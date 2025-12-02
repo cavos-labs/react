@@ -1,0 +1,17 @@
+# Source files
+src/
+tsconfig.json
+tsup.config.ts
+
+# Development files
+.eslintrc.json
+.gitignore
+*.test.ts
+*.test.tsx
+
+# Documentation (keep README.md)
+docs/
+
+# Config
+.vscode/
+.idea/
