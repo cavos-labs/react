@@ -5,12 +5,12 @@ export interface CavosConfig {
   appId: string;
   /** Backend URL for OAuth orchestration (default: https://cavos.xyz) */
   backendUrl?: string;
-  /** StarkNet RPC URL (required for ArgentX deployment) */
-  starknetRpcUrl: string;
+  /** StarkNet RPC URL (optional, uses default if not provided) */
+  starknetRpcUrl?: string;
   /** Network to use (default: sepolia) */
   network?: 'mainnet' | 'sepolia';
-  /** AVNU Paymaster API key for gasless transactions (required) */
-  paymasterApiKey: string;
+  /** AVNU Paymaster API key for gasless transactions (optional, uses Cavos shared key if not provided) */
+  paymasterApiKey?: string;
   /** Enable debug logging (default: false) */
   enableLogging?: boolean;
   /** Passkey modal configuration */

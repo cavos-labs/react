@@ -85,7 +85,7 @@ export function PasskeyModal({ isOpen, onCreatePasskey, config = {} }: PasskeyMo
                     <h2
                         style={{
                             fontSize: '18px',
-                            fontWeight: '500',
+                            fontWeight: '400',
                             color: textColor,
                             margin: 0,
                             textAlign: 'center',

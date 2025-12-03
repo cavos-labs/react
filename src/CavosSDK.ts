@@ -18,6 +18,8 @@ export class CavosSDK {
 
   // Default Cavos shared paymaster API key for Sepolia
   private static readonly DEFAULT_PAYMASTER_KEY = 'c37c52b7-ea5a-4426-8121-329a78354b0b';
+  private static readonly DEFAULT_RPC_MAINNET = 'https://starknet-mainnet.g.alchemy.com/starknet/version/rpc/v0_8/dql5pMT88iueZWl7L0yzT56uVk0EBU4L';
+  private static readonly DEFAULT_RPC_SEPOLIA = 'https://starknet-sepolia.g.alchemy.com/starknet/version/rpc/v0_8/dql5pMT88iueZWl7L0yzT56uVk0EBU4L';
 
   constructor(config: CavosConfig) {
 
@@ -25,6 +27,12 @@ export class CavosSDK {
       ...config,
       // Use provided key or default Cavos shared key
       paymasterApiKey: config.paymasterApiKey || CavosSDK.DEFAULT_PAYMASTER_KEY,
+      // Use provided RPC URL or default based on network
+      starknetRpcUrl: config.starknetRpcUrl || (
+        config.network === 'mainnet'
+          ? CavosSDK.DEFAULT_RPC_MAINNET
+          : CavosSDK.DEFAULT_RPC_SEPOLIA
+      ),
     };
 
     // Initialize auth manager
@@ -37,10 +45,10 @@ export class CavosSDK {
     this.analyticsManager = new AnalyticsManager(this.config);
 
     // Initialize session manager
-    this.sessionManager = new SessionManager(this.config.starknetRpcUrl);
+    this.sessionManager = new SessionManager(this.config.starknetRpcUrl!);
 
     // Initialize paymaster with default key
-    this.paymaster = new PaymasterIntegration(this.config.paymasterApiKey);
+    this.paymaster = new PaymasterIntegration(this.config.paymasterApiKey!);
 
     if (this.config.enableLogging) {
       console.log('[CavosSDK] Initialized with config:', this.config);
@@ -133,7 +141,7 @@ export class CavosSDK {
     // Initialize wallet manager with AuthManager and WebAuthn support
     this.walletManager = new WalletManager(
       this.authManager,
-      this.config.starknetRpcUrl,
+      this.config.starknetRpcUrl!,
       this.config.network || 'sepolia',
       this.analyticsManager
     );
@@ -152,7 +160,7 @@ export class CavosSDK {
     if (!isDeployed) {
       console.log('[CavosSDK] Deploying account...');
       await this.walletManager.deployAccountWithPaymaster(
-        this.config.paymasterApiKey,
+        this.config.paymasterApiKey!,
         this.config.network || 'sepolia'
       );
       console.log('[CavosSDK] Account deployed successfully');
@@ -166,7 +174,7 @@ export class CavosSDK {
 
     this.transactionManager = new TransactionManager(
       account,
-      this.config.paymasterApiKey,
+      this.config.paymasterApiKey!,
       this.config.network || 'sepolia',
       this.analyticsManager
     );
@@ -185,7 +193,7 @@ export class CavosSDK {
     if (!this.walletManager) {
       this.walletManager = new WalletManager(
         this.authManager,
-        this.config.starknetRpcUrl,
+        this.config.starknetRpcUrl!,
         this.config.network || 'sepolia',
         this.analyticsManager
       );
@@ -196,7 +204,7 @@ export class CavosSDK {
     // Auto-deploy account immediately after creation
     console.log('[CavosSDK] Deploying new account...');
     await this.walletManager.deployAccountWithPaymaster(
-      this.config.paymasterApiKey,
+      this.config.paymasterApiKey!,
       this.config.network || 'sepolia'
     );
     console.log('[CavosSDK] Account deployed successfully');
@@ -206,7 +214,7 @@ export class CavosSDK {
     if (account) {
       this.transactionManager = new TransactionManager(
         account,
-        this.config.paymasterApiKey,
+        this.config.paymasterApiKey!,
         this.config.network || 'sepolia',
         this.analyticsManager
       );
