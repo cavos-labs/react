@@ -21,6 +21,9 @@ export class WalletManager {
   // ArgentX account class hash (v0.3.0)
   private static readonly ARGENT_ACCOUNT_CLASS_HASH = '0x036078334509b514626504edc9fb252328d1a240e4e948bef8d0c08dff45927f';
 
+  // Session storage key for caching decrypted wallet
+  private static readonly SESSION_WALLET_KEY = 'cavos_wallet_session';
+
   constructor(
     authManager: AuthManager,
     starknetRpcUrl: string,
@@ -82,9 +85,50 @@ export class WalletManager {
       privateKey: privateKeyHex,
     };
 
+    // Save to session cache
+    this.saveWalletToSession(this.currentWallet);
+
     this.currentAccount = new Account(this.provider, address, privateKeyHex);
 
     return this.currentAccount;
+  }
+
+  /**
+   * Save decrypted wallet to session storage
+   */
+  private saveWalletToSession(wallet: DecryptedWallet): void {
+    try {
+      const walletData = JSON.stringify(wallet);
+      sessionStorage.setItem(WalletManager.SESSION_WALLET_KEY, walletData);
+      console.log('[WalletManager] Wallet cached in session');
+    } catch (error) {
+      console.warn('[WalletManager] Failed to cache wallet:', error);
+    }
+  }
+
+  /**
+   * Load decrypted wallet from session storage
+   */
+  private loadWalletFromSession(): DecryptedWallet | null {
+    try {
+      const walletData = sessionStorage.getItem(WalletManager.SESSION_WALLET_KEY);
+      if (!walletData) return null;
+
+      const wallet = JSON.parse(walletData) as DecryptedWallet;
+      console.log('[WalletManager] Wallet loaded from session cache');
+      return wallet;
+    } catch (error) {
+      console.warn('[WalletManager] Failed to load wallet from session:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Clear wallet from session storage
+   */
+  clearWalletSession(): void {
+    sessionStorage.removeItem(WalletManager.SESSION_WALLET_KEY);
+    console.log('[WalletManager] Wallet session cleared');
   }
 
   /**
@@ -92,6 +136,15 @@ export class WalletManager {
    */
   async loadWallet(user: UserInfo): Promise<Account> {
     this.userEmail = user.email;
+
+    // Check session cache first
+    const cachedWallet = this.loadWalletFromSession();
+    if (cachedWallet) {
+      this.currentWallet = cachedWallet;
+      this.currentAccount = new Account(this.provider, cachedWallet.address, cachedWallet.privateKey);
+      console.log('[WalletManager] Using cached wallet from session');
+      return this.currentAccount;
+    }
 
     // 1. Fetch encrypted blob from Backend API
     console.log('[WalletManager] Fetching wallet from backend...');
@@ -130,6 +183,9 @@ export class WalletManager {
       publicKey: publicKeyHex,
       privateKey,
     };
+
+    // Save to session cache
+    this.saveWalletToSession(this.currentWallet);
 
     this.currentAccount = new Account(this.provider, address, privateKey);
 

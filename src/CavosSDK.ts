@@ -318,6 +318,12 @@ export class CavosSDK {
   async logout(): Promise<void> {
     this.authManager.logout();
     this.sessionManager.clearSession();
+
+    // Clear wallet session cache
+    if (this.walletManager) {
+      this.walletManager.clearWalletSession();
+    }
+
     this.walletManager = null;
     this.transactionManager = null;
   }
