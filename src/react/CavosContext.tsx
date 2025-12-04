@@ -15,6 +15,7 @@ export interface CavosContextValue {
   login: (provider: LoginProvider, redirectUri?: string) => Promise<void>;
   createWallet: () => Promise<void>;
   execute: (calls: Call | Call[], options?: { gasless?: boolean }) => Promise<string>;
+  signMessage: (message: string | string[]) => Promise<{ r: string; s: string }>;
   getOnramp: (provider: OnrampProvider) => string;
   logout: () => Promise<void>;
   isLoading: boolean;
@@ -149,6 +150,7 @@ export function CavosProvider({ config, children }: CavosProviderProps) {
     login,
     createWallet,
     execute,
+    signMessage: async (message: string | string[]) => await cavos.signMessage(message),
     getOnramp,
     logout,
     isLoading,

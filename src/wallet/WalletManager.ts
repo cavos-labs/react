@@ -64,18 +64,18 @@ export class WalletManager {
     // 3. Register Passkey and derive encryption key
     // We use a random challenge for the registration. In a stricter setup, this comes from server.
     const challenge = window.crypto.getRandomValues(new Uint8Array(32));
-    console.log('[WalletManager] Registering new Passkey...');
+
     const encryptionKey = await this.webAuthnManager.register(user.email, challenge);
 
     // 4. Encrypt private key
-    console.log('[WalletManager] Encrypting Private Key...');
+
     const { ciphertext, iv } = await this.webAuthnManager.encrypt(encryptionKey, privateKeyHex);
 
     // Combine IV and Ciphertext for storage (e.g., "iv:ciphertext")
     const encryptedBlob = `${iv}:${ciphertext}`;
 
     // 5. Save to Backend API
-    console.log('[WalletManager] Saving encrypted wallet to backend...');
+
     await this.saveWalletToApi(address, encryptedBlob);
 
     // 6. Create account instance
@@ -100,7 +100,7 @@ export class WalletManager {
     try {
       const walletData = JSON.stringify(wallet);
       sessionStorage.setItem(WalletManager.SESSION_WALLET_KEY, walletData);
-      console.log('[WalletManager] Wallet cached in session');
+
     } catch (error) {
       console.warn('[WalletManager] Failed to cache wallet:', error);
     }
@@ -115,7 +115,7 @@ export class WalletManager {
       if (!walletData) return null;
 
       const wallet = JSON.parse(walletData) as DecryptedWallet;
-      console.log('[WalletManager] Wallet loaded from session cache');
+
       return wallet;
     } catch (error) {
       console.warn('[WalletManager] Failed to load wallet from session:', error);
@@ -128,7 +128,7 @@ export class WalletManager {
    */
   clearWalletSession(): void {
     sessionStorage.removeItem(WalletManager.SESSION_WALLET_KEY);
-    console.log('[WalletManager] Wallet session cleared');
+
   }
 
   /**
@@ -142,12 +142,12 @@ export class WalletManager {
     if (cachedWallet) {
       this.currentWallet = cachedWallet;
       this.currentAccount = new Account(this.provider, cachedWallet.address, cachedWallet.privateKey);
-      console.log('[WalletManager] Using cached wallet from session');
+
       return this.currentAccount;
     }
 
     // 1. Fetch encrypted blob from Backend API
-    console.log('[WalletManager] Fetching wallet from backend...');
+
     const walletData = await this.fetchWalletFromApi();
 
     if (!walletData) {
@@ -166,11 +166,11 @@ export class WalletManager {
     // but for PRF with static salt (in manager), any challenge works for authentication 
     // as long as the RP ID is the same.
     const challenge = window.crypto.getRandomValues(new Uint8Array(32));
-    console.log('[WalletManager] Authenticating Passkey...');
+
     const encryptionKey = await this.webAuthnManager.authenticate(challenge);
 
     // 3. Decrypt private key
-    console.log('[WalletManager] Decrypting Private Key...');
+
     const privateKey = await this.webAuthnManager.decrypt(encryptionKey, ciphertext, iv);
 
     // 4. Derive public key and verify address (optional sanity check)
@@ -200,7 +200,7 @@ export class WalletManager {
       // Try to load existing wallet
       return await this.loadWallet(user);
     } catch (error: any) {
-      console.log('[WalletManager] Load failed, creating new wallet:', error.message);
+
       // If load fails (e.g. no wallet found or user cancelled WebAuthn), try create
       // Note: If user cancelled WebAuthn during load, they might cancel during create too.
       // But we assume "No wallet found" is the main reason to create.
@@ -284,6 +284,62 @@ export class WalletManager {
   }
 
   /**
+   * Sign a message with the wallet
+   * @param message - The message to sign (string or array of field elements)
+   * @returns Signature object with r and s values
+   */
+  async signMessage(message: string | string[]): Promise<{ r: string; s: string }> {
+    if (!this.currentAccount) {
+      throw new Error('No account available. Please login first.');
+    }
+
+    try {
+      // If message is a string, convert to typed data format
+      let typedData: any;
+
+      if (typeof message === 'string') {
+        // Create a simple typed data structure for string messages
+        typedData = {
+          types: {
+            StarkNetDomain: [
+              { name: 'name', type: 'felt' },
+              { name: 'chainId', type: 'felt' },
+              { name: 'version', type: 'felt' },
+            ],
+            Message: [
+              { name: 'message', type: 'felt' },
+            ],
+          },
+          primaryType: 'Message',
+          domain: {
+            name: 'Cavos',
+            chainId: this.network === 'mainnet' ? '0x534e5f4d41494e' : '0x534e5f5345504f4c4941',
+            version: '1',
+          },
+          message: {
+            message: message,
+          },
+        };
+      } else {
+        // If it's already an array, use it directly
+        typedData = message;
+      }
+
+      const signature = await this.currentAccount.signMessage(typedData);
+
+      // Return signature in original Starknet format
+      // Signature object has r and s properties (BigInt values)
+      return {
+        r: (signature as any).r,
+        s: (signature as any).s,
+      };
+    } catch (error) {
+      console.error('[WalletManager] Error signing message:', error);
+      throw error;
+    }
+  }
+
+  /**
    * Get current wallet address
    */
   getAddress(): string | null {
@@ -354,7 +410,7 @@ export class WalletManager {
   async deployAccountWithPaymaster(apiKey: string, network: 'mainnet' | 'sepolia' = 'sepolia'): Promise<string> {
     if (!this.currentWallet) throw new Error('No wallet initialized');
     if (await this.isDeployed()) {
-      console.log('[WalletManager] Account already deployed');
+
       return this.currentWallet.address;
     }
 
@@ -362,7 +418,7 @@ export class WalletManager {
     const deploymentData = this.getDeploymentData();
 
     try {
-      console.log(`[WalletManager] Deploying ArgentX account via AVNU on ${network}...`);
+
       const baseUrl = network === 'sepolia' ? 'https://sepolia.api.avnu.fi' : 'https://starknet.api.avnu.fi';
 
       // Step 1: Build typed data
@@ -378,7 +434,7 @@ export class WalletManager {
       });
 
       if (!typeDataResponse.ok) throw new Error(await typeDataResponse.text());
-      console.log('[WalletManager] Typed data built successfully');
+
 
       // Step 2: Deploy account
       const deployResponse = await fetch(`${baseUrl}/paymaster/v1/deploy-account`, {
@@ -389,7 +445,7 @@ export class WalletManager {
 
       if (!deployResponse.ok) throw new Error(await deployResponse.text());
       const deployResult = await deployResponse.json();
-      console.log('[WalletManager] Account deployed successfully:', deployResult);
+
 
       if (deployResult.transactionHash) {
         await this.provider.waitForTransaction(deployResult.transactionHash);

@@ -51,7 +51,7 @@ export class CavosSDK {
     this.paymaster = new PaymasterIntegration(this.config.paymasterApiKey!);
 
     if (this.config.enableLogging) {
-      console.log('[CavosSDK] Initialized with config:', this.config);
+
     }
   }
 
@@ -61,10 +61,10 @@ export class CavosSDK {
   async init(): Promise<void> {
     // Try to restore session
     if (this.authManager.restoreSession()) {
-      console.log('[CavosSDK] Session restored');
+
       try {
         await this.initializeWallet();
-        console.log('[CavosSDK] Wallet restored');
+
       } catch (error) {
         console.error('[CavosSDK] Failed to restore wallet:', error);
         // If wallet restoration fails, we might want to clear session
@@ -150,7 +150,7 @@ export class CavosSDK {
     try {
       await this.walletManager.loadWallet(user);
     } catch (error: any) {
-      console.log('[CavosSDK] Load failed:', error.message);
+
       // If load fails, we don't auto-create. The UI should handle this.
       throw error;
     }
@@ -158,12 +158,12 @@ export class CavosSDK {
     // Auto-deploy account if not already deployed (gasless with AVNU paymaster)
     const isDeployed = await this.walletManager.isDeployed();
     if (!isDeployed) {
-      console.log('[CavosSDK] Deploying account...');
+
       await this.walletManager.deployAccountWithPaymaster(
         this.config.paymasterApiKey!,
         this.config.network || 'sepolia'
       );
-      console.log('[CavosSDK] Account deployed successfully');
+
     }
 
     // Initialize transaction manager with account and paymaster API key
@@ -202,12 +202,12 @@ export class CavosSDK {
     await this.walletManager.createWallet(user);
 
     // Auto-deploy account immediately after creation
-    console.log('[CavosSDK] Deploying new account...');
+
     await this.walletManager.deployAccountWithPaymaster(
       this.config.paymasterApiKey!,
       this.config.network || 'sepolia'
     );
-    console.log('[CavosSDK] Account deployed successfully');
+
 
     // After creation, initialize transaction manager
     const account = this.walletManager.getAccount();
@@ -255,6 +255,18 @@ export class CavosSDK {
    */
   isAuthenticated(): boolean {
     return this.authManager.isAuthenticated();
+  }
+
+  /**
+   * Sign a message with the wallet
+   * @param message - The message to sign (string or array of field elements)
+   * @returns Signature object with r and s values
+   */
+  async signMessage(message: string | string[]): Promise<{ r: string; s: string }> {
+    if (!this.walletManager) {
+      throw new Error('Wallet not initialized. Please login first.');
+    }
+    return await this.walletManager.signMessage(message);
   }
 
   /**
@@ -393,14 +405,6 @@ export class CavosSDK {
   private getRampNetworkUrl(address: string): string {
     const formattedAddress = this.formatAddress(address);
     const url = this.buildRampNetworkUrl(formattedAddress);
-
-    if (this.config.enableLogging) {
-      console.log('[CavosSDK] Ramp Network onramp URL generated:', {
-        address: formattedAddress,
-        outAsset: 'STARKNET_USDC',
-        inAsset: 'USD'
-      });
-    }
 
     return url;
   }

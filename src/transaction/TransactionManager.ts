@@ -40,7 +40,7 @@ export class TransactionManager {
 
   private async executeGasless(calls: Call[]): Promise<string> {
     try {
-      console.log('[TransactionManager] Executing gasless transaction with AVNU SDK...');
+
 
       const baseUrl = this.network === 'sepolia' ? SEPOLIA_BASE_URL : BASE_URL;
 
@@ -56,7 +56,7 @@ export class TransactionManager {
         options
       );
 
-      console.log('[TransactionManager] Gasless transaction submitted:', result.transactionHash);
+
 
       // Track transaction analytics
       if (this.analyticsManager) {

@@ -53,7 +53,6 @@ export class SessionManager {
         }),
       });
 
-      console.log('[SessionManager] Session registered on-chain:', result.transaction_hash);
 
       // Add allowed contracts if specified
       if (policy.whitelistedAddresses && policy.whitelistedAddresses.length > 0) {

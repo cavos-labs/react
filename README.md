@@ -83,22 +83,53 @@ function SendMoney() {
 
   const handleSend = async () => {
     try {
+      // Single transaction
       const transactionHash = await execute(
         {
           contractAddress: '0x...', // The address of the contract you want to interact with
           entrypoint: 'transfer',   // The function to call
-          calldata: ['0x...', '100'], // The arguments for the function
+          calldata: ['0x...', '1000', '0'], // recipient, amount_low, amount_high
         },
-        { gasless: true } // This makes the transaction free for the user
+        { gasless: true } // Enable gasless transactions
       );
 
-      console.log('Transaction sent:', transactionHash);
+      console.log('Transaction hash:', transactionHash);
     } catch (error) {
-      console.error('Error sending transaction:', error);
+      console.error('Transaction failed:', error);
     }
   };
 
-  return <button onClick={handleSend}>Send Money</button>;
+  const handleMulticall = async () => {
+    try {
+      // Multiple transactions (executed atomically)
+      const transactionHash = await execute(
+        [
+          {
+            contractAddress: '0x...',
+            entrypoint: 'approve',
+            calldata: ['0x...', '1000', '0'],
+          },
+          {
+            contractAddress: '0x...',
+            entrypoint: 'transfer',
+            calldata: ['0x...', '500', '0'],
+          },
+        ],
+        { gasless: true }
+      );
+
+      console.log('Multicall transaction hash:', transactionHash);
+    } catch (error) {
+      console.error('Multicall failed:', error);
+    }
+  };
+
+  return (
+    <div>
+      <button onClick={handleSend}>Send Transaction</button>
+      <button onClick={handleMulticall}>Send Multicall</button>
+    </div>
+  );
 }
 ```
 
