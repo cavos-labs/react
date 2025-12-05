@@ -5,7 +5,7 @@ import { SessionManager } from './session/SessionManager';
 import { PaymasterIntegration } from './paymaster/PaymasterIntegration';
 import { TransactionManager } from './transaction/TransactionManager';
 import { AnalyticsManager } from './analytics/AnalyticsManager';
-import { CavosConfig, UserInfo, SessionPolicy, ExecuteOptions, OnrampProvider, LoginProvider } from './types';
+import { CavosConfig, UserInfo, DecryptedWallet, OnrampProvider, LoginProvider, TypedData, Signature } from './types';
 
 export class CavosSDK {
   private config: CavosConfig;
@@ -18,8 +18,8 @@ export class CavosSDK {
 
   // Default Cavos shared paymaster API key for Sepolia
   private static readonly DEFAULT_PAYMASTER_KEY = 'c37c52b7-ea5a-4426-8121-329a78354b0b';
-  private static readonly DEFAULT_RPC_MAINNET = 'https://starknet-mainnet.g.alchemy.com/starknet/version/rpc/v0_8/dql5pMT88iueZWl7L0yzT56uVk0EBU4L';
-  private static readonly DEFAULT_RPC_SEPOLIA = 'https://starknet-sepolia.g.alchemy.com/starknet/version/rpc/v0_8/dql5pMT88iueZWl7L0yzT56uVk0EBU4L';
+  private static readonly DEFAULT_RPC_MAINNET = 'https://starknet-mainnet.g.alchemy.com/starknet/version/rpc/v0_10/dql5pMT88iueZWl7L0yzT56uVk0EBU4L';
+  private static readonly DEFAULT_RPC_SEPOLIA = 'https://starknet-sepolia.g.alchemy.com/starknet/version/rpc/v0_10/dql5pMT88iueZWl7L0yzT56uVk0EBU4L';
 
   constructor(config: CavosConfig) {
 
@@ -67,8 +67,7 @@ export class CavosSDK {
 
       } catch (error) {
         console.error('[CavosSDK] Failed to restore wallet:', error);
-        // If wallet restoration fails, we might want to clear session
-        // this.authManager.logout();
+        throw error;
       }
     }
   }
@@ -120,7 +119,8 @@ export class CavosSDK {
     try {
       await this.initializeWallet();
     } catch (error: any) {
-      console.warn('[CavosSDK] Wallet initialization failed:', error.message);
+      console.error('[CavosSDK] Wallet initialization failed:', error.message);
+      throw error;
     }
   }
 
@@ -220,6 +220,47 @@ export class CavosSDK {
       );
     }
   }
+
+  /**
+   * Retry wallet unlock after a failed passkey attempt.
+   * This is useful when the user cancels the passkey prompt and wants to try again.
+   * Only works if the user is authenticated but doesn't have a wallet loaded.
+   */
+  async retryWalletUnlock(): Promise<void> {
+    const user = this.authManager.getUserInfo();
+    if (!user) {
+      throw new Error('User not authenticated');
+    }
+
+    if (this.getAddress()) {
+      throw new Error('Wallet is already unlocked');
+    }
+
+    // Initialize wallet manager if not already initialized
+    if (!this.walletManager) {
+      this.walletManager = new WalletManager(
+        this.authManager,
+        this.config.starknetRpcUrl!,
+        this.config.network || 'sepolia',
+        this.analyticsManager
+      );
+    }
+
+    // Try to load the wallet again
+    await this.walletManager.loadWallet(user);
+
+    // Initialize transaction manager
+    const account = this.walletManager.getAccount();
+    if (account) {
+      this.transactionManager = new TransactionManager(
+        account,
+        this.config.paymasterApiKey!,
+        this.config.network || 'sepolia',
+        this.analyticsManager
+      );
+    }
+  }
+
   async createSession(): Promise<void> {
     console.warn('[CavosSDK] Session keys not supported with ArgentX accounts. Use execute() with gasless option instead.');
     // No-op for ArgentX accounts
@@ -228,7 +269,7 @@ export class CavosSDK {
   /**
    * Execute a transaction
    */
-  async execute(calls: Call | Call[], options?: ExecuteOptions): Promise<string> {
+  async execute(calls: Call | Call[], options?: { gasless?: boolean }): Promise<string> {
     if (!this.transactionManager) {
       throw new Error('Transaction manager not initialized. Please login first.');
     }
@@ -258,14 +299,24 @@ export class CavosSDK {
   }
 
   /**
-   * Sign a message with the wallet
-   * @param message - The message to sign (string or array of field elements)
-   * @returns Signature object with r and s values
+   * Deletes the current user's account.
+   * This action is irreversible.
    */
-  async signMessage(message: string | string[]): Promise<{ r: string; s: string }> {
+  async deleteAccount(): Promise<void> {
+    await this.authManager.deleteAccount(this.config.appId, this.config.network || 'sepolia');
+    await this.logout();
+  }
+
+  /**
+   * Signs a message with the wallet's private key.
+   * @param message The message to sign. Can be a string or a TypedData object.
+   * @returns The signature components r and s.
+   */
+  async signMessage(message: string | TypedData): Promise<Signature> {
     if (!this.walletManager) {
       throw new Error('Wallet not initialized. Please login first.');
     }
+    // @ts-ignore - WalletManager handles the type check
     return await this.walletManager.signMessage(message);
   }
 

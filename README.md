@@ -7,7 +7,7 @@ It lets your users log in with Google or Apple and creates a secure wallet for t
 ## Why use this?
 
 - **Easy Login**: Users sign in with their existing Google or Apple accounts.
-- **Secure**: The private keys are created on the user's device and never sent to our servers. Only the user can access their wallet.
+- **Secure**: The private keys are created on the user's device, encrypted with their passkeys which generates a blob saved on our platform for the user to restore it. Only the user can access their wallet.
 - **Free Transactions**: We pay the gas fees for your users, so they do not need to buy ETH or STRK to start using your app.
 - **Works Everywhere**: Users can access their wallet from any device by logging in.
 
@@ -155,6 +155,84 @@ function BuyCrypto() {
   };
 
   return <button onClick={handleBuy}>Buy Crypto</button>;
+}
+```
+
+### 6. Handling Wallet Unlock Errors
+
+If a user cancels the passkey prompt or wallet unlock fails, you can handle the error and allow them to retry.
+
+```tsx
+import { useCavos } from '@cavos/react';
+
+function WalletStatus() {
+  const { isAuthenticated, address, retryWalletUnlock } = useCavos();
+  const [isRetrying, setIsRetrying] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const handleRetry = async () => {
+    setIsRetrying(true);
+    setError(null);
+    
+    try {
+      await retryWalletUnlock();
+      console.log('Wallet unlocked successfully');
+    } catch (err: any) {
+      console.error('Wallet unlock failed:', err);
+      setError(err.message || 'Failed to unlock wallet');
+    } finally {
+      setIsRetrying(false);
+    }
+  };
+
+  // User is authenticated but wallet is not loaded
+  if (isAuthenticated && !address) {
+    return (
+      <div>
+        <p>Your wallet needs to be unlocked with your passkey.</p>
+        {error && <p style={{ color: 'red' }}>{error}</p>}
+        <button onClick={handleRetry} disabled={isRetrying}>
+          {isRetrying ? 'Unlocking...' : 'Unlock Wallet'}
+        </button>
+      </div>
+    );
+  }
+
+  return <p>Wallet Address: {address}</p>;
+}
+```
+
+### 7. Account Deletion
+
+Allow users to permanently delete their account and wallet.
+
+```tsx
+import { useCavos } from '@cavos/react';
+
+function AccountSettings() {
+  const { deleteAccount } = useCavos();
+
+  const handleDelete = async () => {
+    const confirmed = window.confirm(
+      'Are you sure you want to delete your account? This action cannot be undone.'
+    );
+
+    if (!confirmed) return;
+
+    try {
+      await deleteAccount();
+      console.log('Account deleted successfully');
+      // User will be logged out automatically
+    } catch (error) {
+      console.error('Failed to delete account:', error);
+    }
+  };
+
+  return (
+    <button onClick={handleDelete} style={{ color: 'red' }}>
+      Delete Account
+    </button>
+  );
 }
 ```
 

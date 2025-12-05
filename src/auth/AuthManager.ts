@@ -197,6 +197,31 @@ export class AuthManager {
   }
 
   /**
+   * Delete account
+   */
+  async deleteAccount(appId: string, network: string): Promise<void> {
+    const token = this.getAccessToken();
+    if (!token) {
+      throw new Error('User not authenticated');
+    }
+
+    try {
+      await axios.delete(`${this.backendUrl}/api/user/delete`, {
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+        data: {
+          app_id: appId,
+          network: network,
+        },
+      });
+    } catch (error: any) {
+      console.error('[AuthManager] Failed to delete account:', error);
+      throw new Error(`Failed to delete account: ${error.message}`);
+    }
+  }
+
+  /**
    * Get app ID
    */
   getAppId(): string {

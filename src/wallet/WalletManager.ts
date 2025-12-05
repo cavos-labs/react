@@ -35,9 +35,10 @@ export class WalletManager {
     this.network = network;
     this.webAuthnManager = new WebAuthnManager();
 
-    // Use Alchemy v0_8 RPC for Sepolia
+    // Use Alchemy v0_10 RPC - configure to use 'latest' block instead of 'pending'
     this.provider = new RpcProvider({
       nodeUrl: starknetRpcUrl,
+      default: 'latest' as any, // v0_10 doesn't support 'pending' block
     });
 
     if (analyticsManager) {
@@ -397,9 +398,15 @@ export class WalletManager {
   async isDeployed(): Promise<boolean> {
     if (!this.currentWallet) return false;
     try {
-      const classHash = await this.provider.getClassHashAt(this.currentWallet.address);
-      return classHash !== '0x0';
-    } catch (error) {
+      // Use 'latest' block for v0_10 RPC compatibility
+      const classHash = await this.provider.getClassHashAt(this.currentWallet.address, 'latest');
+      console.log('[WalletManager] isDeployed check - classHash:', classHash);
+      const deployed = classHash !== '0x0' && classHash !== '0x' && classHash !== '';
+      console.log('[WalletManager] isDeployed result:', deployed);
+      return deployed;
+    } catch (error: any) {
+      console.log('[WalletManager] isDeployed error:', error.message || error);
+      // If we can't get the class hash, assume not deployed
       return false;
     }
   }
@@ -457,6 +464,16 @@ export class WalletManager {
       return deployResult.transactionHash;
     } catch (error: any) {
       console.error('[WalletManager] Deployment failed:', error);
+
+      // Check if error is because contract is already deployed or tx already sent
+      const errorMessage = error.message || error.toString();
+      if (errorMessage.includes('already deployed') ||
+        errorMessage.includes('CONTRACT_ADDRESS_UNAVAILABLE') ||
+        errorMessage.includes('Tx already sent')) {
+        console.log('[WalletManager] Contract already deployed or deployment in progress, skipping');
+        return this.currentWallet.address;
+      }
+
       throw new Error(`Failed to deploy account: ${error.message || error}`);
     }
   }

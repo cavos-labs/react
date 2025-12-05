@@ -1,7 +1,7 @@
 'use client';
-import React, { createContext, useContext, useEffect, useState, ReactNode } from 'react';
+import React, { createContext, useContext, useEffect, useState, useCallback, ReactNode } from 'react';
 import { CavosSDK } from '../CavosSDK';
-import { CavosConfig, UserInfo, OnrampProvider, LoginProvider } from '../types';
+import { CavosConfig, UserInfo, OnrampProvider, LoginProvider, TypedData, Signature } from '../types';
 import { Call } from 'starknet';
 import { PasskeyModal } from './components/PasskeyModal';
 
@@ -15,7 +15,9 @@ export interface CavosContextValue {
   login: (provider: LoginProvider, redirectUri?: string) => Promise<void>;
   createWallet: () => Promise<void>;
   execute: (calls: Call | Call[], options?: { gasless?: boolean }) => Promise<string>;
-  signMessage: (message: string | string[]) => Promise<{ r: string; s: string }>;
+  signMessage: (message: string | TypedData) => Promise<Signature>;
+  deleteAccount: () => Promise<void>;
+  retryWalletUnlock: () => Promise<void>;
   getOnramp: (provider: OnrampProvider) => string;
   logout: () => Promise<void>;
   isLoading: boolean;
@@ -65,9 +67,19 @@ export function CavosProvider({ config, children }: CavosProviderProps) {
             setRequiresWalletCreation(true);
           }
         }
-      } catch (error) {
+      } catch (error: any) {
         console.error('[CavosProvider] Initialization error:', error);
-        setIsAuthenticated(false);
+
+        // Check if user is authenticated but wallet restoration failed
+        if (cavos.isAuthenticated() && !cavos.getAddress()) {
+          // Keep the user authenticated so they don't get logged out
+          setIsAuthenticated(true);
+          setUser(cavos.getUserInfo());
+          // Show PasskeyModal so user can create/unlock their wallet
+          setRequiresWalletCreation(true);
+        } else {
+          setIsAuthenticated(false);
+        }
       } finally {
         setIsLoading(false);
       }
@@ -76,69 +88,83 @@ export function CavosProvider({ config, children }: CavosProviderProps) {
     initialize();
   }, [cavos]);
 
-  const loginWithGoogle = async (redirectUri?: string) => {
-    setIsLoading(true);
-    try {
-      await cavos.loginWithGoogle(redirectUri);
-    } catch (error) {
-      console.error('[CavosProvider] Google login error:', error);
-      setIsLoading(false);
-      throw error;
-    }
-  };
-
-  const loginWithApple = async (redirectUri?: string) => {
-    setIsLoading(true);
-    try {
-      await cavos.loginWithApple(redirectUri);
-    } catch (error) {
-      console.error('[CavosProvider] Apple login error:', error);
-      setIsLoading(false);
-      throw error;
-    }
-  };
-
-  const login = async (provider: LoginProvider, redirectUri?: string) => {
+  const login = useCallback(async (provider: LoginProvider, redirectUri?: string) => {
+    if (!cavos) throw new Error('Cavos SDK not initialized');
     setIsLoading(true);
     try {
       await cavos.login(provider, redirectUri);
+      // After login, re-initialize to get user info and address
+      await cavos.init();
+      if (cavos.getAddress()) {
+        setAddress(cavos.getAddress());
+        setRequiresWalletCreation(false);
+      }
     } catch (error) {
       console.error(`[CavosProvider] ${provider} login error:`, error);
       setIsLoading(false);
       throw error;
     }
-  };
+  }, [cavos]);
 
-  const createWallet = async () => {
+  const createWallet = useCallback(async () => {
+    if (!cavos) throw new Error('Cavos SDK not initialized');
     setIsLoading(true);
     try {
       await cavos.createWallet();
       setAddress(cavos.getAddress());
       setRequiresWalletCreation(false);
-    } catch (error) {
+    } catch (error: any) {
       console.error('[CavosProvider] Create wallet error:', error);
+      // Re-throw the error so developers can handle it
       throw error;
     } finally {
       setIsLoading(false);
     }
-  };
+  }, [cavos]);
 
-  const execute = async (calls: Call | Call[], options?: { gasless?: boolean }) => {
-    return await cavos.execute(calls, options);
-  };
+  const execute = useCallback(async (calls: Call | Call[], options?: { gasless?: boolean }) => {
+    if (!cavos) throw new Error('Cavos SDK not initialized');
+    return cavos.execute(calls, options);
+  }, [cavos]);
 
-  const getOnramp = (provider: OnrampProvider): string => {
+  const signMessage = useCallback(async (message: string | TypedData) => {
+    if (!cavos) throw new Error('Cavos SDK not initialized');
+    return cavos.signMessage(message);
+  }, [cavos]);
+
+  const deleteAccount = useCallback(async () => {
+    if (!cavos) throw new Error('Cavos SDK not initialized');
+    await cavos.deleteAccount();
+    // Clear state after successful deletion (logout is called in SDK)
+    setIsAuthenticated(false);
+    setUser(null);
+    setAddress(null);
+    setHasActiveSession(false);
+    setRequiresWalletCreation(false);
+  }, [cavos]);
+
+  const retryWalletUnlock = useCallback(async () => {
+    if (!cavos) throw new Error('Cavos SDK not initialized');
+    await cavos.retryWalletUnlock();
+    // Update address after successful unlock
+    setAddress(cavos.getAddress());
+    setRequiresWalletCreation(false);
+  }, [cavos]);
+
+  const getOnramp = useCallback((provider: OnrampProvider) => {
+    if (!cavos) throw new Error('Cavos SDK not initialized');
     return cavos.getOnramp(provider);
-  };
+  }, [cavos]);
 
-  const logout = async () => {
+  const logout = useCallback(async () => {
+    if (!cavos) throw new Error('Cavos SDK not initialized');
     await cavos.logout();
     setIsAuthenticated(false);
     setUser(null);
     setAddress(null);
     setHasActiveSession(false);
     setRequiresWalletCreation(false);
-  };
+  }, [cavos]);
 
   const value: CavosContextValue = {
     cavos,
@@ -150,7 +176,9 @@ export function CavosProvider({ config, children }: CavosProviderProps) {
     login,
     createWallet,
     execute,
-    signMessage: async (message: string | string[]) => await cavos.signMessage(message),
+    signMessage,
+    deleteAccount,
+    retryWalletUnlock,
     getOnramp,
     logout,
     isLoading,
@@ -160,9 +188,11 @@ export function CavosProvider({ config, children }: CavosProviderProps) {
     <CavosContext.Provider value={value}>
       {children}
       <PasskeyModal
-        isOpen={isAuthenticated && requiresWalletCreation && !isLoading}
+        isOpen={requiresWalletCreation}
         onCreatePasskey={createWallet}
+        onClose={logout}
         config={config.passkeyModal}
+        isLoading={isLoading}
       />
     </CavosContext.Provider>
   );
