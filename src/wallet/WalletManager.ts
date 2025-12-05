@@ -286,43 +286,49 @@ export class WalletManager {
 
   /**
    * Sign a message with the wallet
-   * @param message - The message to sign (string or array of field elements)
+   * @param message - The message to sign (string, typed data object, or array of field elements)
    * @returns Signature object with r and s values
    */
-  async signMessage(message: string | string[]): Promise<{ r: string; s: string }> {
+  async signMessage(message: string | object | string[]): Promise<{ r: string; s: string }> {
     if (!this.currentAccount) {
       throw new Error('No account available. Please login first.');
     }
 
     try {
-      // If message is a string, convert to typed data format
       let typedData: any;
 
       if (typeof message === 'string') {
+        // For long messages, we need to hash them first since Starknet types have length limits
+        // shortstring max is 31 chars, felt is even shorter
+        const messageToSign = message.length > 31
+          ? hash.computeHashOnElements([BigInt('0x' + Buffer.from(message).toString('hex'))])
+          : message;
+
         // Create a simple typed data structure for string messages
         typedData = {
           types: {
             StarkNetDomain: [
-              { name: 'name', type: 'felt' },
-              { name: 'chainId', type: 'felt' },
-              { name: 'version', type: 'felt' },
+              { name: 'name', type: 'shortstring' },
+              { name: 'version', type: 'shortstring' },
             ],
             Message: [
-              { name: 'message', type: 'felt' },
+              { name: 'content', type: message.length > 31 ? 'felt' : 'shortstring' },
             ],
           },
           primaryType: 'Message',
           domain: {
             name: 'Cavos',
-            chainId: this.network === 'mainnet' ? '0x534e5f4d41494e' : '0x534e5f5345504f4c4941',
             version: '1',
           },
           message: {
-            message: message,
+            content: messageToSign,
           },
         };
+      } else if (typeof message === 'object' && !Array.isArray(message)) {
+        // If it's an object, assume it's already a typed data structure
+        typedData = message;
       } else {
-        // If it's already an array, use it directly
+        // If it's an array, use it directly
         typedData = message;
       }
 
