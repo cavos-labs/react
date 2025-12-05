@@ -47,13 +47,6 @@ export class iCloudStorage implements CloudStorageProvider {
 
     // Check if button container exists
     const buttonContainer = document.getElementById('apple-sign-in-button');
-    console.log('[iCloudStorage] Button container found:', !!buttonContainer);
-
-    console.log('[iCloudStorage] Configuring CloudKit with:', {
-      containerId,
-      apiToken: apiToken.substring(0, 10) + '...',
-      environment
-    });
 
     try {
       CloudKit.configure({
@@ -70,7 +63,6 @@ export class iCloudStorage implements CloudStorageProvider {
           environment,
         }],
       });
-      console.log('[iCloudStorage] CloudKit configured successfully');
     } catch (err) {
       console.error('[iCloudStorage] CloudKit configuration failed:', err);
     }
@@ -79,14 +71,12 @@ export class iCloudStorage implements CloudStorageProvider {
     this.database = this.container.privateCloudDatabase;
 
     // Listen for auth events
-    this.container.whenUserSignsIn().then((userIdentity: any) => {
-      console.log('[iCloudStorage] User signed in to CloudKit:', userIdentity);
+    this.container.whenUserSignsIn().then(() => {
       // Reload page or notify app to refresh wallet
       // window.location.reload(); 
     });
 
     this.container.whenUserSignsOut().then(() => {
-      console.log('[iCloudStorage] User signed out of CloudKit');
     });
   }
 

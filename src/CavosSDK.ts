@@ -285,6 +285,18 @@ export class CavosSDK {
   }
 
   /**
+   * Check if user has an existing wallet in the database
+   */
+  async hasWallet(): Promise<boolean> {
+    if (!this.walletManager) return false;
+    try {
+      return await this.walletManager.hasWallet();
+    } catch (error) {
+      return false;
+    }
+  }
+
+  /**
    * Get current user info
    */
   getUserInfo(): UserInfo | null {

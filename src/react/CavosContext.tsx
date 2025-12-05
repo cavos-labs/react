@@ -75,8 +75,17 @@ export function CavosProvider({ config, children }: CavosProviderProps) {
           // Keep the user authenticated so they don't get logged out
           setIsAuthenticated(true);
           setUser(cavos.getUserInfo());
-          // Show PasskeyModal so user can create/unlock their wallet
-          setRequiresWalletCreation(true);
+
+          // Only show PasskeyModal if user doesn't have an existing wallet
+          // If they have a wallet but cancelled passkey, don't show the modal
+          const userHasWallet = await cavos.hasWallet();
+          if (!userHasWallet) {
+            // User is new and needs to create a wallet
+            setRequiresWalletCreation(true);
+          } else {
+            // User has a wallet but cancelled passkey unlock - don't show modal
+            setRequiresWalletCreation(false);
+          }
         } else {
           setIsAuthenticated(false);
         }
