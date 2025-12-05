@@ -1,6 +1,6 @@
 {
   "name": "@cavos/react",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Cavos SDK - Session-key based wallets with OAuth and cloud storage for React",
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",
