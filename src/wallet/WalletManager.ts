@@ -91,6 +91,9 @@ export class WalletManager {
 
     this.currentAccount = new Account(this.provider, address, privateKeyHex);
 
+    // Track MAU
+    await this.trackUsage(address);
+
     return this.currentAccount;
   }
 
@@ -144,6 +147,9 @@ export class WalletManager {
       this.currentWallet = cachedWallet;
       this.currentAccount = new Account(this.provider, cachedWallet.address, cachedWallet.privateKey);
 
+      // Track MAU even for session restore
+      await this.trackUsage(cachedWallet.address);
+
       return this.currentAccount;
     }
 
@@ -189,6 +195,9 @@ export class WalletManager {
     this.saveWalletToSession(this.currentWallet);
 
     this.currentAccount = new Account(this.provider, address, privateKey);
+
+    // Track MAU
+    await this.trackUsage(address);
 
     return this.currentAccount;
   }
@@ -503,5 +512,23 @@ export class WalletManager {
 
   getWalletInfo(): DecryptedWallet | null {
     return this.currentWallet;
+  }
+
+  /**
+   * Track MAU usage
+   */
+  private async trackUsage(walletAddress: string): Promise<void> {
+    try {
+      const backendUrl = (this.authManager as any).backendUrl || 'https://cavos.xyz';
+
+      await axios.post(`${backendUrl}/api/usage/track`, {
+        app_id: this.appId,
+        wallet_address: walletAddress,
+        network: this.network
+      });
+    } catch (error) {
+      // Silent fail - don't block user flow for metrics
+      console.debug('[Cavos SDK] Usage tracking failed:', error);
+    }
   }
 }
