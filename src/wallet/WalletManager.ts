@@ -93,7 +93,7 @@ export class WalletManager {
     // Save to session cache
     this.saveWalletToSession(this.currentWallet);
 
-    this.currentAccount = new Account(this.provider, address, privateKeyHex);
+    this.currentAccount = new Account({ provider: this.provider, address, signer: privateKeyHex });
 
     // Track MAU
     await this.trackUsage(address);
@@ -149,7 +149,7 @@ export class WalletManager {
     const cachedWallet = this.loadWalletFromSession();
     if (cachedWallet) {
       this.currentWallet = cachedWallet;
-      this.currentAccount = new Account(this.provider, cachedWallet.address, cachedWallet.privateKey);
+      this.currentAccount = new Account({ provider: this.provider, address: cachedWallet.address, signer: cachedWallet.privateKey });
 
       // Track MAU even for session restore
       await this.trackUsage(cachedWallet.address);
@@ -198,7 +198,7 @@ export class WalletManager {
     // Save to session cache
     this.saveWalletToSession(this.currentWallet);
 
-    this.currentAccount = new Account(this.provider, address, privateKey);
+    this.currentAccount = new Account({ provider: this.provider, address, signer: privateKey });
 
     // Track MAU
     await this.trackUsage(address);
@@ -579,7 +579,7 @@ export class WalletManager {
       publicKey: publicKeyHex,
       privateKey: privateKeyHex,
     };
-    this.currentAccount = new Account(this.provider, address, privateKeyHex);
+    this.currentAccount = new Account({ provider: this.provider, address, signer: privateKeyHex });
 
     // 7. Auto-deploy wallet
     await this.deployPasskeyWallet(paymasterApiKey);
@@ -616,7 +616,7 @@ export class WalletManager {
       publicKey: data.publicKey,
       privateKey: privateKeyHex,
     };
-    this.currentAccount = new Account(this.provider, data.address, privateKeyHex);
+    this.currentAccount = new Account({ provider: this.provider, address: data.address, signer: privateKeyHex });
   }
 
   /**
@@ -660,7 +660,7 @@ export class WalletManager {
       publicKey: publicKeyHex,
       privateKey: privateKeyHex,
     };
-    this.currentAccount = new Account(this.provider, backendWallet.address, privateKeyHex);
+    this.currentAccount = new Account({ provider: this.provider, address: backendWallet.address, signer: privateKeyHex });
   }
 
   /**
