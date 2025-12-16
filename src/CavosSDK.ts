@@ -215,11 +215,8 @@ export class CavosSDK {
     } else {
       // Passkey-Only Flow (Smart Auth: Recover -> Create)
       try {
-        console.log('[CavosSDK] Attempting to recover existing passkey wallet first...');
         await this.walletManager.recoverWalletWithPasskey();
-        console.log('[CavosSDK] Wallet recovered successfully');
       } catch (error) {
-        console.log('[CavosSDK] Recovery failed, proceeding to creation.');
         // Fallback to creation
         await this.walletManager.createPasskeyOnlyWallet(this.config.paymasterApiKey!);
       }

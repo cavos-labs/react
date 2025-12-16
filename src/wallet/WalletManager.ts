@@ -532,7 +532,6 @@ export class WalletManager {
       });
     } catch (error) {
       // Silent fail - don't block user flow for metrics
-      console.debug('[Cavos SDK] Usage tracking failed:', error);
     }
   }
 
