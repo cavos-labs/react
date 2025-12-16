@@ -50,7 +50,7 @@ Add buttons to let users log in.
 import { useCavos } from '@cavos/react';
 
 function Login() {
-  const { login, isAuthenticated, user } = useCavos();
+  const { login, isAuthenticated, user, createWallet } = useCavos();
 
   if (isAuthenticated) {
     return <p>Hello, {user?.email}!</p>;
@@ -60,6 +60,9 @@ function Login() {
     <div>
       <button onClick={() => login('google')}>Login with Google</button>
       <button onClick={() => login('apple')}>Login with Apple</button>
+      
+      {/* Passkey-Only Option */}
+      <button onClick={() => createWallet()}>Continue with Passkey</button>
     </div>
   );
 }
@@ -67,9 +70,13 @@ function Login() {
 
 ### 3. Creating the Wallet
 
-After logging in, the user needs to create their wallet. This happens automatically with a secure passkey (FaceID or TouchID).
+After logging in (or if using Passkey-only mode), the user needs to create their wallet. This happens automatically with a secure passkey (FaceID or TouchID).
 
-Our library handles the user interface for this. You just need to make sure the `CavosProvider` is set up correctly.
+Our library handles the user interface for this using a **Smart Auth** flow:
+1.  **OAuth**: If logged in with Google/Apple, a wallet is created linked to that account.
+2.  **Passkey-Only**: The SDK first checks if a wallet already exists for this passkey (Recovery). If not, it creates a new one.
+
+You just need to make sure the `CavosProvider` is set up correctly.
 
 ### 4. Sending Transactions
 

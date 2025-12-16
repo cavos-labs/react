@@ -190,11 +190,6 @@ export class CavosSDK {
    * This must be called from a user gesture (e.g. button click) to satisfy WebAuthn requirements.
    */
   async createWallet(): Promise<void> {
-    const user = this.authManager.getUserInfo();
-    if (!user) {
-      throw new Error('User info not available');
-    }
-
     if (this.isLimitExceeded) {
       throw new Error('MAU limit reached. Upgrade your plan to create more wallets.');
     }
@@ -208,17 +203,29 @@ export class CavosSDK {
       );
     }
 
-    await this.walletManager.createWallet(user);
+    const user = this.authManager.getUserInfo();
 
-    // Auto-deploy account immediately after creation
+    if (user) {
+      // OAuth Flow
+      await this.walletManager.createWallet(user);
+      await this.walletManager.deployAccountWithPaymaster(
+        this.config.paymasterApiKey!,
+        this.config.network || 'sepolia'
+      );
+    } else {
+      // Passkey-Only Flow (Smart Auth: Recover -> Create)
+      try {
+        console.log('[CavosSDK] Attempting to recover existing passkey wallet first...');
+        await this.walletManager.recoverWalletWithPasskey();
+        console.log('[CavosSDK] Wallet recovered successfully');
+      } catch (error) {
+        console.log('[CavosSDK] Recovery failed, proceeding to creation.');
+        // Fallback to creation
+        await this.walletManager.createPasskeyOnlyWallet(this.config.paymasterApiKey!);
+      }
+    }
 
-    await this.walletManager.deployAccountWithPaymaster(
-      this.config.paymasterApiKey!,
-      this.config.network || 'sepolia'
-    );
-
-
-    // After creation, initialize transaction manager
+    // Initialize transaction manager
     const account = this.walletManager.getAccount();
     if (account) {
       this.transactionManager = new TransactionManager(
@@ -578,5 +585,89 @@ export class CavosSDK {
 
     // Construct final URL
     return `${baseUrl}?${params.toString()}`;
+  }
+
+  // ============================================
+  // PASSKEY-ONLY METHODS
+  // ============================================
+  /**
+   * Load an existing passkey-only wallet
+   */
+  async loadPasskeyOnlyWallet(): Promise<void> {
+    if (!this.walletManager) {
+      this.walletManager = new WalletManager(
+        this.authManager,
+        this.config.starknetRpcUrl!,
+        this.config.network || 'sepolia',
+        this.analyticsManager
+      );
+    }
+
+    await this.walletManager.loadPasskeyOnlyWallet();
+
+    // Initialize transaction manager
+    const account = this.walletManager.getAccount();
+    if (account) {
+      this.transactionManager = new TransactionManager(
+        account,
+        this.config.paymasterApiKey!,
+        this.config.network || 'sepolia',
+        this.analyticsManager
+      );
+    }
+  }
+
+  /**
+   * Recover wallet from backend using an existing passkey
+   */
+  async recoverWalletWithPasskey(): Promise<void> {
+    if (!this.walletManager) {
+      this.walletManager = new WalletManager(
+        this.authManager,
+        this.config.starknetRpcUrl!,
+        this.config.network || 'sepolia',
+        this.analyticsManager
+      );
+    }
+
+    await this.walletManager.recoverWalletWithPasskey();
+
+    // Initialize transaction manager
+    const account = this.walletManager.getAccount();
+    if (account) {
+      this.transactionManager = new TransactionManager(
+        account,
+        this.config.paymasterApiKey!,
+        this.config.network || 'sepolia',
+        this.analyticsManager
+      );
+    }
+  }
+
+  /**
+   * Check if a passkey-only wallet exists locally
+   */
+  async hasPasskeyOnlyWallet(): Promise<boolean> {
+    if (!this.walletManager) {
+      // Create temp manager to check storage
+      const tempManager = new WalletManager(
+        this.authManager,
+        this.config.starknetRpcUrl!,
+        this.config.network || 'sepolia'
+      );
+      return tempManager.hasPasskeyOnlyWallet();
+    }
+    return this.walletManager.hasPasskeyOnlyWallet();
+  }
+
+  /**
+   * Clear passkey-only wallet from local storage
+   */
+  async clearPasskeyOnlyWallet(): Promise<void> {
+    if (this.walletManager) {
+      await this.walletManager.clearPasskeyOnlyWallet();
+    }
+    // Also clear generic session if manual calls
+    localStorage.removeItem('cavos_passkey_wallet');
   }
 }

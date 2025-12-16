@@ -51,14 +51,46 @@ export function CavosProvider({ config, children }: CavosProviderProps) {
           // Clean up URL
           window.history.replaceState({}, document.title, window.location.pathname);
         } else {
-          // Try to restore session
+          // 1. Try to restore OAuth session
           await cavos.init();
+
+          // 2. If no OAuth session, check for Passkey-Only wallet
+          if (!cavos.isAuthenticated() && await cavos.hasPasskeyOnlyWallet()) {
+            try {
+              await cavos.loadPasskeyOnlyWallet();
+              // Set a pseudo-user for UI
+              if (cavos.getAddress()) {
+                setUser({
+                  id: 'passkey-user',
+                  email: 'Passkey Wallet',
+                  name: 'Passkey User',
+                  picture: ''
+                });
+                setIsAuthenticated(true);
+                setAddress(cavos.getAddress());
+              }
+            } catch (e) {
+              console.warn('[CavosProvider] Failed to load passkey wallet:', e);
+            }
+          }
         }
 
-        // Update state if authenticated
-        if (cavos.isAuthenticated()) {
+        // Update state if authenticated (OAuth or Passkey)
+        if (cavos.isAuthenticated() || cavos.getAddress()) {
           setIsAuthenticated(true);
-          setUser(cavos.getUserInfo());
+          const currentUser = cavos.getUserInfo();
+          if (currentUser) {
+            setUser(currentUser);
+          } else if (cavos.getAddress() && !user) {
+            // Fallback for passkey user if not set above
+            setUser({
+              id: 'passkey-user',
+              email: 'Passkey Wallet',
+              name: 'Passkey User',
+              picture: ''
+            });
+          }
+
           const addr = cavos.getAddress();
           if (addr) {
             setAddress(addr);
@@ -167,6 +199,8 @@ export function CavosProvider({ config, children }: CavosProviderProps) {
 
   const logout = useCallback(async () => {
     if (!cavos) throw new Error('Cavos SDK not initialized');
+    // Clear passkey wallet explicitly if needed (handled in SDK now)
+    await cavos.clearPasskeyOnlyWallet();
     await cavos.logout();
     setIsAuthenticated(false);
     setUser(null);

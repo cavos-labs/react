@@ -20,7 +20,7 @@ export class WebAuthnManager {
      * @param userId User's unique identifier (e.g. email or social ID)
      * @param challenge Random challenge from server (or locally generated for client-side derivation)
      */
-    async register(userId: string, challenge: Uint8Array): Promise<CryptoKey> {
+    async register(userId: string, challenge: Uint8Array): Promise<{ encryptionKey: CryptoKey; credentialId: string }> {
         // Create user handle
         const userHandle = new TextEncoder().encode(userId);
 
@@ -76,19 +76,24 @@ export class WebAuthnManager {
 
         // Import the derived key for AES-GCM
         const rawKey = new Uint8Array(prfResult.results.first as any);
-        return await window.crypto.subtle.importKey(
+        const encryptionKey = await window.crypto.subtle.importKey(
             'raw',
             rawKey,
             'AES-GCM',
             true,
             ['encrypt', 'decrypt']
         );
+
+        return {
+            encryptionKey,
+            credentialId: credential.id
+        };
     }
 
     /**
      * Authenticate with existing Passkey and derive the same encryption key
      */
-    async authenticate(challenge: Uint8Array): Promise<CryptoKey> {
+    async authenticate(challenge: Uint8Array): Promise<{ encryptionKey: CryptoKey; credentialId: string }> {
         const prfSalt = new Uint8Array(32).fill(1); // Must match registration salt
 
         const publicKeyCredentialRequestOptions: PublicKeyCredentialRequestOptions = {
@@ -124,13 +129,18 @@ export class WebAuthnManager {
 
         // Import the derived key
         const rawKey = new Uint8Array(prfResult.results.first as any);
-        return await window.crypto.subtle.importKey(
+        const encryptionKey = await window.crypto.subtle.importKey(
             'raw',
             rawKey,
             'AES-GCM',
             true,
             ['encrypt', 'decrypt']
         );
+
+        return {
+            encryptionKey,
+            credentialId: credential.id
+        };
     }
 
     /**

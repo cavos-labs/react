@@ -20,9 +20,13 @@ export class WalletManager {
 
   // ArgentX account class hash (v0.3.0)
   private static readonly ARGENT_ACCOUNT_CLASS_HASH = '0x036078334509b514626504edc9fb252328d1a240e4e948bef8d0c08dff45927f';
+  // ArgentX account class hash for passkey signers (no guardian)
+  private static readonly ARGENT_ACCOUNT_CLASS_HASH_PASSKEY = '0x01a736d6ed154502257f02b1ccdf4d9d1089f80811cd6acad48e6b6a9d1f2003';
 
   // Session storage key for caching decrypted wallet
   private static readonly SESSION_WALLET_KEY = 'cavos_wallet_session';
+  // Local storage key for passkey wallet metadata
+  private static readonly PASSKEY_WALLET_KEY = 'cavos_passkey_wallet';
 
   constructor(
     authManager: AuthManager,
@@ -66,7 +70,7 @@ export class WalletManager {
     // We use a random challenge for the registration. In a stricter setup, this comes from server.
     const challenge = window.crypto.getRandomValues(new Uint8Array(32));
 
-    const encryptionKey = await this.webAuthnManager.register(user.email, challenge);
+    const { encryptionKey } = await this.webAuthnManager.register(user.email, challenge);
 
     // 4. Encrypt private key
 
@@ -174,7 +178,7 @@ export class WalletManager {
     // as long as the RP ID is the same.
     const challenge = window.crypto.getRandomValues(new Uint8Array(32));
 
-    const encryptionKey = await this.webAuthnManager.authenticate(challenge);
+    const { encryptionKey } = await this.webAuthnManager.authenticate(challenge);
 
     // 3. Decrypt private key
 
@@ -530,5 +534,277 @@ export class WalletManager {
       // Silent fail - don't block user flow for metrics
       console.debug('[Cavos SDK] Usage tracking failed:', error);
     }
+  }
+
+  // ============================================
+  // PASSKEY-ONLY WALLET METHODS
+  // ============================================
+
+  /**
+   * Create a wallet using ONLY a passkey (WebAuthn)
+   * No OAuth login required. Wallet is stored locally.
+   */
+  async createPasskeyOnlyWallet(paymasterApiKey: string): Promise<void> {
+    const userId = `user_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    const challenge = window.crypto.getRandomValues(new Uint8Array(32));
+
+    // 1. Register passkey with anonymous ID
+    const { encryptionKey, credentialId } = await this.webAuthnManager.register(userId, challenge);
+
+    // 2. Generate wallet keypair
+    const privateKey = ec.starkCurve.utils.randomPrivateKey();
+    const privateKeyHex = '0x' + Buffer.from(privateKey).toString('hex');
+    const publicKey = ec.starkCurve.getStarkKey(privateKey);
+    const publicKeyHex = publicKey.startsWith('0x') ? publicKey : '0x' + publicKey;
+
+    // 3. Compute wallet address
+    const address = await this.computePasskeyWalletAddress(publicKeyHex);
+
+    // 4. Encrypt private key
+    const { ciphertext, iv } = await this.webAuthnManager.encrypt(encryptionKey, privateKeyHex);
+
+    // 5. Store locally using localStorage (persistent)
+    localStorage.setItem(
+      WalletManager.PASSKEY_WALLET_KEY,
+      JSON.stringify({
+        credentialId,
+        address,
+        publicKey: publicKeyHex,
+        encryptedBlob: `${iv}:${ciphertext}`,
+      })
+    );
+
+    // 6. Set wallet state
+    this.currentWallet = {
+      address,
+      publicKey: publicKeyHex,
+      privateKey: privateKeyHex,
+    };
+    this.currentAccount = new Account(this.provider, address, privateKeyHex);
+
+    // 7. Auto-deploy wallet
+    await this.deployPasskeyWallet(paymasterApiKey);
+
+    // 8. Save wallet to backend (for recovery with passkey)
+    await this.savePasskeyWalletToBackend(credentialId, address, `${iv}:${ciphertext}`);
+
+    // 9. Track usage
+    await this.trackUsage(address);
+  }
+
+  /**
+   * Load an existing passkey-only wallet from local storage
+   */
+  async loadPasskeyOnlyWallet(): Promise<void> {
+    const dataStr = localStorage.getItem(WalletManager.PASSKEY_WALLET_KEY);
+    if (!dataStr) {
+      throw new Error('No passkey wallet found');
+    }
+
+    const data = JSON.parse(dataStr);
+
+    // Authenticate with passkey
+    const challenge = window.crypto.getRandomValues(new Uint8Array(32));
+    const { encryptionKey } = await this.webAuthnManager.authenticate(challenge);
+
+    // Decrypt private key
+    const [iv, ciphertext] = data.encryptedBlob.split(':');
+    const privateKeyHex = await this.webAuthnManager.decrypt(encryptionKey, ciphertext, iv);
+
+    // Set wallet state
+    this.currentWallet = {
+      address: data.address,
+      publicKey: data.publicKey,
+      privateKey: privateKeyHex,
+    };
+    this.currentAccount = new Account(this.provider, data.address, privateKeyHex);
+  }
+
+  /**
+   * Recover wallet from backend using an existing passkey
+   */
+  async recoverWalletWithPasskey(): Promise<void> {
+    // 1. Authenticate with passkey
+    const challenge = window.crypto.getRandomValues(new Uint8Array(32));
+    const { encryptionKey, credentialId } = await this.webAuthnManager.authenticate(challenge);
+
+    // 2. Try to fetch wallet from backend using credentialId
+    const backendWallet = await this.fetchPasskeyWalletFromBackend(credentialId);
+
+    if (!backendWallet) {
+      throw new Error('No wallet found in backend for this passkey.');
+    }
+
+    // 3. Decrypt private key
+    const [iv, ciphertext] = backendWallet.encryptedBlob.split(':');
+    const privateKeyHex = await this.webAuthnManager.decrypt(encryptionKey, ciphertext, iv);
+
+    // 4. Derive public key
+    const privateKeyBytes = Buffer.from(privateKeyHex.replace('0x', ''), 'hex');
+    const publicKey = ec.starkCurve.getStarkKey(privateKeyBytes);
+    const publicKeyHex = publicKey.startsWith('0x') ? publicKey : '0x' + publicKey;
+
+    // 5. Save to local storage for future use
+    localStorage.setItem(
+      WalletManager.PASSKEY_WALLET_KEY,
+      JSON.stringify({
+        credentialId,
+        address: backendWallet.address,
+        publicKey: publicKeyHex,
+        encryptedBlob: backendWallet.encryptedBlob,
+      })
+    );
+
+    // 6. Set wallet state
+    this.currentWallet = {
+      address: backendWallet.address,
+      publicKey: publicKeyHex,
+      privateKey: privateKeyHex,
+    };
+    this.currentAccount = new Account(this.provider, backendWallet.address, privateKeyHex);
+  }
+
+  /**
+   * Check if a passkey-only wallet exists locally
+   */
+  async hasPasskeyOnlyWallet(): Promise<boolean> {
+    return !!localStorage.getItem(WalletManager.PASSKEY_WALLET_KEY);
+  }
+
+  /**
+   * Compute wallet address for passkey-only wallet
+   */
+  private async computePasskeyWalletAddress(publicKey: string): Promise<string> {
+    const constructorCallData = CallData.compile({
+      owner: publicKey,
+      guardian: '0x0',
+    });
+
+    return hash.calculateContractAddressFromHash(
+      publicKey,  // salt is publicKey
+      WalletManager.ARGENT_ACCOUNT_CLASS_HASH_PASSKEY,
+      constructorCallData,
+      0
+    );
+  }
+
+  /**
+   * Deploy passkey-only wallet via AVNU Paymaster
+   */
+  private async deployPasskeyWallet(paymasterApiKey: string): Promise<string> {
+    if (!this.currentWallet) throw new Error('No passkey wallet');
+
+    const starkKeyPub = this.currentWallet.publicKey;
+    const constructorCallData = CallData.compile({
+      owner: starkKeyPub,
+      guardian: '0x0',
+    });
+
+    const deploymentData = {
+      class_hash: WalletManager.ARGENT_ACCOUNT_CLASS_HASH_PASSKEY,
+      salt: starkKeyPub,
+      unique: '0x0',
+      calldata: constructorCallData.map((x) => `0x${BigInt(x).toString(16)}`),
+    };
+
+    const baseUrl = this.network === 'sepolia'
+      ? 'https://sepolia.api.avnu.fi'
+      : 'https://starknet.api.avnu.fi';
+
+    try {
+      await fetch(`${baseUrl}/paymaster/v1/build-typed-data`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'api-key': paymasterApiKey },
+        body: JSON.stringify({
+          userAddress: this.currentWallet.address,
+          accountClassHash: WalletManager.ARGENT_ACCOUNT_CLASS_HASH_PASSKEY,
+          deploymentData: deploymentData,
+          calls: [],
+        }),
+      });
+
+      const deployResponse = await fetch(`${baseUrl}/paymaster/v1/deploy-account`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'api-key': paymasterApiKey },
+        body: JSON.stringify({
+          userAddress: this.currentWallet.address,
+          deploymentData,
+        }),
+      });
+
+      if (!deployResponse.ok) throw new Error(await deployResponse.text());
+      const deployResult = await deployResponse.json();
+
+      if (deployResult.transactionHash) {
+        await this.provider.waitForTransaction(deployResult.transactionHash);
+      }
+
+      return deployResult.transactionHash;
+    } catch (error: any) {
+      const errorMessage = error.message || error.toString();
+      if (errorMessage.includes('already deployed') || errorMessage.includes('CONTRACT_ADDRESS_UNAVAILABLE')) {
+        return this.currentWallet.address;
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Save passkey wallet to backend for recovery
+   */
+  private async savePasskeyWalletToBackend(
+    credentialId: string,
+    address: string,
+    encryptedBlob: string
+  ): Promise<void> {
+    const backendUrl = (this.authManager as any).backendUrl || 'https://cavos.xyz';
+    try {
+      await axios.post(`${backendUrl}/api/wallets`, {
+        app_id: this.appId,
+        user_social_id: `passkey:${credentialId}`,
+        network: this.network,
+        address,
+        encrypted_pk_blob: encryptedBlob,
+      });
+    } catch (error) {
+      console.warn('[WalletManager] Failed to save passkey wallet to backend:', error);
+    }
+  }
+
+  /**
+   * Fetch passkey wallet from backend for recovery
+   */
+  private async fetchPasskeyWalletFromBackend(
+    credentialId: string
+  ): Promise<{ address: string; encryptedBlob: string } | null> {
+    const backendUrl = (this.authManager as any).backendUrl || 'https://cavos.xyz';
+    try {
+      const params = new URLSearchParams({
+        app_id: this.appId,
+        user_social_id: `passkey:${credentialId}`,
+        network: this.network,
+      });
+
+      const response = await axios.get(`${backendUrl}/api/wallets?${params.toString()}`);
+
+      if (response.data.found) {
+        return {
+          address: response.data.address,
+          encryptedBlob: response.data.encrypted_pk_blob,
+        };
+      }
+      return null;
+    } catch (error) {
+      console.warn('[WalletManager] Failed to fetch passkey wallet from backend:', error);
+      return null;
+    }
+  }
+  /**
+   * Clear passkey-only wallet from local storage
+   */
+  async clearPasskeyOnlyWallet(): Promise<void> {
+    localStorage.removeItem(WalletManager.PASSKEY_WALLET_KEY);
+    this.currentWallet = null;
+    this.currentAccount = null;
   }
 }
