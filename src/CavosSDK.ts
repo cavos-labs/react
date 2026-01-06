@@ -46,8 +46,11 @@ export class CavosSDK {
     // Initialize analytics manager
     this.analyticsManager = new AnalyticsManager(this.config);
 
-    // Initialize session manager
-    this.sessionManager = new SessionManager(this.config.starknetRpcUrl!);
+    // Initialize session manager with network
+    this.sessionManager = new SessionManager(
+      this.config.starknetRpcUrl!,
+      this.config.network || 'sepolia'
+    );
 
     // Initialize paymaster with default key
     this.paymaster = new PaymasterIntegration(this.config.paymasterApiKey!);
@@ -274,20 +277,170 @@ export class CavosSDK {
     }
   }
 
-  async createSession(): Promise<void> {
-    console.warn('[CavosSDK] Session keys not supported with ArgentX accounts. Use execute() with gasless option instead.');
-    // No-op for ArgentX accounts
+  /**
+   * Create a session for executing transactions without user signature.
+   * User will be prompted to sign the session authorization once.
+   */
+  async createSession(policy: {
+    allowedMethods: Array<{ contractAddress: string; selector: string }>;
+    expiresAt?: number;
+    maxFees?: Array<{ tokenAddress: string; maxAmount: string }>;
+  }): Promise<void> {
+    console.log('[CavosSDK] createSession called with:', policy);
+
+    const account = this.walletManager?.getAccount();
+    const walletInfo = this.walletManager?.getWalletInfo();
+    console.log('[CavosSDK] Account:', account ? account.address : 'null');
+
+    if (!account || !walletInfo) {
+      throw new Error('No wallet loaded. Please login first.');
+    }
+
+    const fullPolicy = {
+      allowedMethods: policy.allowedMethods,
+      expiresAt: policy.expiresAt || Date.now() + 24 * 60 * 60 * 1000, // Default 24 hours
+    };
+    console.log('[CavosSDK] Full policy:', fullPolicy);
+
+    // Pass the wallet's private key for guardian key derivation
+    await this.sessionManager.createSession(account, fullPolicy, walletInfo.privateKey);
+    console.log('[CavosSDK] Session created successfully');
+
+    // EPHEMERAL PK: Clear private key from memory after session is created
+    // The session keys are now stored in sessionStorage and will be used for signing
+    this.walletManager?.clearPrivateKey();
+    console.log('[CavosSDK] Private key cleared (ephemeral PK architecture)');
   }
 
   /**
-   * Execute a transaction
+   * Execute transactions with session key (no user signature required).
+   * Session must be created first with createSession().
+   * Uses gasless execution via paymaster with session key signature.
    */
-  async execute(calls: Call | Call[], options?: { gasless?: boolean }): Promise<string> {
-    if (!this.transactionManager) {
-      throw new Error('Transaction manager not initialized. Please login first.');
+  async executeWithSession(calls: Call | Call[]): Promise<string> {
+    if (!this.sessionManager.hasActiveSession()) {
+      throw new Error('No active session. Call createSession() first.');
     }
 
-    return await this.transactionManager.execute(calls, options);
+    const account = this.walletManager?.getAccount();
+    if (!account) {
+      throw new Error('No wallet loaded');
+    }
+
+    const callsArray = Array.isArray(calls) ? calls : [calls];
+    console.log('[CavosSDK] Executing with session key:', callsArray.length, 'calls');
+
+    // Get paymaster API configuration
+    const baseUrl = this.config.network === 'mainnet'
+      ? 'https://starknet.api.avnu.fi'
+      : 'https://sepolia.api.avnu.fi';
+
+    // Format calls for AVNU API
+    const formattedCalls = callsArray.map(call => ({
+      contractAddress: call.contractAddress,
+      entrypoint: call.entrypoint,
+      calldata: call.calldata ? (call.calldata as string[]).map(c => `0x${BigInt(c).toString(16)}`) : [],
+    }));
+
+    // Step 1: Build typed data from paymaster
+    console.log('[CavosSDK] Building typed data from paymaster...');
+    const buildResponse = await fetch(`${baseUrl}/paymaster/v1/build-typed-data`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'api-key': this.config.paymasterApiKey!,
+      },
+      body: JSON.stringify({
+        userAddress: account.address,
+        calls: formattedCalls,
+      }),
+    });
+
+    if (!buildResponse.ok) {
+      throw new Error(`Build typed data failed: ${await buildResponse.text()}`);
+    }
+
+    const paymasterTypedData = await buildResponse.json();
+    console.log('[CavosSDK] Received typed data from paymaster');
+
+    // Step 2: Sign with session keys (NOT with account private key!)
+    const sessionSignature = await this.sessionManager.signTypedDataWithSession(
+      paymasterTypedData,
+      account.address,
+      callsArray,
+    );
+    console.log('[CavosSDK] Got session signature:', sessionSignature.length, 'elements');
+
+    // Format signature for API
+    const formattedSignature = sessionSignature.map(s =>
+      s.startsWith('0x') ? s : `0x${BigInt(s).toString(16)}`
+    );
+
+    // Step 3: Execute via paymaster with session signature
+    console.log('[CavosSDK] Executing via paymaster with session signature...');
+    const executeResponse = await fetch(`${baseUrl}/paymaster/v1/execute`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'api-key': this.config.paymasterApiKey!,
+      },
+      body: JSON.stringify({
+        userAddress: account.address,
+        typedData: JSON.stringify(paymasterTypedData),
+        signature: formattedSignature,
+      }),
+    });
+
+    if (!executeResponse.ok) {
+      const errorText = await executeResponse.text();
+      console.error('[CavosSDK] Paymaster execute failed:', errorText);
+      throw new Error(`Execute failed: ${errorText}`);
+    }
+
+    const result = await executeResponse.json();
+    console.log('[CavosSDK] Transaction submitted with session key:', result.transactionHash);
+
+    return result.transactionHash;
+  }
+
+  /**
+   * Check if there's an active session.
+   */
+  hasActiveSession(): boolean {
+    return this.sessionManager.hasActiveSession();
+  }
+
+  /**
+   * Clear current session.
+   */
+  clearSession(): void {
+    this.sessionManager.clearSession();
+  }
+
+  /**
+   * Execute a transaction.
+   * Uses session keys for signing - requires an active session.
+   * 
+   * @param calls - The call(s) to execute
+   * @param _options - Execution options (ignored - gasless is always true with session keys)
+   * @returns Transaction hash
+   * @throws Error if no active session
+   */
+  async execute(calls: Call | Call[], _options?: { gasless?: boolean }): Promise<string> {
+    // All transactions with session keys are gasless
+    return this.executeWithSession(calls);
+  }
+
+  /**
+   * Sign a message with the session key.
+   * Uses session keys for signing - requires an active session.
+   * 
+   * @param message - The message hash to sign (must be a hex string)
+   * @returns Signature with r and s components
+   * @throws Error if no active session
+   */
+  async signMessage(message: string): Promise<Signature> {
+    return this.sessionManager.signMessage(message);
   }
 
   /**
@@ -330,26 +483,6 @@ export class CavosSDK {
   async deleteAccount(): Promise<void> {
     await this.authManager.deleteAccount(this.config.appId, this.config.network || 'sepolia');
     await this.logout();
-  }
-
-  /**
-   * Signs a message with the wallet's private key.
-   * @param message The message to sign. Can be a string or a TypedData object.
-   * @returns The signature components r and s.
-   */
-  async signMessage(message: string | TypedData): Promise<Signature> {
-    if (!this.walletManager) {
-      throw new Error('Wallet not initialized. Please login first.');
-    }
-    // @ts-ignore - WalletManager handles the type check
-    return await this.walletManager.signMessage(message);
-  }
-
-  /**
-   * Check if session is active
-   */
-  hasActiveSession(): boolean {
-    return !this.sessionManager.isSessionExpired();
   }
 
   /**
@@ -437,7 +570,7 @@ export class CavosSDK {
   /**
    * Get session account (for advanced usage)
    */
-  getSessionAccount(): Account | null {
+  async getSessionAccount(): Promise<Account | null> {
     return this.sessionManager.getSessionAccount();
   }
 

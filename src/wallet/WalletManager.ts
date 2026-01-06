@@ -1,4 +1,4 @@
-import { Account, CallData, ec, hash, RpcProvider, CairoOption, CairoCustomEnum } from 'starknet';
+import { Account, CallData, ec, hash, RpcProvider, CairoOption, CairoOptionVariant, CairoCustomEnum, shortString } from 'starknet';
 import { UserInfo, DecryptedWallet } from '../types';
 import { WebAuthnManager } from '../security/WebAuthnManager';
 import { AnalyticsManager } from '../analytics/AnalyticsManager';
@@ -18,15 +18,34 @@ export class WalletManager {
   private currentAccount: Account | null = null;
   private userEmail: string | null = null;
 
-  // ArgentX account class hash (v0.3.0)
+  // ArgentX account class hash (v0.4.0 with session support)
   private static readonly ARGENT_ACCOUNT_CLASS_HASH = '0x036078334509b514626504edc9fb252328d1a240e4e948bef8d0c08dff45927f';
-  // ArgentX account class hash for passkey signers (no guardian)
-  private static readonly ARGENT_ACCOUNT_CLASS_HASH_PASSKEY = '0x01a736d6ed154502257f02b1ccdf4d9d1089f80811cd6acad48e6b6a9d1f2003';
 
   // Session storage key for caching decrypted wallet
   private static readonly SESSION_WALLET_KEY = 'cavos_wallet_session';
   // Local storage key for passkey wallet metadata
   private static readonly PASSKEY_WALLET_KEY = 'cavos_passkey_wallet';
+
+  /**
+   * Derive a guardian key from the wallet's private key.
+   * This allows session keys to work without external guardian service.
+   */
+  private static deriveGuardianKey(privateKey: string): { privateKey: string; publicKey: string } {
+    // Hash the private key with "guardian" to derive a separate key
+    const guardianSeed = hash.computePoseidonHashOnElements([
+      BigInt(privateKey),
+      BigInt(shortString.encodeShortString('guardian')),
+    ]);
+    // Ensure proper hex formatting (248 bits = 62 hex chars)
+    const seedBigInt = BigInt(guardianSeed);
+    let guardianHex = seedBigInt.toString(16);
+    while (guardianHex.length < 62) {
+      guardianHex = '0' + guardianHex;
+    }
+    const guardianPrivateKey = '0x' + guardianHex;
+    const guardianPublicKey = ec.starkCurve.getStarkKey(guardianPrivateKey);
+    return { privateKey: guardianPrivateKey, publicKey: guardianPublicKey };
+  }
 
   constructor(
     authManager: AuthManager,
@@ -60,11 +79,11 @@ export class WalletManager {
     const privateKey = ec.starkCurve.utils.randomPrivateKey();
     const publicKey = ec.starkCurve.getStarkKey(privateKey);
 
-    // 2. Compute wallet address
-    const address = await this.computeWalletAddress(publicKey);
-
     const privateKeyHex = '0x' + Buffer.from(privateKey).toString('hex');
     const publicKeyHex = publicKey.startsWith('0x') ? publicKey : '0x' + publicKey;
+
+    // 2. Compute wallet address (includes guardian derived from privateKey)
+    const address = await this.computeWalletAddress(publicKeyHex, privateKeyHex);
 
     // 3. Register Passkey and derive encryption key
     // We use a random challenge for the registration. In a stricter setup, this comes from server.
@@ -136,7 +155,45 @@ export class WalletManager {
    */
   clearWalletSession(): void {
     sessionStorage.removeItem(WalletManager.SESSION_WALLET_KEY);
+  }
 
+  /**
+   * Clear private key from memory after session creation.
+   * This is the key method for ephemeral PK architecture - after creating
+   * a session, the PK is no longer needed and should be deleted for security.
+   */
+  clearPrivateKey(): void {
+    if (this.currentWallet) {
+      // Clear PK from wallet object
+      this.currentWallet = {
+        address: this.currentWallet.address,
+        publicKey: this.currentWallet.publicKey,
+        privateKey: '', // Clear the private key
+      };
+
+      // Update session storage to not contain PK
+      sessionStorage.removeItem(WalletManager.SESSION_WALLET_KEY);
+
+      console.log('[WalletManager] Private key cleared from memory');
+    }
+
+    // Also nullify account signer (it holds the PK)
+    if (this.currentAccount && this.currentWallet) {
+      // Recreate account without signer capability
+      // The account can still be used for address/calls but not signing
+      this.currentAccount = new Account({
+        provider: this.provider,
+        address: this.currentWallet.address,
+        signer: '', // No signer - transactions must use session keys
+      });
+    }
+  }
+
+  /**
+   * Check if private key is available (for session creation).
+   */
+  hasPrivateKey(): boolean {
+    return !!(this.currentWallet?.privateKey && this.currentWallet.privateKey.length > 0);
   }
 
   /**
@@ -376,11 +433,29 @@ export class WalletManager {
 
   /**
    * Compute wallet address using ArgentX pattern (AVNU-compatible)
+   * Includes guardian derived from private key for session key support.
    */
-  private async computeWalletAddress(publicKey: string): Promise<string> {
+  private async computeWalletAddress(publicKey: string, privateKey: string): Promise<string> {
     const starkKeyPub = publicKey;
-    const signer = new CairoCustomEnum({ Starknet: { pubkey: starkKeyPub } });
-    const guardian = new CairoOption(1);
+    const signer = new CairoCustomEnum({
+      Starknet: { pubkey: starkKeyPub },
+      Secp256k1: undefined,
+      Secp256r1: undefined,
+      Eip191: undefined,
+      Webauthn: undefined,
+    });
+
+    // Derive guardian key from private key
+    const guardianKey = WalletManager.deriveGuardianKey(privateKey);
+    const guardianSigner = new CairoCustomEnum({
+      Starknet: { pubkey: guardianKey.publicKey },
+      Secp256k1: undefined,
+      Secp256r1: undefined,
+      Eip191: undefined,
+      Webauthn: undefined,
+    });
+    const guardian = new CairoOption(CairoOptionVariant.Some, guardianSigner);
+
     const constructorCallData = CallData.compile({ owner: signer, guardian: guardian });
 
     return hash.calculateContractAddressFromHash(
@@ -392,15 +467,33 @@ export class WalletManager {
   }
 
   /**
-   * Get deployment data for ArgentX account
+   * Get deployment data for ArgentX account.
+   * Includes guardian derived from private key for session key support.
    */
   getDeploymentData(): any {
     if (!this.currentWallet) throw new Error('No wallet initialized');
 
     const privateKey = this.currentWallet.privateKey;
     const starkKeyPub = ec.starkCurve.getStarkKey(privateKey);
-    const signer = new CairoCustomEnum({ Starknet: { pubkey: starkKeyPub } });
-    const guardian = new CairoOption(1);
+    const signer = new CairoCustomEnum({
+      Starknet: { pubkey: starkKeyPub },
+      Secp256k1: undefined,
+      Secp256r1: undefined,
+      Eip191: undefined,
+      Webauthn: undefined,
+    });
+
+    // Derive guardian key from private key
+    const guardianKey = WalletManager.deriveGuardianKey(privateKey);
+    const guardianSigner = new CairoCustomEnum({
+      Starknet: { pubkey: guardianKey.publicKey },
+      Secp256k1: undefined,
+      Secp256r1: undefined,
+      Eip191: undefined,
+      Webauthn: undefined,
+    });
+    const guardian = new CairoOption(CairoOptionVariant.Some, guardianSigner);
+
     const constructorCallData = CallData.compile({ owner: signer, guardian: guardian });
 
     return {
@@ -556,8 +649,8 @@ export class WalletManager {
     const publicKey = ec.starkCurve.getStarkKey(privateKey);
     const publicKeyHex = publicKey.startsWith('0x') ? publicKey : '0x' + publicKey;
 
-    // 3. Compute wallet address
-    const address = await this.computePasskeyWalletAddress(publicKeyHex);
+    // 3. Compute wallet address (includes guardian derived from privateKey)
+    const address = await this.computePasskeyWalletAddress(publicKeyHex, privateKeyHex);
 
     // 4. Encrypt private key
     const { ciphertext, iv } = await this.webAuthnManager.encrypt(encryptionKey, privateKeyHex);
@@ -672,16 +765,34 @@ export class WalletManager {
 
   /**
    * Compute wallet address for passkey-only wallet
+   * Uses the same class hash as regular wallets for session support
+   * Includes guardian derived from privateKey.
    */
-  private async computePasskeyWalletAddress(publicKey: string): Promise<string> {
-    const constructorCallData = CallData.compile({
-      owner: publicKey,
-      guardian: '0x0',
+  private async computePasskeyWalletAddress(publicKey: string, privateKey: string): Promise<string> {
+    const signer = new CairoCustomEnum({
+      Starknet: { pubkey: publicKey },
+      Secp256k1: undefined,
+      Secp256r1: undefined,
+      Eip191: undefined,
+      Webauthn: undefined,
     });
+
+    // Derive guardian key from private key
+    const guardianKey = WalletManager.deriveGuardianKey(privateKey);
+    const guardianSigner = new CairoCustomEnum({
+      Starknet: { pubkey: guardianKey.publicKey },
+      Secp256k1: undefined,
+      Secp256r1: undefined,
+      Eip191: undefined,
+      Webauthn: undefined,
+    });
+    const guardian = new CairoOption(CairoOptionVariant.Some, guardianSigner);
+
+    const constructorCallData = CallData.compile({ owner: signer, guardian: guardian });
 
     return hash.calculateContractAddressFromHash(
       publicKey,  // salt is publicKey
-      WalletManager.ARGENT_ACCOUNT_CLASS_HASH_PASSKEY,
+      WalletManager.ARGENT_ACCOUNT_CLASS_HASH,
       constructorCallData,
       0
     );
@@ -689,18 +800,37 @@ export class WalletManager {
 
   /**
    * Deploy passkey-only wallet via AVNU Paymaster
+   * Includes guardian derived from privateKey.
    */
   private async deployPasskeyWallet(paymasterApiKey: string): Promise<string> {
     if (!this.currentWallet) throw new Error('No passkey wallet');
 
     const starkKeyPub = this.currentWallet.publicKey;
-    const constructorCallData = CallData.compile({
-      owner: starkKeyPub,
-      guardian: '0x0',
+    const privateKey = this.currentWallet.privateKey;
+
+    const signer = new CairoCustomEnum({
+      Starknet: { pubkey: starkKeyPub },
+      Secp256k1: undefined,
+      Secp256r1: undefined,
+      Eip191: undefined,
+      Webauthn: undefined,
     });
 
+    // Derive guardian key from private key
+    const guardianKey = WalletManager.deriveGuardianKey(privateKey);
+    const guardianSigner = new CairoCustomEnum({
+      Starknet: { pubkey: guardianKey.publicKey },
+      Secp256k1: undefined,
+      Secp256r1: undefined,
+      Eip191: undefined,
+      Webauthn: undefined,
+    });
+    const guardian = new CairoOption(CairoOptionVariant.Some, guardianSigner);
+
+    const constructorCallData = CallData.compile({ owner: signer, guardian: guardian });
+
     const deploymentData = {
-      class_hash: WalletManager.ARGENT_ACCOUNT_CLASS_HASH_PASSKEY,
+      class_hash: WalletManager.ARGENT_ACCOUNT_CLASS_HASH,
       salt: starkKeyPub,
       unique: '0x0',
       calldata: constructorCallData.map((x) => `0x${BigInt(x).toString(16)}`),
@@ -716,7 +846,7 @@ export class WalletManager {
         headers: { 'Content-Type': 'application/json', 'api-key': paymasterApiKey },
         body: JSON.stringify({
           userAddress: this.currentWallet.address,
-          accountClassHash: WalletManager.ARGENT_ACCOUNT_CLASS_HASH_PASSKEY,
+          accountClassHash: WalletManager.ARGENT_ACCOUNT_CLASS_HASH,
           deploymentData: deploymentData,
           calls: [],
         }),

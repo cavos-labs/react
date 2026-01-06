@@ -4,12 +4,20 @@ import { useCavos } from '../CavosContext';
 
 type ExecuteOptions = { gasless?: boolean };
 
+/**
+ * Hook for executing transactions.
+ * Uses session keys for signing - requires an active session.
+ */
 export function useTransaction() {
   const { cavos } = useCavos();
   const [isSending, setIsSending] = useState(false);
   const [error, setError] = useState<Error | null>(null);
   const [txHash, setTxHash] = useState<string | null>(null);
 
+  /**
+   * Send a transaction using the active session key.
+   * Requires an active session - call createSession() first.
+   */
   const sendTransaction = async (calls: Call | Call[], options?: ExecuteOptions) => {
     setIsSending(true);
     setError(null);

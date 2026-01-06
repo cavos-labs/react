@@ -1,7 +1,7 @@
 'use client';
 import React, { createContext, useContext, useEffect, useState, useCallback, ReactNode } from 'react';
 import { CavosSDK } from '../CavosSDK';
-import { CavosConfig, UserInfo, OnrampProvider, LoginProvider, TypedData, Signature } from '../types';
+import { CavosConfig, UserInfo, OnrampProvider, LoginProvider, Signature } from '../types';
 import { Call } from 'starknet';
 import { PasskeyModal } from './components/PasskeyModal';
 
@@ -15,7 +15,7 @@ export interface CavosContextValue {
   login: (provider: LoginProvider, redirectUri?: string) => Promise<void>;
   createWallet: () => Promise<void>;
   execute: (calls: Call | Call[], options?: { gasless?: boolean }) => Promise<string>;
-  signMessage: (message: string | TypedData) => Promise<Signature>;
+  signMessage: (message: string) => Promise<Signature>;
   deleteAccount: () => Promise<void>;
   retryWalletUnlock: () => Promise<void>;
   getOnramp: (provider: OnrampProvider) => string;
@@ -152,8 +152,16 @@ export function CavosProvider({ config, children }: CavosProviderProps) {
     setIsLoading(true);
     try {
       await cavos.createWallet();
-      setAddress(cavos.getAddress());
+
+      // Update all authentication state after wallet creation
+      const walletAddress = cavos.getAddress();
+      const userInfo = cavos.getUserInfo();
+
+      setAddress(walletAddress);
+      setIsAuthenticated(!!walletAddress);
+      setUser(userInfo);
       setRequiresWalletCreation(false);
+      setHasActiveSession(cavos.hasActiveSession());
     } catch (error: any) {
       console.error('[CavosProvider] Create wallet error:', error);
       // Re-throw the error so developers can handle it
@@ -168,7 +176,7 @@ export function CavosProvider({ config, children }: CavosProviderProps) {
     return cavos.execute(calls, options);
   }, [cavos]);
 
-  const signMessage = useCallback(async (message: string | TypedData) => {
+  const signMessage = useCallback(async (message: string) => {
     if (!cavos) throw new Error('Cavos SDK not initialized');
     return cavos.signMessage(message);
   }, [cavos]);

@@ -1,16 +1,18 @@
 import { Call } from 'starknet';
 
 export interface SessionPolicy {
+  allowedMethods: Array<{
+    contractAddress: string;
+    selector: string;
+  }>;
   expiresAt: number;
-  allowedMethods: string[];
-  spendingLimits?: {
+  maxFees?: Array<{
+    tokenAddress: string;
     maxAmount: string;
-    period: number;
-  };
-  whitelistedAddresses?: string[];
+  }>;
 }
 
-export interface SessionKey {
+export interface CavosSessionKey {
   publicKey: string;
   privateKey: string;
   policy: SessionPolicy;
@@ -18,7 +20,7 @@ export interface SessionKey {
 }
 
 export interface SessionData {
-  sessionKey: SessionKey;
+  sessionKey: CavosSessionKey;
   accountAddress: string;
   chainId: string;
 }
