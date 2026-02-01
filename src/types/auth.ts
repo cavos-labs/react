@@ -25,4 +25,9 @@ export interface AuthState {
   provider: OAuthProvider | null;
 }
 
-export type LoginProvider = 'google' | 'apple';
+export type LoginProvider = 'google' | 'apple' | 'firebase';
+
+export interface FirebaseCredentials {
+  email: string;
+  password: string;
+}

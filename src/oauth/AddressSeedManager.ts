@@ -1,0 +1,91 @@
+/**
+ * AddressSeedManager - Computes deterministic wallet addresses from OAuth identity
+ *
+ * address_seed = Poseidon(sub, salt)
+ *
+ * The address_seed uniquely identifies a wallet owner based on their
+ * OAuth `sub` claim and a salt value. Same Google account = same wallet.
+ */
+
+import { hash, num } from 'starknet';
+
+export class AddressSeedManager {
+  private salt: string;
+
+  constructor(salt: string = '0') {
+    this.salt = salt;
+  }
+
+  /**
+   * Compute the address seed from a user's OAuth `sub` claim
+   * MUST match Cairo: PoseidonTrait::new().update(sub).update(salt).finalize()
+   * @param sub The OAuth `sub` claim (user ID)
+   */
+  computeAddressSeed(sub: string): string {
+    // Convert sub to felt252 (hash if too long)
+    const subFelt = this.subToFelt(sub);
+    const saltFelt = num.toHex(this.salt);
+
+    // Poseidon([sub, salt]) - matches Cairo's .update().update().finalize()
+    return hash.computePoseidonHashOnElements([subFelt, saltFelt]);
+  }
+
+  /**
+   * Convert a sub claim to a felt252
+   * If sub is numeric and fits in felt252, use directly
+   * Otherwise, hash it
+   */
+  private subToFelt(sub: string): string {
+    // Try to parse as BigInt directly
+    try {
+      const subBigInt = BigInt(sub);
+      // Check if it fits in felt252 (< 2^251)
+      if (subBigInt < 2n ** 251n) {
+        return num.toHex(subBigInt);
+      }
+    } catch {
+      // Not a pure number (e.g. Apple sub), use raw string bytes
+    }
+
+    return this.stringToFelt(sub);
+  }
+
+  private stringToFelt(str: string): string {
+    const bytes = new TextEncoder().encode(str);
+    let result = 0n;
+    for (let i = 0; i < bytes.length && i < 31; i++) {
+      result = result * 256n + BigInt(bytes[i]);
+    }
+    return num.toHex(result);
+  }
+
+  /**
+   * Compute the contract address for an OAuth wallet
+   * @param sub The OAuth `sub` claim
+   * @param classHash The OAuth account contract class hash
+   * @param jwksRegistryAddress The JWKS registry contract address
+   * @param deployerAddress The deployer contract address (for session registration)
+   */
+  computeContractAddress(
+    sub: string,
+    classHash: string,
+    jwksRegistryAddress: string,
+    deployerAddress: string
+  ): string {
+    const addressSeed = this.computeAddressSeed(sub);
+
+    // Constructor calldata: [address_seed, jwks_registry, deployer]
+    const constructorCalldata = [addressSeed, jwksRegistryAddress, deployerAddress];
+
+    // Use starknet.js utility to calculate address
+    // This handles the correct hash function (Pedersen vs Poseidon) based on protocol defaults
+    const contractAddress = hash.calculateContractAddressFromHash(
+      addressSeed, // salt
+      classHash,
+      constructorCalldata,
+      0 // deployer_address is 0
+    );
+
+    return contractAddress;
+  }
+}

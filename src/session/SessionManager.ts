@@ -1,7 +1,6 @@
 /**
  * Session Keys Implementation
  * Based on Argent's contract-level session library
- * Uses passkey-derived guardian key instead of cloud API
  */
 
 import {
@@ -627,6 +626,8 @@ export class SessionManager {
       return;
     }
 
+    if (typeof window === 'undefined') return;
+
     try {
       const sessionData = {
         // Account info
@@ -664,6 +665,7 @@ export class SessionManager {
    */
   loadSessionFromStorage(): boolean {
     try {
+      if (typeof window === 'undefined') return false;
       const stored = sessionStorage.getItem(SessionManager.SESSION_STORAGE_KEY);
       if (!stored) {
         return false;
@@ -711,6 +713,7 @@ export class SessionManager {
    */
   clearSessionStorage(): void {
     try {
+      if (typeof window === 'undefined') return;
       sessionStorage.removeItem(SessionManager.SESSION_STORAGE_KEY);
       console.log('[SessionManager] Session storage cleared');
     } catch (error) {
@@ -723,6 +726,7 @@ export class SessionManager {
    */
   isSessionSaved(): boolean {
     try {
+      if (typeof window === 'undefined') return false;
       return sessionStorage.getItem(SessionManager.SESSION_STORAGE_KEY) !== null;
     } catch {
       return false;

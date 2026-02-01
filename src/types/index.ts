@@ -3,25 +3,12 @@ export * from './session';
 export * from './wallet';
 export * from './storage';
 export * from './auth';
-export * from './modal';
 
 export interface UserInfo {
     id: string;
     email: string;
     name?: string;
     picture?: string;
-}
-
-export interface DecryptedWallet {
-    address: string;
-    publicKey: string;
-    privateKey: string;
-}
-
-export interface PasskeyModalConfig {
-    title?: string;
-    description?: string;
-    buttonText?: string;
 }
 
 // Signature types

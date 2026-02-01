@@ -1,5 +1,3 @@
-import type { PasskeyModalConfig } from './modal';
-
 export interface CavosConfig {
   /** Your app ID from Cavos dashboard (https://cavos.xyz/dashboard) */
   appId: string;
@@ -13,8 +11,34 @@ export interface CavosConfig {
   paymasterApiKey?: string;
   /** Enable debug logging (default: false) */
   enableLogging?: boolean;
-  /** Passkey modal configuration */
-  passkeyModal?: PasskeyModalConfig;
+  /** OAuth Wallet configuration (optional, uses defaults for network if not provided) */
+  oauthWallet?: Partial<OAuthWalletConfig>;
+  /** Session configuration for ephemeral keys */
+  session?: SessionConfig;
+}
+
+/** Configuration for ephemeral session duration */
+export interface SessionConfig {
+  /** Session duration in blocks (default: 2880 = ~24 hours at 30s/block) */
+  sessionDuration?: number;
+  /** Grace period for renewal in blocks (default: 2880 = ~24 hours) */
+  renewalGracePeriod?: number;
+}
+
+/** Configuration for OAuth Wallet mode */
+export interface OAuthWalletConfig {
+  /** Address of the deployed JWKS Registry contract */
+  jwksRegistryAddress: string;
+  /** Address of the OAuth Account class hash (for deployment) */
+  cavosAccountClassHash: string;
+  /** Salt for address derivation (default: '0') */
+  salt?: string;
+  /** Address of the Deployer contract (for gasless deployment via INVOKE) */
+  deployerContractAddress: string;
+  /** Relayer address to act as sender for deployment transaction */
+  relayerAddress: string;
+  /** Relayer private key */
+  relayerPrivateKey: string;
 }
 
 export interface AuthConfig {
