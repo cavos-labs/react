@@ -79,6 +79,89 @@ export class OAuthWalletManager {
   }
 
   /**
+   * Set the per-app salt for wallet address derivation.
+   * Called by CavosSDK after fetching app_salt from backend.
+   * Re-computes wallet address if session exists with different salt.
+   */
+  setAppSalt(salt: string): void {
+    this.config.salt = salt;
+    this.addressSeedManager = new AddressSeedManager(salt);
+
+    // If session exists and has a sub claim, re-compute the wallet address
+    if (this.session?.jwtClaims?.sub) {
+      const sub = this.session.jwtClaims.sub;
+      const deployerAddress = this.config.deployerContractAddress || '0x0';
+
+      // Re-compute with new salt
+      const newAddressSeed = this.addressSeedManager.computeAddressSeed(sub);
+      const newWalletAddress = this.addressSeedManager.computeContractAddress(
+        sub,
+        this.config.cavosAccountClassHash,
+        this.config.jwksRegistryAddress,
+        deployerAddress
+      );
+
+      // Update session with new values
+      this.session = {
+        ...this.session,
+        addressSeed: newAddressSeed,
+        walletAddress: newWalletAddress,
+      };
+
+      // Persist updated session
+      this.persistSession();
+    }
+  }
+
+
+  /**
+   * Generate a new session with fresh ephemeral key (for renewal).
+   * Returns a complete OAuthSession that can be used for renewal.
+   */
+  async generateNewSession(): Promise<OAuthSession> {
+    const currentSession = this.getSession();
+    if (!currentSession?.walletAddress || !currentSession.jwtClaims?.sub) {
+      throw new Error('No current session to renew from');
+    }
+
+    // Generate ephemeral key pair
+    const STARK_CURVE_ORDER = BigInt('0x800000000000010ffffffffffffffffb781126dcae7b2321e66a241adc64d2f');
+
+    const randomBytes = crypto.getRandomValues(new Uint8Array(32));
+    let privateKeyBigInt = BigInt('0x' + Array.from(randomBytes).map(b => b.toString(16).padStart(2, '0')).join(''));
+
+    privateKeyBigInt = (privateKeyBigInt % (STARK_CURVE_ORDER - 1n)) + 1n;
+
+    const ephemeralPrivateKey = '0x' + privateKeyBigInt.toString(16);
+    const ephemeralPubKey = ec.starkCurve.getStarkKey(ephemeralPrivateKey);
+
+    // Get current block number
+    const block = await this.provider.getBlockNumber();
+    const currentBlock = BigInt(block);
+
+    // Generate nonce params
+    const nonceParams = NonceManager.generateNonceParams(
+      ephemeralPubKey,
+      currentBlock,
+      BigInt(this.sessionDuration),
+      BigInt(this.renewalGracePeriod)
+    );
+
+    const nonce = NonceManager.computeNonce(nonceParams);
+
+    // Create new session object reusing current session data
+    const newSession: OAuthSession = {
+      ...currentSession,
+      ephemeralPrivateKey,
+      ephemeralPubKey,
+      nonceParams,
+      nonce,
+    };
+
+    return newSession;
+  }
+
+  /**
    * Initialize a new OAuth session before redirecting to OAuth provider
    * Generates ephemeral key and computes nonce
    */
@@ -221,17 +304,14 @@ export class OAuthWalletManager {
 
     // Compute address seed and wallet address
     const addressSeed = this.addressSeedManager.computeAddressSeed(jwtClaims.sub);
-    if (!this.config.deployerContractAddress) {
-      throw new Error('Deployer contract address not configured');
-    }
+    const deployerAddress = this.config.deployerContractAddress || '0x0';
 
     const walletAddress = this.addressSeedManager.computeContractAddress(
       jwtClaims.sub,
       this.config.cavosAccountClassHash,
       this.config.jwksRegistryAddress,
-      this.config.deployerContractAddress
+      deployerAddress
     );
-
     // Update session with JWT data
     this.session = {
       ...this.session,
@@ -349,18 +429,8 @@ export class OAuthWalletManager {
     // Calculate n_prime and R^2
     const { n_prime, r_sq } = this.calculateMontgomeryConstants(modulusLimbs);
 
-    console.log('=== BUILDING JWT SIGNATURE DATA (PACKED + MONTGOMERY) ===');
-    console.log('jwt_sub (original):', jwtClaims.sub);
-    console.log('jwt_sub (felt):', jwt_sub_felt);
-    console.log('salt (config):', this.config.salt);
-    console.log('salt (hex):', salt_hex);
-    console.log('addressSeed (stored):', addressSeed);
-    console.log('ephemeralPubKey:', ephemeralPubKey);
-    console.log('nonce:', this.session.nonce);
-    console.log('claim offsets:', offsets);
-    console.log('signed data length:', signedDataBytes.length);
-    console.log('packed chunks count:', packedBytes.length);
-    console.log('===================================');
+    const jwt_kid_value = this.extractKidFromJwt(jwt);
+    const jwt_kid_felt = this.stringToFelt(jwt_kid_value);
 
     const sig: string[] = [
       '0x4f415554485f4a57545f5631', // OAUTH_JWT_V1 magic
@@ -430,7 +500,6 @@ export class OAuthWalletManager {
       // specific implementation returns hex strings, convert to bigints for calculation
       return limbs.map(l => BigInt(l));
     } catch (error) {
-      console.error("Error fetching JWKS:", error);
       throw error;
     }
   }
@@ -465,55 +534,6 @@ export class OAuthWalletManager {
     const n_inv = modInverse(n, R);
     const n_prime_val = (R - n_inv) % R;
     const r_sq_val = (R * R) % n;
-
-    // --- DEBUG VERIFICATION START ---
-    try {
-      console.log("--- OFFLINE MONTGOMERY VERIFICATION ---");
-      const montMul = (a: bigint, b: bigint, _n: bigint, _n_prime: bigint): bigint => {
-        const T = a * b;
-        const m = ((T & (R - 1n)) * _n_prime) & (R - 1n);
-        const t = (T + m * _n) / R;
-        if (t >= _n) return t - _n;
-        return t;
-      };
-
-      const montPow = (base: bigint, exp: bigint, _n: bigint, _n_prime: bigint): bigint => {
-        const r_mod_n = R % _n;
-        const r_sq_mod_n = (R * R) % _n;
-        // Convert base to mont form: base * R mod n
-        let x = montMul(base, r_sq_mod_n, _n, _n_prime);
-        let res = montMul(1n, r_sq_mod_n, _n, _n_prime); // 1 in mont form
-
-        // Exponent is 65537 (0x10001)
-        // 17 bits.
-        for (let i = 0; i < 17; i++) {
-          if ((exp & (1n << BigInt(i))) !== 0n) {
-            res = montMul(res, x, _n, _n_prime);
-          }
-          x = montMul(x, x, _n, _n_prime);
-        }
-        // Convert back: res * 1 mod n
-        return montMul(res, 1n, _n, _n_prime);
-      };
-
-      // Check n_prime correctness: n * n' = -1 mod R
-      const check = (n * n_prime_val) % R;
-      const target = R - 1n;
-      console.log(`n * n' mod R = ${check.toString(16)} (Expected ${target.toString(16)})`);
-      if (check !== target) console.error("FATAL: n_prime calculation incorrect");
-
-      // Simple mul check: 2 * 3 = 6
-      const r_mod_n = R % n;
-      const r_sq_check = (R * R) % n;
-      const a_mont = montMul(2n, r_sq_check, n, n_prime_val);
-      const b_mont = montMul(3n, r_sq_check, n, n_prime_val);
-      const prod_mont = montMul(a_mont, b_mont, n, n_prime_val);
-      const prod = montMul(prod_mont, 1n, n, n_prime_val);
-      console.log(`2 * 3 = ${prod} (Montgomery checked)`);
-    } catch (e) {
-      console.error("Offline verification failed:", e);
-    }
-    // --- DEBUG VERIFICATION END ---
 
     // Convert back to limbs
     const toLimbs = (val: bigint): string[] => {
@@ -633,9 +653,6 @@ export class OAuthWalletManager {
 
     const oldSession = { ...this.session };
 
-    console.log('[OAuthWalletManager] Freshening session...');
-    console.log('[OAuthWalletManager] Old Ephemeral Pubkey:', oldSession.ephemeralPubKey);
-
     // Generate NEW ephemeral key pair
     const STARK_CURVE_ORDER = BigInt('0x800000000000010ffffffffffffffffb781126dcae7b2321e66a241adc64d2f');
     const randomBytes = crypto.getRandomValues(new Uint8Array(32));
@@ -645,13 +662,9 @@ export class OAuthWalletManager {
     const ephemeralPrivateKey = '0x' + privateKeyBigInt.toString(16);
     const ephemeralPubKey = ec.starkCurve.getStarkKey(ephemeralPrivateKey);
 
-    console.log('[OAuthWalletManager] New Ephemeral Pubkey:', ephemeralPubKey);
-
     // Get current block number
     const block = await this.provider.getBlockNumber();
     const currentBlock = BigInt(block);
-    console.log('[OAuthWalletManager] Current Block:', currentBlock.toString());
-
     // New nonce params with configured duration
     const nonceParams = NonceManager.generateNonceParams(
       ephemeralPubKey,
@@ -661,8 +674,6 @@ export class OAuthWalletManager {
     );
 
     const nonce = NonceManager.computeNonce(nonceParams);
-    console.log('[OAuthWalletManager] New Nonce:', nonce);
-
     // Update session
     this.session = {
       ...this.session,
@@ -674,7 +685,6 @@ export class OAuthWalletManager {
 
     // Persist freshened session
     this.persistSession();
-    console.log('[OAuthWalletManager] Session freshened and persisted.');
 
     return oldSession;
   }
@@ -818,7 +828,7 @@ export class OAuthWalletManager {
     const header = parts[0];
     const payload = parts[1];
 
-    // Decode header and payload JSON
+    // Decode header and payload JSON to get claim values
     const headerJson = JSON.parse(atob(this.base64UrlToBase64(header)));
     const payloadJson = JSON.parse(atob(this.base64UrlToBase64(payload)));
 
@@ -831,27 +841,68 @@ export class OAuthWalletManager {
     const decodedPayload = atob(this.base64UrlToBase64(payload));
     const decodedHeader = atob(this.base64UrlToBase64(header));
 
-    // Find offsets in decoded strings
-    // sub is in payload
-    const subPattern = `"sub":"${subValue}"`;
-    const subIdx = decodedPayload.indexOf(subPattern);
-    const subValueStart = subIdx >= 0 ? subIdx + 7 : 0; // +7 for `"sub":"`
+    // Find offsets in the DECODED JSON strings
+    // The contract will decode the base64 segment and look for claims at these offsets
+    // Offsets are relative to each decoded segment, NOT to the full signedData
 
-    // nonce is in payload
-    const noncePattern = `"nonce":"${nonceValue}"`;
-    const nonceIdx = decodedPayload.indexOf(noncePattern);
-    const nonceValueStart = nonceIdx >= 0 ? nonceIdx + 9 : 0; // +9 for `"nonce":"`
+    // Helper to find claim value start offset in decoded JSON
+    // Searches for the pattern "key":"value" or "key": "value" (with optional space)
+    const findClaimValueOffset = (decoded: string, key: string, value: string): number => {
+      // Try exact pattern first (no space after colon)
+      const exactPattern = `"${key}":"${value}"`;
+      let idx = decoded.indexOf(exactPattern);
+      if (idx >= 0) {
+        // Offset is after "key":"
+        return idx + key.length + 4; // 4 = `":"` + opening quote of value
+      }
 
-    // kid is in header
-    const kidPattern = `"kid":"${kidValue}"`;
-    const kidIdx = decodedHeader.indexOf(kidPattern);
-    const kidValueStart = kidIdx >= 0 ? kidIdx + 7 : 0; // +7 for `"kid":"`
+      // Try pattern with space after colon
+      const spacedPattern = `"${key}": "${value}"`;
+      idx = decoded.indexOf(spacedPattern);
+      if (idx >= 0) {
+        // Offset is after "key": "
+        return idx + key.length + 5; // 5 = `": "` + opening quote of value
+      }
 
-    // Log for debugging
-    console.log('[findClaimOffsets] Claim positions in decoded JSON:');
-    console.log(`  sub: "${subValue}" at offset ${subValueStart}, len ${subValue.length}`);
-    console.log(`  nonce: "${nonceValue}" at offset ${nonceValueStart}, len ${nonceValue.length}`);
-    console.log(`  kid: "${kidValue}" at offset ${kidValueStart}, len ${kidValue.length}`);
+      // Fallback: search for just the key and find the value
+      const keyPattern = `"${key}"`;
+      idx = decoded.indexOf(keyPattern);
+      if (idx >= 0) {
+        // Find the colon after the key
+        const colonIdx = decoded.indexOf(':', idx + key.length + 2);
+        if (colonIdx >= 0) {
+          // Find the opening quote of the value
+          const valueQuoteIdx = decoded.indexOf('"', colonIdx + 1);
+          if (valueQuoteIdx >= 0) {
+            return valueQuoteIdx + 1; // After the opening quote
+          }
+        }
+      }
+
+      return -1;
+    };
+
+    // Find offsets in the DECODED JSON strings
+    // The contract will decode the base64 segment and look for claims at these offsets
+    // Offsets are relative to each decoded segment, NOT to the full signedData
+
+    // sub is in payload (decoded)
+    const subValueStart = findClaimValueOffset(decodedPayload, 'sub', subValue);
+    if (subValueStart < 0) {
+      throw new Error(`Failed to find sub claim in JWT payload`);
+    }
+
+    // nonce is in payload (decoded)
+    const nonceValueStart = findClaimValueOffset(decodedPayload, 'nonce', nonceValue);
+    if (nonceValueStart < 0) {
+      throw new Error(`Failed to find nonce claim in JWT payload`);
+    }
+
+    // kid is in header (decoded)
+    const kidValueStart = findClaimValueOffset(decodedHeader, 'kid', kidValue);
+    if (kidValueStart < 0) {
+      throw new Error(`Failed to find kid claim in JWT header`);
+    }
 
     return {
       sub_offset: subValueStart,
@@ -878,6 +929,7 @@ export class OAuthWalletManager {
         email,
         password,
         nonce: this.session!.nonce,
+        app_id: this.appId,
       }),
     });
 
@@ -886,7 +938,28 @@ export class OAuthWalletManager {
       throw new Error(error.error || 'Registration failed');
     }
 
-    const { jwt } = await response.json();
+    const data = await response.json();
+
+    // Handle verification required response
+    if (data.status === 'verification_required') {
+      // Store pending verification state
+      if (typeof localStorage !== 'undefined') {
+        localStorage.setItem('cavos_pending_verification', JSON.stringify({
+          email,
+          app_id: this.appId,
+          timestamp: Date.now(),
+        }));
+      }
+
+      // Import dynamically to avoid circular dependencies
+      const { EmailVerificationRequiredError } = await import('./errors');
+      throw new EmailVerificationRequiredError(
+        data.message || 'Please check your email to verify your account before logging in',
+        email
+      );
+    }
+
+    const { jwt } = data;
 
     // Process JWT same as Google/Apple
     return this.processFirebaseJWT(jwt);
@@ -907,17 +980,66 @@ export class OAuthWalletManager {
         email,
         password,
         nonce: this.session!.nonce,
+        app_id: this.appId,
       }),
     });
 
     if (!response.ok) {
       const error = await response.json();
+
+      // Handle email not verified error
+      if (error.error === 'email_not_verified') {
+        // Import dynamically to avoid circular dependencies
+        const { EmailNotVerifiedError } = await import('./errors');
+        throw new EmailNotVerifiedError(
+          error.message || 'Please verify your email before logging in',
+          email
+        );
+      }
+
       throw new Error(error.error || 'Login failed');
     }
 
     const { jwt } = await response.json();
 
     return this.processFirebaseJWT(jwt);
+  }
+
+  /**
+   * Check if email is verified for the app
+   */
+  async checkEmailVerification(email: string): Promise<boolean> {
+    try {
+      const response = await fetch(
+        `${this.backendUrl}/api/oauth/firebase/check-verification?app_id=${this.appId}&email=${encodeURIComponent(email)}`
+      );
+
+      if (!response.ok) {
+        return false;
+      }
+
+      const { verified } = await response.json();
+      return verified;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  /**
+   * Resend verification email
+   */
+  async resendVerificationEmail(email: string): Promise<void> {
+    const response = await fetch(`${this.backendUrl}/api/oauth/firebase/resend-verification`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, app_id: this.appId }),
+    });
+
+    if (!response.ok) {
+      const error = await response.json();
+      throw new Error(error.error || 'Failed to resend verification email');
+    }
+
   }
 
   /**
@@ -938,15 +1060,13 @@ export class OAuthWalletManager {
 
     // Compute address seed and wallet address
     const addressSeed = this.addressSeedManager.computeAddressSeed(jwtClaims.sub);
-    if (!this.config.deployerContractAddress) {
-      throw new Error('Deployer contract address not configured');
-    }
+    const deployerAddress = this.config.deployerContractAddress || '0x0';
 
     const walletAddress = this.addressSeedManager.computeContractAddress(
       jwtClaims.sub,
       this.config.cavosAccountClassHash,
       this.config.jwksRegistryAddress,
-      this.config.deployerContractAddress
+      deployerAddress
     );
 
     // Update session with JWT data

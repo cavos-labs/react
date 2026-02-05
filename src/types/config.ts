@@ -33,12 +33,18 @@ export interface OAuthWalletConfig {
   cavosAccountClassHash: string;
   /** Salt for address derivation (default: '0') */
   salt?: string;
-  /** Address of the Deployer contract (for gasless deployment via INVOKE) */
-  deployerContractAddress: string;
-  /** Relayer address to act as sender for deployment transaction */
-  relayerAddress: string;
-  /** Relayer private key */
-  relayerPrivateKey: string;
+  /**
+   * @deprecated No longer used - deployment is now self-custodial via PaymasterRpc
+   */
+  deployerContractAddress?: string;
+  /**
+   * @deprecated No longer used - no relayer dependency
+   */
+  relayerAddress?: string;
+  /**
+   * @deprecated No longer used - no relayer dependency
+   */
+  relayerPrivateKey?: string;
 }
 
 export interface AuthConfig {

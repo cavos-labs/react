@@ -4,7 +4,7 @@
  * Handles:
  * - Transaction signing with ephemeral keys
  * - Building JWT signature data for on-chain verification
- * - Account deployment
+ * - Account deployment (self-deploy via paymaster)
  * - Paymaster integration
  */
 
@@ -12,13 +12,70 @@ import {
   Account,
   Call,
   RpcProvider,
+  PaymasterRpc,
   num,
   typedData,
   hash,
   ec,
+  Signer,
+  type Signature,
+  type TypedData,
 } from 'starknet';
 import { OAuthWalletManager, OAuthSession } from './OAuthWalletManager';
 import { OAuthWalletConfig } from '../types/config';
+
+/**
+ * Custom signer for OAuth accounts.
+ * Produces JWT signatures for deploy and session signatures for execute.
+ */
+class OAuthSigner extends Signer {
+  private oauthManager: OAuthWalletManager;
+  private forDeploy: boolean;
+
+  constructor(oauthManager: OAuthWalletManager, forDeploy: boolean = false) {
+    super();
+    this.oauthManager = oauthManager;
+    this.forDeploy = forDeploy;
+  }
+
+  async getPubKey(): Promise<string> {
+    const session = this.oauthManager.getSession();
+    return session?.ephemeralPubKey || '0x0';
+  }
+
+  async signMessage(typedDataInput: TypedData, accountAddress: string): Promise<Signature> {
+    // For OutsideExecution (paymaster), compute the typed data hash properly
+    const msgHash = typedData.getMessageHash(typedDataInput, accountAddress);
+
+    if (this.forDeploy) {
+      // For deploy, use full JWT signature
+      return await this.oauthManager.buildJWTSignatureData(msgHash);
+    } else {
+      // For execute, use lightweight session signature
+      return this.oauthManager.buildSessionSignature(msgHash);
+    }
+  }
+
+  async signTransaction(
+    _transactions: Call[],
+    details: any
+  ): Promise<Signature> {
+    const txHash = details.transactionHash || '0x0';
+
+    if (this.forDeploy) {
+      return await this.oauthManager.buildJWTSignatureData(txHash);
+    } else {
+      return this.oauthManager.buildSessionSignature(txHash);
+    }
+  }
+
+  async signDeployAccountTransaction(details: any): Promise<Signature> {
+    const txHash = details.transactionHash || '0x0';
+
+    // Deploy always uses full JWT signature
+    return await this.oauthManager.buildJWTSignatureData(txHash);
+  }
+}
 
 export class OAuthTransactionManager {
   private config: OAuthWalletConfig;
@@ -27,6 +84,7 @@ export class OAuthTransactionManager {
   private paymasterApiKey: string;
   private network: 'mainnet' | 'sepolia';
   private account: Account | null = null;
+  private paymasterRpc: PaymasterRpc;
 
   constructor(
     config: OAuthWalletConfig,
@@ -40,6 +98,16 @@ export class OAuthTransactionManager {
     this.oauthManager = oauthManager;
     this.paymasterApiKey = paymasterApiKey;
     this.network = network;
+
+    // Initialize PaymasterRpc
+    const paymasterUrl = network === 'mainnet'
+      ? 'https://starknet.paymaster.avnu.fi'
+      : 'https://sepolia.paymaster.avnu.fi';
+
+    this.paymasterRpc = new PaymasterRpc({
+      nodeUrl: paymasterUrl,
+      headers: { 'x-paymaster-api-key': paymasterApiKey },
+    });
   }
 
   /**
@@ -58,9 +126,71 @@ export class OAuthTransactionManager {
   }
 
   /**
-   * Deploy the OAuth account contract using paymaster.
-   * This uses the new deploy_oauth_account_with_session function that
-   * registers the session during deployment, avoiding expensive on-chain RSA verification.
+   * Get session status from on-chain.
+   * Returns detailed status including whether it's expired and if it can be renewed.
+   */
+  async getSessionStatus(): Promise<{
+    registered: boolean;
+    expired: boolean;
+    canRenew: boolean;
+    maxBlock?: bigint;
+    renewalDeadline?: bigint;
+  }> {
+    const session = this.oauthManager.getSession();
+    if (!session?.walletAddress || !session.ephemeralPubKey) {
+      return { registered: false, expired: false, canRenew: false };
+    }
+
+    try {
+      const result = await this.provider.callContract({
+        contractAddress: session.walletAddress,
+        entrypoint: 'get_session',
+        calldata: [session.ephemeralPubKey],
+      });
+
+      // get_session returns (nonce, max_block, renewal_deadline, registered_at)
+      const nonce = BigInt(result[0]);
+      const maxBlock = BigInt(result[1]);
+      const renewalDeadline = BigInt(result[2]);
+
+      const registered = nonce !== 0n;
+
+      if (!registered) {
+        return { registered: false, expired: false, canRenew: false };
+      }
+
+      // Get current block number
+      const currentBlock = BigInt((await this.provider.getBlockNumber()) || 0);
+
+      const expired = currentBlock >= maxBlock;
+      const canRenew = expired && currentBlock < renewalDeadline;
+
+      return { registered, expired, canRenew, maxBlock, renewalDeadline };
+    } catch {
+      return { registered: false, expired: false, canRenew: false };
+    }
+  }
+
+  /**
+   * Check if the current session is registered on-chain.
+   * Calls the contract's get_session(ephemeral_pubkey) function.
+   * If nonce == 0, the session is NOT registered.
+   */
+  async isSessionRegistered(): Promise<boolean> {
+    const status = await this.getSessionStatus();
+    return status.registered && !status.expired;
+  }
+
+  /**
+   * Deploy the OAuth account contract using starknet.js PaymasterRpc (Self-Deploy).
+   *
+   * The account deploys ITSELF via AVNU Paymaster - no relayer needed!
+   *
+   * Flow:
+   * 1. Create counterfactual Account with OAuthSigner and PaymasterRpc
+   * 2. Build AccountDeploymentData
+   * 3. Call executePaymasterTransaction with deploymentData
+   * 4. Contract's __validate_deploy__ verifies JWT and registers session
    */
   async deployAccount(): Promise<string> {
     const session = this.oauthManager.getSession();
@@ -68,139 +198,86 @@ export class OAuthTransactionManager {
       throw new Error('No valid session for deployment');
     }
 
-    if (!this.config.deployerContractAddress) {
-      throw new Error('Deployer contract address not configured');
+    // Deployer address is legacy - no longer used but kept for contract constructor compatibility
+    const deployerAddress = this.config.deployerContractAddress || '0x0';
+
+    // Check if already deployed
+    const alreadyDeployed = await this.isDeployed();
+    if (alreadyDeployed) {
+      return 'already-deployed';
     }
 
-    if (!this.config.relayerAddress || !this.config.relayerPrivateKey) {
-      throw new Error('Relayer configuration missing');
-    }
+    // Constructor calldata: [address_seed, jwks_registry, deployer]
+    const constructorCalldata = [
+      session.addressSeed,
+      this.config.jwksRegistryAddress,
+      deployerAddress,
+    ].map(c => num.toHex(c));
 
-    const baseUrl = this.network === 'mainnet'
-      ? 'https://starknet.api.avnu.fi'
-      : 'https://sepolia.api.avnu.fi';
+    // Create custom signer for deploy (uses full JWT signature)
+    const deploySigner = new OAuthSigner(this.oauthManager, true);
 
-    // Extract session parameters for on-chain registration
-    const ephemeralPubkey = session.ephemeralPubKey;
-    const nonce = session.nonce;
-    const maxBlock = session.nonceParams.maxBlock;
-    const renewalDeadline = session.nonceParams.renewalDeadline;
+    // Create counterfactual Account with PaymasterRpc (starknet.js v9 syntax)
+    const counterfactualAccount = new Account({
+      provider: this.provider,
+      address: session.walletAddress,
+      signer: deploySigner,
+      paymaster: this.paymasterRpc,
+    });
 
-    console.log('[OAuthTransactionManager] Deploying account with session registration...');
-    console.log('[OAuthTransactionManager] CLASS HASH BEING USED:', this.config.cavosAccountClassHash);
-    console.log('[OAuthTransactionManager] JWKS Registry:', this.config.jwksRegistryAddress);
-    console.log('[OAuthTransactionManager] Deployer:', this.config.deployerContractAddress);
-    console.log('[OAuthTransactionManager] Ephemeral pubkey:', ephemeralPubkey);
-    console.log('[OAuthTransactionManager] Nonce:', nonce);
-    console.log('[OAuthTransactionManager] Max block:', maxBlock.toString());
-    console.log('[OAuthTransactionManager] Renewal deadline:', renewalDeadline.toString());
-
-    // Calldata for deploy_oauth_account_with_session:
-    // [class_hash, salt, address_seed, jwks_registry, ephemeral_pubkey, nonce, max_block, renewal_deadline, signature_len, ...signature]
-
-    // We need to provide a valid JWT signature.
-    // The contract's verify_jwt_and_register_session_internal does NOT check the ephemeral signature (r,s)
-    // against the transaction hash (because in this Case the Relayer is the transaction sender).
-    // So we can sign a dummy hash here.
-    const dummyTxHash = '0x0';
-    const jwtSignature = await this.oauthManager.buildJWTSignatureData(dummyTxHash);
-
-    const deployCall: Call = {
-      contractAddress: this.config.deployerContractAddress,
-      entrypoint: 'deploy_oauth_account_with_session',
-      calldata: [
-        this.config.cavosAccountClassHash,
-        session.addressSeed,
-        session.addressSeed, // salt matches addressSeed
-        this.config.jwksRegistryAddress,
-        ephemeralPubkey,
-        nonce,
-        num.toHex(maxBlock),
-        num.toHex(renewalDeadline),
-        num.toHex(jwtSignature.length), // signature_len
-        ...jwtSignature,                // signature span
-      ]
+    // Build AccountDeploymentData per starknet.js spec
+    const deploymentData = {
+      address: session.walletAddress,
+      class_hash: this.config.cavosAccountClassHash,
+      salt: session.addressSeed,
+      calldata: constructorCalldata,
+      version: 1 as const,
     };
 
-    // Step 1: Build typed data for Relayer
-    const buildResponse = await fetch(`${baseUrl}/paymaster/v1/build-typed-data`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'api-key': this.paymasterApiKey,
-      },
-      body: JSON.stringify({
-        userAddress: this.config.relayerAddress,
-        calls: [deployCall],
-      }),
-    });
-
-    if (!buildResponse.ok) {
-      const errorText = await buildResponse.text();
-      console.error('[OAuthTransactionManager] Relayer build failed:', errorText);
-      throw new Error(`Relayer build failed: ${errorText}`);
-    }
-
-    const paymasterTypedData = await buildResponse.json();
-
-    // Step 2: Sign with Relayer Private Key (Standard Starknet Signature)
-    // We need a temporary Account instance to sign SNIP-12 data easily, or just use `account.signMessage`
-    const relayerAccount = new Account({
-      provider: this.provider,
-      address: this.config.relayerAddress,
-      signer: this.config.relayerPrivateKey
-    });
-
-    // Sign the typed data
-    const signature = await relayerAccount.signMessage(paymasterTypedData);
-
-    // Format signature for API (ensure hex strings)
-    const formattedSignature = Array.isArray(signature)
-      ? signature.map(s => num.toHex(s))
-      : [num.toHex(signature.r), num.toHex(signature.s)];
-
-    // Step 3: Execute via paymaster
     try {
-      const executeResponse = await fetch(`${baseUrl}/paymaster/v1/execute`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'api-key': this.paymasterApiKey,
-        },
-        body: JSON.stringify({
-          userAddress: this.config.relayerAddress,
-          typedData: JSON.stringify(paymasterTypedData),
-          signature: formattedSignature,
-        }),
-      });
+      // Execute deploy with paymaster sponsorship using starknet.js
+      const feesDetails = {
+        feeMode: { mode: 'sponsored' as const },
+        deploymentData: deploymentData,
+      };
 
-      if (!executeResponse.ok) {
-        const errorText = await executeResponse.text();
-        // Check for "already deployed" error
-        if (errorText.includes('contract already deployed') || errorText.includes('0x48997c5f27f1308e2266befb0693d0df10e6e097a9de9c66f3b8cb542fb032b')) {
-          console.log('[OAuthTransactionManager] Account already deployed (caught from Relayer error).');
-          return 'already-deployed';
-        }
-        console.error('[OAuthTransactionManager] Relayer execute failed:', errorText);
-        throw new Error(`Relayer execute failed: ${errorText}`);
-      }
+      // For DEPLOY_ACCOUNT, call executePaymasterTransaction with empty calls
+      const result = await counterfactualAccount.executePaymasterTransaction(
+        [], // No calls - just deploy
+        feesDetails
+      );
 
-      const result = await executeResponse.json();
-      console.log('[OAuthTransactionManager] Deploy tx hash:', result.transactionHash);
-      return result.transactionHash;
+      // Wait for confirmation
+      await this.provider.waitForTransaction(result.transaction_hash);
+
+      return result.transaction_hash;
 
     } catch (e: any) {
-      if (e.message.includes('contract already deployed') || e.message.includes('already-deployed')) {
+      const errorMsg = e.message || e.toString();
+      if (
+        errorMsg.includes('contract already deployed') ||
+        errorMsg.includes('already deployed') ||
+        errorMsg.includes('already-deployed') ||
+        errorMsg.includes('Class hash') && errorMsg.includes('not supported')
+      ) {
+        // If class hash not supported, fall back to note
+        if (errorMsg.includes('not supported')) {
+          throw new Error('Class hash not supported by paymaster. Contact AVNU to whitelist.');
+        }
         return 'already-deployed';
       }
+
       throw e;
     }
   }
 
   /**
    * Execute calls using the OAuth wallet with paymaster.
-   * Assumes the session was registered during deployment.
-   * Uses lightweight session signatures (no RSA verification).
+   * Uses AVNU API with automatic session handling:
+   * - Session NOT registered: Uses JWT signature (registers + executes in one tx)
+   * - Session expired but renewable: Auto-renews then executes
+   * - Session active: Uses lightweight session signature
+   * - Session expired outside grace: Throws error (user must re-login)
    */
   async execute(calls: Call | Call[]): Promise<string> {
     const session = this.oauthManager.getSession();
@@ -210,12 +287,50 @@ export class OAuthTransactionManager {
 
     const callsArray = Array.isArray(calls) ? calls : [calls];
 
+    // Check session status on-chain
+    const status = await this.getSessionStatus();
+    // Case 1: Session not registered - use JWT signature via AVNU (registers + executes)
+    if (!status.registered) {
+      return this.executeWithAVNUAPI(callsArray, session, true); // forceJWT=true
+    }
+
+    // Case 2: Session expired but can be renewed - auto-renew then execute
+    if (status.expired && status.canRenew) {
+      // Generate new session
+      const newSession = await this.oauthManager.generateNewSession();
+
+      // Renew the session
+      await this.renewSession(newSession);
+
+      // Now execute with the new session signature
+      return this.executeWithAVNUAPI(callsArray, newSession);
+    }
+
+    // Case 3: Session expired and outside grace period - cannot renew
+    if (status.expired && !status.canRenew) {
+      throw new Error('SESSION_EXPIRED: Session has expired outside grace period. Please login again.');
+    }
+
+    // Case 4: Session is active - use session signature (cheap)
+    return this.executeWithAVNUAPI(callsArray, session);
+  }
+
+
+  /**
+   * Execute with AVNU API.
+   * @param forceJWT If true, uses JWT signature (for first tx). Otherwise uses session signature.
+   */
+  private async executeWithAVNUAPI(calls: Call[], session: OAuthSession, forceJWT: boolean = false): Promise<string> {
+    if (!session.walletAddress) {
+      throw new Error('No wallet address in session');
+    }
+
     const baseUrl = this.network === 'mainnet'
       ? 'https://starknet.api.avnu.fi'
       : 'https://sepolia.api.avnu.fi';
 
     // Format calls for AVNU API
-    const formattedCalls = callsArray.map(call => ({
+    const formattedCalls = calls.map(call => ({
       contractAddress: call.contractAddress,
       entrypoint: call.entrypoint,
       calldata: call.calldata
@@ -245,9 +360,10 @@ export class OAuthTransactionManager {
     // Compute message hash
     const messageHash = this.computeTypedDataHash(paymasterTypedData, session.walletAddress);
 
-    // Build lightweight session signature (no RSA verification needed!)
-    // The session was registered during deployment, so we can use cheap signatures now
-    const signature = this.oauthManager.buildSessionSignature(messageHash);
+    // Build signature (JWT for first tx, session for subsequent)
+    const signature = forceJWT
+      ? await this.oauthManager.buildJWTSignatureData(messageHash)
+      : this.oauthManager.buildSessionSignature(messageHash);
 
     // Execute via paymaster
     const executePayload = {
@@ -292,23 +408,18 @@ export class OAuthTransactionManager {
     const pollInterval = 3000; // Poll every 3 seconds
     let attemptCount = 0;
 
-    console.log(`[OAuthTransactionManager] Waiting for tx ${txHash} to confirm...`);
-
     while (Date.now() - startTime < timeout) {
       attemptCount++;
       try {
         const receipt = await this.provider.getTransactionReceipt(txHash);
         if (receipt) {
-          console.log(`[OAuthTransactionManager] Receipt found after ${attemptCount} attempts:`, receipt);
-
           // Check if transaction was successful
           const isSuccessful = (receipt as any).execution_status === 'SUCCEEDED' ||
-                              (receipt as any).status === 'ACCEPTED_ON_L2' ||
-                              (receipt as any).finality_status === 'ACCEPTED_ON_L2' ||
-                              (receipt as any).finality_status === 'ACCEPTED_ON_L1';
+            (receipt as any).status === 'ACCEPTED_ON_L2' ||
+            (receipt as any).finality_status === 'ACCEPTED_ON_L2' ||
+            (receipt as any).finality_status === 'ACCEPTED_ON_L1';
 
           if (isSuccessful) {
-            console.log(`[OAuthTransactionManager] Transaction confirmed successfully!`);
             return;
           }
 
@@ -323,7 +434,6 @@ export class OAuthTransactionManager {
         if (error.message && error.message.includes('reverted')) {
           throw error;
         }
-        console.log(`[OAuthTransactionManager] Attempt ${attemptCount}: tx not ready yet...`);
       }
 
       await new Promise(resolve => setTimeout(resolve, pollInterval));
@@ -439,8 +549,6 @@ export class OAuthTransactionManager {
       throw new Error('New session data incomplete');
     }
 
-    console.log('[OAuthTransactionManager] Renewing session via grace period...');
-
     // Sign the new session params with the OLD ephemeral key
     // Message = poseidon(new_ephemeral_pubkey, new_nonce, new_max_block, new_renewal_deadline)
     const message = hash.computePoseidonHashOnElements([
@@ -521,7 +629,6 @@ export class OAuthTransactionManager {
     }
 
     const result = await executeResponse.json();
-    console.log('[OAuthTransactionManager] Session renewed! Tx hash:', result.transactionHash);
     return result.transactionHash;
   }
 
@@ -545,8 +652,6 @@ export class OAuthTransactionManager {
     if (!this.config.relayerAddress || !this.config.relayerPrivateKey) {
       throw new Error('Relayer configuration missing');
     }
-
-    console.log('[OAuthTransactionManager] Registering session via deployer (fallback)...');
 
     const baseUrl = this.network === 'mainnet'
       ? 'https://starknet.api.avnu.fi'
@@ -626,9 +731,13 @@ export class OAuthTransactionManager {
     }
 
     const result = await executeResponse.json();
-    console.log('[OAuthTransactionManager] Session registered via deployer! Tx hash:', result.transactionHash);
+
+    // Wait for transaction confirmation
+    await this.provider.waitForTransaction(result.transactionHash);
+
     return result.transactionHash;
   }
+
   /**
    * Get the wallet address
    */

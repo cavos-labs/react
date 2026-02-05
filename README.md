@@ -1,19 +1,18 @@
 # @cavos/react
 
-A library to add secure, easy-to-use wallets to your React application.
+A library to add secure, easy-to-use wallets to your React application using OAuth-based authentication.
 
-It lets your users log in with Google or Apple and creates a secure wallet for them. They do not need to worry about private keys or seed phrases.
+Users log in with Google, Apple, or email/password (Firebase) and get a smart account wallet on Starknet. No seed phrases, no private key management—just simple, secure authentication.
 
 ## Why use this?
 
-- **Easy Login**: Users sign in with their existing Google or Apple accounts.
-- **Secure**: The private keys are created on the user's device, encrypted with their passkeys which generates a blob saved on our platform for the user to restore it. Only the user can access their wallet.
-- **Free Transactions**: We pay the gas fees for your users, so they do not need to buy ETH or STRK to start using your app.
-- **Works Everywhere**: Users can access their wallet from any device by logging in.
+- **Easy Login**: Users sign in with Google, Apple, or email/password
+- **Self-Custodial**: JWT-based authentication with ephemeral session keys—no server holds your keys
+- **Gasless Transactions**: Powered by AVNU Paymaster for free transactions
+- **Session Management**: Automatic session registration and renewal with grace periods
+- **Works Everywhere**: Access your wallet from any device by logging in
 
 ## Installation
-
-Run this command in your project folder:
 
 ```bash
 npm install @cavos/react starknet
@@ -32,8 +31,8 @@ function App() {
   return (
     <CavosProvider
       config={{
-        appId: 'your-app-id', // Get this from your Cavos dashboard
-        network: 'sepolia', // Use 'mainnet' for real money, 'sepolia' for testing
+        appId: 'your-app-id', // Get this from Cavos dashboard
+        network: 'sepolia',   // 'mainnet' or 'sepolia'
       }}
     >
       <YourApp />
@@ -42,65 +41,114 @@ function App() {
 }
 ```
 
-### 2. Login Buttons
+### 2. Login with OAuth
 
-Add buttons to let users log in.
+Add login buttons for Google, Apple, or Firebase email/password.
 
 ```tsx
 import { useCavos } from '@cavos/react';
 
 function Login() {
-  const { login, isAuthenticated, user, createWallet } = useCavos();
+  const { login, register, isAuthenticated, user, walletStatus } = useCavos();
 
   if (isAuthenticated) {
-    return <p>Hello, {user?.email}!</p>;
+    return (
+      <div>
+        <p>Logged in as: {user?.id}</p>
+        <p>Status: {walletStatus.isReady ? 'Ready' : 'Setting up...'}</p>
+      </div>
+    );
   }
 
   return (
     <div>
-      <button onClick={() => login('google')}>Login with Google</button>
-      <button onClick={() => login('apple')}>Login with Apple</button>
-      
-      {/* Passkey-Only Option */}
-      <button onClick={() => createWallet()}>Continue with Passkey</button>
+      {/* OAuth Login */}
+      <button onClick={() => login('google')}>
+        Login with Google
+      </button>
+      <button onClick={() => login('apple')}>
+        Login with Apple
+      </button>
+
+      {/* Email/Password (Firebase) */}
+      <button onClick={() => login('firebase', {
+        email: 'user@example.com',
+        password: 'password123'
+      })}>
+        Login with Email
+      </button>
+
+      {/* Register with Email/Password */}
+      <button onClick={() => register('firebase', {
+        email: 'user@example.com',
+        password: 'password123'
+      })}>
+        Sign Up with Email
+      </button>
     </div>
   );
 }
 ```
 
-### 3. Creating the Wallet
+### 3. Wallet Status Tracking
 
-After logging in (or if using Passkey-only mode), the user needs to create their wallet. This happens automatically with a secure passkey (FaceID or TouchID).
-
-Our library handles the user interface for this using a **Smart Auth** flow:
-1.  **OAuth**: If logged in with Google/Apple, a wallet is created linked to that account.
-2.  **Passkey-Only**: The SDK first checks if a wallet already exists for this passkey (Recovery). If not, it creates a new one.
-
-You just need to make sure the `CavosProvider` is set up correctly.
-
-### 4. Sending Transactions
-
-You can send transactions on the blockchain easily.
+The SDK automatically tracks wallet deployment and session registration state.
 
 ```tsx
 import { useCavos } from '@cavos/react';
 
-function SendMoney() {
-  const { execute } = useCavos();
+function WalletStatus() {
+  const { walletStatus, address } = useCavos();
+
+  return (
+    <div>
+      <p>Address: {address}</p>
+      <p>Deployed: {walletStatus.isDeployed ? 'Yes' : 'No'}</p>
+      <p>Session Active: {walletStatus.isSessionActive ? 'Yes' : 'No'}</p>
+      <p>Ready: {walletStatus.isReady ? 'Yes' : 'No'}</p>
+
+      {walletStatus.isDeploying && <p>Deploying account...</p>}
+      {walletStatus.isRegistering && <p>Registering session...</p>}
+    </div>
+  );
+}
+```
+
+**WalletStatus fields:**
+- `isDeploying`: Account deployment in progress
+- `isDeployed`: Account exists on-chain
+- `isRegistering`: Session registration in progress
+- `isSessionActive`: Session registered and valid
+- `isReady`: Wallet is ready to execute transactions (all setup complete)
+
+### 4. Sending Transactions
+
+Execute transactions on Starknet. The SDK automatically:
+- Checks if the session is registered on-chain
+- Registers the session if needed (via deployer)
+- Uses gasless execution via AVNU Paymaster
+
+```tsx
+import { useCavos } from '@cavos/react';
+
+function SendTransaction() {
+  const { execute, walletStatus } = useCavos();
 
   const handleSend = async () => {
+    if (!walletStatus.isReady) {
+      console.log('Wallet not ready yet');
+      return;
+    }
+
     try {
       // Single transaction
-      const transactionHash = await execute(
-        {
-          contractAddress: '0x...', // The address of the contract you want to interact with
-          entrypoint: 'transfer',   // The function to call
-          calldata: ['0x...', '1000', '0'], // recipient, amount_low, amount_high
-        },
-        { gasless: true } // Enable gasless transactions
-      );
+      const txHash = await execute({
+        contractAddress: '0x...',
+        entrypoint: 'transfer',
+        calldata: ['0x...', '1000', '0'], // recipient, amount_low, amount_high
+      });
 
-      console.log('Transaction hash:', transactionHash);
+      console.log('Transaction hash:', txHash);
     } catch (error) {
       console.error('Transaction failed:', error);
     }
@@ -109,23 +157,20 @@ function SendMoney() {
   const handleMulticall = async () => {
     try {
       // Multiple transactions (executed atomically)
-      const transactionHash = await execute(
-        [
-          {
-            contractAddress: '0x...',
-            entrypoint: 'approve',
-            calldata: ['0x...', '1000', '0'],
-          },
-          {
-            contractAddress: '0x...',
-            entrypoint: 'transfer',
-            calldata: ['0x...', '500', '0'],
-          },
-        ],
-        { gasless: true }
-      );
+      const txHash = await execute([
+        {
+          contractAddress: '0x...',
+          entrypoint: 'approve',
+          calldata: ['0x...', '1000', '0'],
+        },
+        {
+          contractAddress: '0x...',
+          entrypoint: 'transfer',
+          calldata: ['0x...', '500', '0'],
+        },
+      ]);
 
-      console.log('Multicall transaction hash:', transactionHash);
+      console.log('Multicall hash:', txHash);
     } catch (error) {
       console.error('Multicall failed:', error);
     }
@@ -133,16 +178,103 @@ function SendMoney() {
 
   return (
     <div>
-      <button onClick={handleSend}>Send Transaction</button>
-      <button onClick={handleMulticall}>Send Multicall</button>
+      <button onClick={handleSend} disabled={!walletStatus.isReady}>
+        Send Transaction
+      </button>
+      <button onClick={handleMulticall} disabled={!walletStatus.isReady}>
+        Send Multicall
+      </button>
     </div>
   );
 }
 ```
 
-### 5. Buying Crypto (Onramp)
+### 5. Session Renewal
 
-You can let users buy crypto with their credit card directly in your app.
+Sessions have a `max_block` expiry and a grace period. When expired, renew with:
+
+```tsx
+import { useCavos } from '@cavos/react';
+
+function SessionManager() {
+  const { renewSession } = useCavos();
+
+  const handleRenew = async () => {
+    try {
+      const txHash = await renewSession();
+      console.log('Session renewed:', txHash);
+    } catch (error) {
+      console.error('Renewal failed:', error);
+    }
+  };
+
+  return <button onClick={handleRenew}>Renew Session</button>;
+}
+```
+
+If the grace period expired, the SDK automatically falls back to `registerSessionViaDeployer()`.
+
+### 6. Manual Account Deployment
+
+Usually deployment happens automatically on first login, but you can trigger it manually:
+
+```tsx
+import { useCavos } from '@cavos/react';
+
+function DeployAccount() {
+  const { deployAccount, isAccountDeployed } = useCavos();
+  const [deployed, setDeployed] = useState(false);
+
+  useEffect(() => {
+    isAccountDeployed().then(setDeployed);
+  }, []);
+
+  const handleDeploy = async () => {
+    try {
+      const txHash = await deployAccount();
+      console.log('Deploy tx:', txHash);
+      setDeployed(true);
+    } catch (error) {
+      console.error('Deploy failed:', error);
+    }
+  };
+
+  if (deployed) return <p>Account deployed!</p>;
+
+  return <button onClick={handleDeploy}>Deploy Account</button>;
+}
+```
+
+### 7. Getting Balance
+
+Check the wallet's ETH balance:
+
+```tsx
+import { useCavos } from '@cavos/react';
+
+function Balance() {
+  const { getBalance } = useCavos();
+  const [balance, setBalance] = useState('0');
+
+  useEffect(() => {
+    const fetchBalance = async () => {
+      const bal = await getBalance();
+      setBalance((Number(bal) / 1e18).toFixed(4));
+    };
+
+    fetchBalance();
+    const interval = setInterval(fetchBalance, 30000); // Poll every 30s
+
+    return () => clearInterval(interval);
+  }, [getBalance]);
+
+  return <p>Balance: {balance} ETH</p>;
+}
+```
+
+### 8. Buying Crypto (Onramp)
+
+Let users buy crypto with a credit card (mainnet only):
 
 ```tsx
 import { useCavos } from '@cavos/react';
@@ -152,12 +284,10 @@ function BuyCrypto() {
 
   const handleBuy = () => {
     try {
-      // Get the secure link to buy crypto
       const url = getOnramp('RAMP_NETWORK');
-      // Open it in a new tab
       window.open(url, '_blank');
     } catch (error) {
-      console.error('Error getting onramp link:', error);
+      console.error('Onramp error:', error);
     }
   };
 
@@ -165,84 +295,88 @@ function BuyCrypto() {
 }
 ```
 
-### 6. Handling Wallet Unlock Errors
+### 9. Logout
 
-If a user cancels the passkey prompt or wallet unlock fails, you can handle the error and allow them to retry.
+Clear the session and reset wallet state:
 
 ```tsx
 import { useCavos } from '@cavos/react';
 
-function WalletStatus() {
-  const { isAuthenticated, address, retryWalletUnlock } = useCavos();
-  const [isRetrying, setIsRetrying] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+function LogoutButton() {
+  const { logout } = useCavos();
 
-  const handleRetry = async () => {
-    setIsRetrying(true);
-    setError(null);
-    
-    try {
-      await retryWalletUnlock();
-      console.log('Wallet unlocked successfully');
-    } catch (err: any) {
-      console.error('Wallet unlock failed:', err);
-      setError(err.message || 'Failed to unlock wallet');
-    } finally {
-      setIsRetrying(false);
-    }
-  };
-
-  // User is authenticated but wallet is not loaded
-  if (isAuthenticated && !address) {
-    return (
-      <div>
-        <p>Your wallet needs to be unlocked with your passkey.</p>
-        {error && <p style={{ color: 'red' }}>{error}</p>}
-        <button onClick={handleRetry} disabled={isRetrying}>
-          {isRetrying ? 'Unlocking...' : 'Unlock Wallet'}
-        </button>
-      </div>
-    );
-  }
-
-  return <p>Wallet Address: {address}</p>;
+  return <button onClick={() => logout()}>Logout</button>;
 }
 ```
 
-### 7. Account Deletion
-
-Allow users to permanently delete their account and wallet.
+## Configuration Options
 
 ```tsx
-import { useCavos } from '@cavos/react';
+interface CavosConfig {
+  appId: string;                    // Your app ID from Cavos dashboard
+  network?: 'mainnet' | 'sepolia';  // Default: 'sepolia'
+  backendUrl?: string;              // Custom backend URL (optional)
+  paymasterApiKey?: string;         // AVNU Paymaster key (optional, uses default)
+  starknetRpcUrl?: string;          // Custom RPC URL (optional)
+  enableLogging?: boolean;          // Enable SDK logs (default: false)
+}
+```
 
-function AccountSettings() {
-  const { deleteAccount } = useCavos();
+## Architecture
 
-  const handleDelete = async () => {
-    const confirmed = window.confirm(
-      'Are you sure you want to delete your account? This action cannot be undone.'
-    );
+- **OAuth Wallet**: JWT-based authentication with ephemeral session keys
+- **Session Management**: On-chain session registration with `max_block` expiry and grace period
+- **Paymaster**: AVNU Paymaster sponsorship for gasless transactions
+- **Self-Custody**: No server holds keys—JWT + ephemeral key is the auth mechanism
+- **Account Recovery**: Re-login with OAuth to regain access
 
-    if (!confirmed) return;
+## API Reference
 
-    try {
-      await deleteAccount();
-      console.log('Account deleted successfully');
-      // User will be logged out automatically
-    } catch (error) {
-      console.error('Failed to delete account:', error);
-    }
-  };
+### useCavos()
 
-  return (
-    <button onClick={handleDelete} style={{ color: 'red' }}>
-      Delete Account
-    </button>
-  );
+Returns:
+```typescript
+{
+  // Authentication
+  login: (provider: 'google' | 'apple' | 'firebase', credentials?: FirebaseCredentials) => Promise<void>
+  register: (provider: 'firebase', credentials: FirebaseCredentials) => Promise<void>
+  logout: () => Promise<void>
+  isAuthenticated: boolean
+  user: UserInfo | null
+
+  // Wallet
+  address: string | null
+  walletStatus: WalletStatus
+
+  // Transactions
+  execute: (calls: Call | Call[]) => Promise<string>
+  deployAccount: () => Promise<string>
+  renewSession: () => Promise<string>
+
+  // Utilities
+  isAccountDeployed: () => Promise<boolean>
+  getBalance: () => Promise<string>
+  getOnramp: (provider: OnrampProvider) => string
+
+  // Loading state
+  isLoading: boolean
+}
+```
+
+### WalletStatus
+
+```typescript
+{
+  isDeploying: boolean      // Deployment in progress
+  isDeployed: boolean       // Account exists on-chain
+  isRegistering: boolean    // Session registration in progress
+  isSessionActive: boolean  // Session is registered
+  isReady: boolean          // Ready to execute (all setup complete)
 }
 ```
 
 ## Need Help?
 
-If you have questions, please check our GitHub repository or contact support.
+- GitHub: [github.com/your-org/cavos](https://github.com)
+- Documentation: [docs.cavos.app](https://docs.cavos.app)
+- Support: support@cavos.app

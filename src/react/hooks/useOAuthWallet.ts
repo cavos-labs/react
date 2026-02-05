@@ -173,24 +173,8 @@ export function useOAuthWallet(hookConfig: UseOAuthWalletConfig): UseOAuthWallet
           console.log('[useOAuthWallet] Account deployed. Hash:', deployHash);
           setIsDeployed(true);
         } else {
-          // Account exists, but we need to register the new session (ephemeral key)
-          // Try to renew first (if supported), otherwise register via deployer
-          setStage('deploying'); // Using 'deploying' stage to show progress, though it's just a tx
-          console.log('[useOAuthWallet] Account exists. Registering new session...');
-
-          try {
-            // Attempt fallback registration via deployer
-            const txHash = await txManager.registerSessionViaDeployer(oauthSession);
-            console.log('[useOAuthWallet] Session registered. Hash:', txHash);
-          } catch (err: any) {
-            console.error('[useOAuthWallet] Session registration failed:', err);
-            // If it failed because "Session already registered", that's fine (maybe page reload)
-            if (!err.message.includes('Session already registered')) {
-              throw err;
-            }
-          }
+          console.log('[useOAuthWallet] Account already deployed.');
         }
-
         setStage('ready');
       } catch (e: any) {
         setError(e.message);

@@ -1,6 +1,6 @@
 'use client';
 import React, { createContext, useContext, useEffect, useState, useCallback, ReactNode } from 'react';
-import { CavosSDK } from '../CavosSDK';
+import { CavosSDK, WalletStatus } from '../CavosSDK';
 import { CavosConfig, UserInfo, OnrampProvider, LoginProvider, Signature, FirebaseCredentials } from '../types';
 import { Call } from 'starknet';
 
@@ -21,6 +21,8 @@ export interface CavosContextValue {
   isAccountDeployed: () => Promise<boolean>;
   deployAccount: () => Promise<string>;
   getBalance: () => Promise<string>;
+  /** Wallet status for tracking deploy/session registration state */
+  walletStatus: WalletStatus;
 }
 
 const CavosContext = createContext<CavosContextValue | null>(null);
@@ -30,6 +32,14 @@ export interface CavosProviderProps {
   children: ReactNode;
 }
 
+const DEFAULT_WALLET_STATUS: WalletStatus = {
+  isDeploying: false,
+  isDeployed: false,
+  isRegistering: false,
+  isSessionActive: false,
+  isReady: false,
+};
+
 export function CavosProvider({ config, children }: CavosProviderProps) {
   const [cavos] = useState(() => new CavosSDK(config));
   const [isAuthenticated, setIsAuthenticated] = useState(false);
@@ -37,6 +47,7 @@ export function CavosProvider({ config, children }: CavosProviderProps) {
   const [address, setAddress] = useState<string | null>(null);
   const [hasActiveSession, setHasActiveSession] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
+  const [walletStatus, setWalletStatus] = useState<WalletStatus>(DEFAULT_WALLET_STATUS);
 
   const updateState = useCallback(() => {
     setIsAuthenticated(cavos.isAuthenticated());
@@ -45,22 +56,34 @@ export function CavosProvider({ config, children }: CavosProviderProps) {
     setHasActiveSession(cavos.isAuthenticated());
   }, [cavos]);
 
+  // Subscribe to wallet status changes
+  useEffect(() => {
+    const unsubscribe = cavos.onWalletStatusChange(setWalletStatus);
+    return unsubscribe;
+  }, [cavos]);
+
   useEffect(() => {
     const initialize = async () => {
       if (typeof window === 'undefined') return;
+      console.log('[CavosContext] initialize() starting');
+
       const urlParams = new URLSearchParams(window.location.search);
       const authData = urlParams.get('auth_data') || urlParams.get('zk_auth_data');
+      console.log('[CavosContext] authData:', authData ? 'present' : 'null');
 
       try {
         if (authData) {
           // Handle OAuth callback
+          console.log('[CavosContext] calling handleCallback()');
           await cavos.handleCallback(authData);
           // Clean up URL
           window.history.replaceState({}, document.title, window.location.pathname);
         } else {
           // Initialize and restore session
+          console.log('[CavosContext] calling init()');
           await cavos.init();
         }
+        console.log('[CavosContext] after init/callback, address:', cavos.getAddress());
         updateState();
       } catch (error) {
         console.error('[CavosProvider] Initialization error:', error);
@@ -148,6 +171,7 @@ export function CavosProvider({ config, children }: CavosProviderProps) {
     isAccountDeployed,
     deployAccount,
     getBalance,
+    walletStatus,
   };
 
   return (

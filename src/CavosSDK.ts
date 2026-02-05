@@ -5,16 +5,39 @@ import { AnalyticsManager } from './analytics/AnalyticsManager';
 import { OAuthWalletManager, OAuthTransactionManager } from './oauth';
 import { CavosConfig, UserInfo, OnrampProvider, LoginProvider, Signature, OAuthWalletConfig, FirebaseCredentials } from './types';
 import { DEFAULT_OAUTH_CONFIG_SEPOLIA, DEFAULT_OAUTH_CONFIG_MAINNET } from './config/defaults';
+import { Logger } from './utils/logger';
 import axios from 'axios';
+
+export interface WalletStatus {
+  isDeploying: boolean;
+  isDeployed: boolean;
+  isRegistering: boolean;
+  isSessionActive: boolean;
+  isReady: boolean;
+}
+
+export type WalletStatusListener = (status: WalletStatus) => void;
 
 export class CavosSDK {
   private config: CavosConfig;
+  private logger: Logger;
   private oauthWalletManager: OAuthWalletManager;
   private transactionManager: OAuthTransactionManager | null = null;
   private sessionManager: SessionManager;
   private paymaster: PaymasterIntegration;
   private analyticsManager: AnalyticsManager;
   private isLimitExceeded: boolean = false;
+  private appSalt: string | null = null;
+
+  // Wallet status state
+  private _walletStatus: WalletStatus = {
+    isDeploying: false,
+    isDeployed: false,
+    isRegistering: false,
+    isSessionActive: false,
+    isReady: false,
+  };
+  private walletStatusListeners: Set<WalletStatusListener> = new Set();
 
   // Default Cavos shared paymaster API key for Sepolia
   public static readonly DEFAULT_PAYMASTER_KEY = 'c37c52b7-ea5a-4426-8121-329a78354b0b';
@@ -39,6 +62,9 @@ export class CavosSDK {
         ...config.oauthWallet
       }
     };
+
+    // Initialize logger
+    this.logger = new Logger(config.enableLogging || false);
 
     const oauthConfig = this.config.oauthWallet as OAuthWalletConfig;
     const sessionConfig = {
@@ -67,9 +93,17 @@ export class CavosSDK {
    * Initialize SDK and restore session if available
    */
   async init(): Promise<void> {
-    await this.validateAccess();
+    console.log('[CavosSDK] init() called');
 
-    if (this.oauthWalletManager.restoreSession()) {
+    // CRITICAL: Restore session FIRST so that setAppSalt() can recalculate the address
+    const sessionRestored = this.oauthWalletManager.restoreSession();
+    console.log('[CavosSDK] restoreSession result:', sessionRestored, 'wallet before salt:', this.oauthWalletManager.getWalletAddress());
+
+    // Now fetch app_salt and apply it (will recalculate wallet if session exists)
+    await this.validateAccess();
+    console.log('[CavosSDK] after validateAccess, appSalt:', this.appSalt, 'wallet after salt:', this.oauthWalletManager.getWalletAddress());
+
+    if (sessionRestored) {
       this.initializeTransactionManager();
     }
   }
@@ -78,6 +112,11 @@ export class CavosSDK {
    * Handle OAuth login redirect or Firebase email/password login
    */
   async login(provider: LoginProvider, credentials?: FirebaseCredentials): Promise<void> {
+    // Ensure app_salt is fetched before starting OAuth flow
+    if (!this.appSalt) {
+      await this.validateAccess();
+    }
+
     if (provider === 'firebase') {
       if (!credentials) {
         throw new Error('Firebase login requires email and password');
@@ -105,6 +144,8 @@ export class CavosSDK {
 
   /**
    * Register new user with Firebase email/password
+   * NOTE: This only creates the user in Firebase and stores the session locally.
+   * The account is NOT deployed on-chain. Use login() to deploy.
    */
   async register(provider: LoginProvider, credentials: FirebaseCredentials): Promise<void> {
     if (provider !== 'firebase') {
@@ -114,40 +155,66 @@ export class CavosSDK {
     await this.oauthWalletManager.registerWithFirebase(credentials.email, credentials.password);
     this.initializeTransactionManager();
 
-    // Deploy account in background
-    this.deployAccountInBackground();
+    // Do NOT deploy on registration
+    this.logger.log('User registered. Account will be deployed on first login.');
   }
 
   /**
    * Login with Firebase email/password
+   * Deploys account if it doesn't exist yet
    */
   private async loginWithFirebase(email: string, password: string): Promise<void> {
+    if (!this.appSalt) {
+      await this.validateAccess();
+    }
+
     await this.oauthWalletManager.loginWithFirebase(email, password);
     this.initializeTransactionManager();
 
-    // Deploy or register session in background
+    // Deploy or register session in background (only on login)
     this.deployAccountInBackground();
   }
 
   /**
-   * Deploy account or register session in background
+   * Deploy account in background
+   *
+   * Note: Session registration is no longer needed here!
+   * The first execute() call will automatically register the session using JWT signature.
+   * This eliminates the relayer dependency completely.
    */
   private deployAccountInBackground(): void {
     this.isAccountDeployed().then(async (deployed) => {
       if (!deployed) {
-        console.log('[CavosSDK] Account not deployed. Deploying with session...');
-        await this.deployAccount();
-      } else {
-        console.log('[CavosSDK] Account already deployed. Registering new session via deployer...');
-        if (this.transactionManager) {
-          const session = this.oauthWalletManager.getSession();
-          if (session) {
-            await this.transactionManager.registerSessionViaDeployer(session);
+        this.logger.log('Account not deployed. Deploying with session...');
+        this.updateWalletStatus({ isDeploying: true });
+        try {
+          await this.deployAccount();
+          this.updateWalletStatus({
+            isDeploying: false,
+            isDeployed: true,
+            isSessionActive: false, // Session will be registered on first execute()
+            isReady: true
+          });
+          // Track wallet deployment for MAU
+          const address = this.getAddress();
+          const email = this.oauthWalletManager.getSession()?.jwtClaims?.sub;
+          if (address) {
+            this.analyticsManager.trackWalletDeployment(address, email);
           }
+        } catch (err) {
+          this.updateWalletStatus({ isDeploying: false });
+          throw err;
         }
+      } else {
+        this.logger.log('Account already deployed. Ready to execute.');
+        this.updateWalletStatus({
+          isDeployed: true,
+          isSessionActive: false, // Will be checked/registered on first execute()
+          isReady: true
+        });
       }
     }).catch(err => {
-      console.error('[CavosSDK] Background session registration/deployment failed:', err);
+      this.logger.alwaysError('Background deployment check failed:', err);
     });
   }
 
@@ -155,6 +222,12 @@ export class CavosSDK {
    * Handle OAuth callback
    */
   async handleCallback(authDataString: string): Promise<void> {
+    // CRITICAL: Fetch app_salt BEFORE processing callback
+    // The callback will compute wallet address using the salt
+    if (!this.appSalt) {
+      await this.validateAccess();
+    }
+
     await this.oauthWalletManager.handleOAuthCallback(authDataString);
     this.initializeTransactionManager();
 
@@ -177,12 +250,29 @@ export class CavosSDK {
 
   /**
    * Execute transactions (OAuth Wallet Flow)
+   *
+   * Automatically handles session registration:
+   * - If session NOT registered: Uses JWT signature (self-custodial, no relayer needed)
+   * - If session IS registered: Uses lightweight session signature
+   *
+   * No manual session registration needed - it's all handled transparently!
    */
   async execute(calls: Call | Call[], _options?: { gasless?: boolean }): Promise<string> {
     if (!this.transactionManager) {
       throw new Error('Wallet not initialized. Please login first.');
     }
-    return this.transactionManager.execute(calls);
+
+    // The transactionManager.execute() will automatically detect if session is registered
+    // and use the appropriate signature type (JWT for first tx, session for subsequent)
+    const txHash = await this.transactionManager.execute(calls);
+
+    // Track transaction for MAU
+    const address = this.getAddress();
+    if (address) {
+      this.analyticsManager.trackTransaction(txHash, address, 'confirmed');
+    }
+
+    return txHash;
   }
 
   /**
@@ -196,7 +286,7 @@ export class CavosSDK {
    * Create session (Compatibility Alias - Always returns success as OAuth IS a session)
    */
   async createSession(_policy?: any): Promise<void> {
-    console.warn('[CavosSDK] createSession() is deprecated. OAuth flow handles sessions automatically.');
+    this.logger.warn('createSession() is deprecated. OAuth flow handles sessions automatically.');
     return;
   }
 
@@ -284,6 +374,51 @@ export class CavosSDK {
   async logout(): Promise<void> {
     this.oauthWalletManager.clearSession();
     this.transactionManager = null;
+    // Reset wallet status
+    this._walletStatus = {
+      isDeploying: false,
+      isDeployed: false,
+      isRegistering: false,
+      isSessionActive: false,
+      isReady: false,
+    };
+    this.notifyWalletStatusListeners();
+  }
+
+  /**
+   * Get current wallet status
+   */
+  getWalletStatus(): WalletStatus {
+    return { ...this._walletStatus };
+  }
+
+  /**
+   * Subscribe to wallet status changes
+   */
+  onWalletStatusChange(listener: WalletStatusListener): () => void {
+    this.walletStatusListeners.add(listener);
+    // Immediately call with current status
+    listener(this.getWalletStatus());
+    // Return unsubscribe function
+    return () => {
+      this.walletStatusListeners.delete(listener);
+    };
+  }
+
+  /**
+   * Update wallet status and notify listeners
+   */
+  private updateWalletStatus(updates: Partial<WalletStatus>): void {
+    this._walletStatus = { ...this._walletStatus, ...updates };
+    this.notifyWalletStatusListeners();
+  }
+
+  /**
+   * Notify all wallet status listeners
+   */
+  private notifyWalletStatusListeners(): void {
+    const status = this.getWalletStatus();
+    this.walletStatusListeners.forEach(listener => listener(status));
   }
 
   /**
@@ -312,7 +447,7 @@ export class CavosSDK {
    * Get account (Not directly available in OAuth flow without eph PK access)
    */
   getAccount(): Account | null {
-    console.warn('[CavosSDK] getAccount() is not available in OAuth-only mode. Use execute() instead.');
+    this.logger.warn('getAccount() is not available in OAuth-only mode. Use execute() instead.');
     return null;
   }
 
@@ -335,15 +470,22 @@ export class CavosSDK {
 
       if (!result.allowed) {
         this.isLimitExceeded = true;
-        console.warn('[Cavos SDK] MAU limit exceeded.');
+        this.logger.warn('MAU limit exceeded.');
         return;
       }
 
+      // Store app_salt for per-app wallet derivation
+      if (result.app_salt) {
+        this.appSalt = result.app_salt;
+        // Update OAuthWalletManager with the per-app salt
+        this.oauthWalletManager.setAppSalt(result.app_salt);
+      }
+
       if (result.warning) {
-        console.warn('[Cavos SDK]', result.message);
+        this.logger.warn(result.message);
       }
     } catch (error: any) {
-      console.warn('[Cavos SDK] Validation check failed:', error.message);
+      this.logger.warn('Validation check failed:', error.message);
     }
   }
 
@@ -408,9 +550,23 @@ export class CavosSDK {
     }
   }
 
+  /**
+   * Check if email is verified for this app
+   */
+  async isEmailVerified(email: string): Promise<boolean> {
+    return this.oauthWalletManager.checkEmailVerification(email);
+  }
+
+  /**
+   * Resend verification email
+   */
+  async resendVerificationEmail(email: string): Promise<void> {
+    return this.oauthWalletManager.resendVerificationEmail(email);
+  }
+
   // Passkey compatibility methods (deprecated/no-op)
   async createWallet(): Promise<void> {
-    console.warn('[CavosSDK] createWallet() is deprecated. OAuth flow handles account creation automatically.');
+    this.logger.warn('createWallet() is deprecated. OAuth flow handles account creation automatically.');
   }
 
   async hasPasskeyOnlyWallet(): Promise<boolean> { return false; }
