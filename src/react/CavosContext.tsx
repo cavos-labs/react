@@ -21,6 +21,7 @@ export interface CavosContextValue {
   isAccountDeployed: () => Promise<boolean>;
   deployAccount: () => Promise<string>;
   getBalance: () => Promise<string>;
+  resendVerificationEmail: (email: string) => Promise<void>;
   /** Wallet status for tracking deploy/session registration state */
   walletStatus: WalletStatus;
 }
@@ -154,6 +155,10 @@ export function CavosProvider({ config, children }: CavosProviderProps) {
     return cavos.getBalance();
   }, [cavos]);
 
+  const resendVerificationEmail = useCallback(async (email: string) => {
+    return cavos.resendVerificationEmail(email);
+  }, [cavos]);
+
   const value: CavosContextValue = {
     cavos,
     isAuthenticated,
@@ -171,6 +176,7 @@ export function CavosProvider({ config, children }: CavosProviderProps) {
     isAccountDeployed,
     deployAccount,
     getBalance,
+    resendVerificationEmail,
     walletStatus,
   };
 

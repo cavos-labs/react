@@ -377,6 +377,6 @@ Returns:
 
 ## Need Help?
 
-- GitHub: [github.com/your-org/cavos](https://github.com)
-- Documentation: [docs.cavos.app](https://docs.cavos.app)
-- Support: support@cavos.app
+- GitHub: [https://github.com/cavos-labs](https://github.com/cavos-labs)
+- Documentation: [docs.cavos.xyz](https://docs.cavos.xyz)
+- Support: [https://discord.gg/ywdFVnNG](https://discord.gg/ywdFVnNG)
