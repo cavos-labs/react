@@ -8,7 +8,7 @@
  * - Session persistence across page reloads
  */
 
-import { ec, encode, num, hash, RpcProvider } from 'starknet';
+import { ec, encode, num, hash, RpcProvider, typedData, type TypedData, type Signature } from 'starknet';
 import { NonceManager, NonceParams } from './NonceManager';
 import { AddressSeedManager } from './AddressSeedManager';
 import { OAuthWalletConfig } from '../types/config';
@@ -356,6 +356,28 @@ export class OAuthWalletManager {
     ];
 
     return sig;
+  }
+
+  /**
+   * Sign typed data with the ephemeral key.
+   * This allows the user to sign messages/transactions using their OAuth session.
+   * The signature is a standard ECDSA signature from the ephemeral key.
+   *
+   * @param typedDataInput - The typed data to sign (SNIP-12 format)
+   * @returns Signature array [r, s]
+   */
+  signMessage(typedDataInput: TypedData): Signature {
+    if (!this.session?.ephemeralPrivateKey || !this.session.walletAddress) {
+      throw new Error('No active session. Please login first.');
+    }
+
+    // Compute the message hash from typed data
+    const messageHash = typedData.getMessageHash(typedDataInput, this.session.walletAddress);
+
+    // Sign with ephemeral key
+    const signature = ec.starkCurve.sign(messageHash, this.session.ephemeralPrivateKey);
+
+    return [num.toHex(signature.r), num.toHex(signature.s)];
   }
 
   /**

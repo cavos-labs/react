@@ -2,7 +2,7 @@
 import React, { createContext, useContext, useEffect, useState, useCallback, ReactNode } from 'react';
 import { CavosSDK, WalletStatus } from '../CavosSDK';
 import { CavosConfig, UserInfo, OnrampProvider, LoginProvider, Signature, FirebaseCredentials } from '../types';
-import { Call } from 'starknet';
+import { Call, type TypedData } from 'starknet';
 
 export interface CavosContextValue {
   cavos: CavosSDK;
@@ -14,7 +14,7 @@ export interface CavosContextValue {
   register: (provider: LoginProvider, credentials: FirebaseCredentials) => Promise<void>;
   execute: (calls: Call | Call[], options?: { gasless?: boolean }) => Promise<string>;
   renewSession: () => Promise<string>;
-  signMessage: (message: string) => Promise<Signature>;
+  signMessage: (typedData: TypedData) => Promise<Signature>;
   getOnramp: (provider: OnrampProvider) => string;
   logout: () => Promise<void>;
   isLoading: boolean;
@@ -129,8 +129,8 @@ export function CavosProvider({ config, children }: CavosProviderProps) {
     return cavos.renewSession();
   }, [cavos]);
 
-  const signMessage = useCallback(async (message: string) => {
-    return cavos.signMessage(message);
+  const signMessage = useCallback(async (typedData: TypedData) => {
+    return cavos.signMessage(typedData);
   }, [cavos]);
 
   const getOnramp = useCallback((provider: OnrampProvider) => {

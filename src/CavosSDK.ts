@@ -1,4 +1,4 @@
-import { Account, Call, RpcProvider } from 'starknet';
+import { Account, Call, RpcProvider, type TypedData } from 'starknet';
 import { SessionManager } from './session/SessionManager';
 import { PaymasterIntegration } from './paymaster/PaymasterIntegration';
 import { AnalyticsManager } from './analytics/AnalyticsManager';
@@ -574,7 +574,19 @@ export class CavosSDK {
   async clearPasskeyOnlyWallet(): Promise<void> { }
   async retryWalletUnlock(): Promise<void> { }
   async deleteAccount(): Promise<void> { }
-  async signMessage(_message: string): Promise<Signature> {
-    throw new Error('signMessage() not yet implemented for OAuth-only mode.');
+  /**
+   * Sign typed data with the ephemeral key (OAuth mode).
+   * The signature is generated using the ephemeral key from the current session.
+   *
+   * @param typedDataInput - The typed data to sign (SNIP-12 format)
+   * @returns Signature object with r and s components
+   */
+  async signMessage(typedDataInput: TypedData): Promise<Signature> {
+    const sig = this.oauthWalletManager.signMessage(typedDataInput);
+    // sig is an array [r, s] from starknet.js
+    return {
+      r: (sig as string[])[0],
+      s: (sig as string[])[1],
+    };
   }
 }
