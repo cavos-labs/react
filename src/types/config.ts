@@ -13,16 +13,18 @@ export interface CavosConfig {
   enableLogging?: boolean;
   /** OAuth Wallet configuration (optional, uses defaults for network if not provided) */
   oauthWallet?: Partial<OAuthWalletConfig>;
-  /** Session configuration for ephemeral keys */
+  /** Session configuration for session keys */
   session?: SessionConfig;
 }
 
-/** Configuration for ephemeral session duration */
+/** Configuration for session key duration and default policy */
 export interface SessionConfig {
-  /** Session duration in blocks (default: 2880 = ~24 hours at 30s/block) */
+  /** Session duration in seconds (default: 86400 = 24 hours) */
   sessionDuration?: number;
-  /** Grace period for renewal in blocks (default: 2880 = ~24 hours) */
+  /** Grace period for renewal in seconds (default: 172800 = 48 hours) */
   renewalGracePeriod?: number;
+  /** Default policy applied to all sessions (allowed contracts, spending limits, max calls) */
+  defaultPolicy?: import('./session').SessionKeyPolicy;
 }
 
 /** Configuration for OAuth Wallet mode */

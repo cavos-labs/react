@@ -68,8 +68,9 @@ export class CavosSDK {
 
     const oauthConfig = this.config.oauthWallet as OAuthWalletConfig;
     const sessionConfig = {
-      sessionDuration: this.config.session?.sessionDuration || 2880, // ~24 hours
-      renewalGracePeriod: this.config.session?.renewalGracePeriod || 2880, // ~24 hours
+      sessionDuration: this.config.session?.sessionDuration || 86400, // 24 hours in seconds
+      renewalGracePeriod: this.config.session?.renewalGracePeriod || 172800, // 48 hours in seconds
+      defaultPolicy: this.config.session?.defaultPolicy,
     };
     this.oauthWalletManager = new OAuthWalletManager(
       oauthConfig,
@@ -105,6 +106,8 @@ export class CavosSDK {
 
     if (sessionRestored) {
       this.initializeTransactionManager();
+      // Check deployment status and update walletStatus
+      this.deployAccountInBackground();
     }
   }
 
@@ -345,8 +348,10 @@ export class CavosSDK {
   }
 
   /**
-   * Renew the current session with a new ephemeral key
-   * Call this when execute() throws SESSION_EXPIRED error
+   * Renew the current session with a new session key.
+   * The current session must be registered on-chain and expired (but within the grace period).
+   * If the session is not registered yet, execute a transaction first to register it.
+   * If the session is still active, renewal is not needed.
    * @returns Transaction hash of the renewal transaction
    */
   async renewSession(): Promise<string> {
@@ -354,7 +359,25 @@ export class CavosSDK {
       throw new Error('Wallet not initialized');
     }
 
-    // Freshen session (generate new ephemeral key while keeping old one in memory)
+    // Check session status on-chain before attempting renewal
+    const status = await this.transactionManager.getSessionStatus();
+
+    if (!status.registered) {
+      throw new Error('Session not registered on-chain yet. Execute a transaction first — the session key gets registered automatically on your first tx.');
+    }
+
+    if (!status.expired) {
+      const remaining = status.validUntil ? Number(status.validUntil - BigInt(Math.floor(Date.now() / 1000))) : 0;
+      const hours = Math.floor(remaining / 3600);
+      const mins = Math.floor((remaining % 3600) / 60);
+      throw new Error(`Session is still active (${hours}h ${mins}m remaining). Renewal is only needed after expiry.`);
+    }
+
+    if (!status.canRenew) {
+      throw new Error('Session expired outside the grace period. Please login again.');
+    }
+
+    // Freshen session (generate new session key while keeping old one in memory)
     await this.oauthWalletManager.freshenSession();
     const newSession = this.oauthWalletManager.getSession();
 
@@ -362,10 +385,37 @@ export class CavosSDK {
       throw new Error('Failed to generate new session');
     }
 
-    // Register new session on-chain (uses old session internally for signing)
     const txHash = await this.transactionManager.renewSession(newSession);
 
     return txHash;
+  }
+
+  /**
+   * Revoke a specific session key on-chain.
+   * Requires JWT verification.
+   * @param sessionKey The session key (public key) to revoke
+   * @returns Transaction hash
+   */
+  async revokeSession(sessionKey: string): Promise<string> {
+    if (!this.transactionManager) {
+      throw new Error('Wallet not initialized');
+    }
+
+    return this.transactionManager.revokeSession(sessionKey);
+  }
+
+  /**
+   * Emergency revoke ALL session keys on-chain.
+   * Increments the revocation epoch, invalidating all existing sessions.
+   * Requires JWT verification.
+   * @returns Transaction hash
+   */
+  async emergencyRevokeAllSessions(): Promise<string> {
+    if (!this.transactionManager) {
+      throw new Error('Wallet not initialized');
+    }
+
+    return this.transactionManager.emergencyRevokeAllSessions();
   }
 
   /**
@@ -575,8 +625,7 @@ export class CavosSDK {
   async retryWalletUnlock(): Promise<void> { }
   async deleteAccount(): Promise<void> { }
   /**
-   * Sign typed data with the ephemeral key (OAuth mode).
-   * The signature is generated using the ephemeral key from the current session.
+   * Sign typed data with the session key (OAuth mode).
    *
    * @param typedDataInput - The typed data to sign (SNIP-12 format)
    * @returns Signature object with r and s components

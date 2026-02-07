@@ -1,5 +1,14 @@
 import { Call } from 'starknet';
 
+export interface SessionKeyPolicy {
+  spendingLimits: Array<{
+    token: string;
+    limit: bigint;
+  }>;
+  allowedContracts: string[];
+  maxCallsPerTx: number;
+}
+
 export interface SessionPolicy {
   allowedMethods: Array<{
     contractAddress: string;

@@ -5,7 +5,7 @@
 
 const SENSITIVE_KEYS = [
   'privateKey',
-  'ephemeralPrivateKey',
+  'sessionPrivateKey',
   'relayerPrivateKey',
   'jwt',
   'password',

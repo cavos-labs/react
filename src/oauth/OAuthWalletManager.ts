@@ -2,22 +2,23 @@
  * OAuthWalletManager - Manages OAuth-based wallet authentication
  *
  * Handles:
- * - Ephemeral key generation and management
+ * - Session key generation and management
  * - OAuth redirect flow with nonce
  * - JWT parsing and storage
  * - Session persistence across page reloads
  */
 
-import { ec, encode, num, hash, RpcProvider, typedData, type TypedData, type Signature } from 'starknet';
+import { ec, num, hash, RpcProvider, typedData, type TypedData, type Signature } from 'starknet';
 import { NonceManager, NonceParams } from './NonceManager';
 import { AddressSeedManager } from './AddressSeedManager';
 import { OAuthWalletConfig } from '../types/config';
+import { SessionKeyPolicy } from '../types/session';
 
 export interface OAuthSession {
-  /** Ephemeral private key (hex) */
-  ephemeralPrivateKey: string;
-  /** Ephemeral public key (hex) */
-  ephemeralPubKey: string;
+  /** Session private key (hex) */
+  sessionPrivateKey: string;
+  /** Session public key (hex) */
+  sessionPubKey: string;
   /** Nonce parameters */
   nonceParams: NonceParams;
   /** Computed nonce (for verification) */
@@ -30,6 +31,8 @@ export interface OAuthSession {
   walletAddress?: string;
   /** Address seed */
   addressSeed?: string;
+  /** Session key policy */
+  sessionPolicy?: SessionKeyPolicy;
 }
 
 export interface JWTClaims {
@@ -61,21 +64,23 @@ export class OAuthWalletManager {
   private addressSeedManager: AddressSeedManager;
   private sessionDuration: number;
   private renewalGracePeriod: number;
+  private defaultPolicy?: SessionKeyPolicy;
 
   constructor(
     config: OAuthWalletConfig,
     backendUrl: string,
     appId: string,
     rpcUrl: string,
-    sessionConfig?: { sessionDuration?: number; renewalGracePeriod?: number }
+    sessionConfig?: { sessionDuration?: number; renewalGracePeriod?: number; defaultPolicy?: SessionKeyPolicy }
   ) {
     this.config = config;
     this.backendUrl = backendUrl;
     this.appId = appId;
     this.provider = new RpcProvider({ nodeUrl: rpcUrl });
     this.addressSeedManager = new AddressSeedManager(config.salt || '0');
-    this.sessionDuration = sessionConfig?.sessionDuration || 2880; // ~24 hours at 30s/block
-    this.renewalGracePeriod = sessionConfig?.renewalGracePeriod || 2880; // ~24 hours
+    this.sessionDuration = sessionConfig?.sessionDuration || 86400; // 24 hours in seconds
+    this.renewalGracePeriod = sessionConfig?.renewalGracePeriod || 172800; // 48 hours in seconds
+    this.defaultPolicy = sessionConfig?.defaultPolicy;
   }
 
   /**
@@ -90,7 +95,6 @@ export class OAuthWalletManager {
     // If session exists and has a sub claim, re-compute the wallet address
     if (this.session?.jwtClaims?.sub) {
       const sub = this.session.jwtClaims.sub;
-      const deployerAddress = this.config.deployerContractAddress || '0x0';
 
       // Re-compute with new salt
       const newAddressSeed = this.addressSeedManager.computeAddressSeed(sub);
@@ -98,7 +102,6 @@ export class OAuthWalletManager {
         sub,
         this.config.cavosAccountClassHash,
         this.config.jwksRegistryAddress,
-        deployerAddress
       );
 
       // Update session with new values
@@ -115,7 +118,7 @@ export class OAuthWalletManager {
 
 
   /**
-   * Generate a new session with fresh ephemeral key (for renewal).
+   * Generate a new session with fresh session key (for renewal).
    * Returns a complete OAuthSession that can be used for renewal.
    */
   async generateNewSession(): Promise<OAuthSession> {
@@ -124,7 +127,7 @@ export class OAuthWalletManager {
       throw new Error('No current session to renew from');
     }
 
-    // Generate ephemeral key pair
+    // Generate session key pair
     const STARK_CURVE_ORDER = BigInt('0x800000000000010ffffffffffffffffb781126dcae7b2321e66a241adc64d2f');
 
     const randomBytes = crypto.getRandomValues(new Uint8Array(32));
@@ -132,17 +135,17 @@ export class OAuthWalletManager {
 
     privateKeyBigInt = (privateKeyBigInt % (STARK_CURVE_ORDER - 1n)) + 1n;
 
-    const ephemeralPrivateKey = '0x' + privateKeyBigInt.toString(16);
-    const ephemeralPubKey = ec.starkCurve.getStarkKey(ephemeralPrivateKey);
+    const sessionPrivateKey = '0x' + privateKeyBigInt.toString(16);
+    const sessionPubKey = ec.starkCurve.getStarkKey(sessionPrivateKey);
 
-    // Get current block number
-    const block = await this.provider.getBlockNumber();
-    const currentBlock = BigInt(block);
+    // Get current block timestamp
+    const block = await this.provider.getBlock('latest');
+    const currentTimestamp = BigInt(block.timestamp);
 
-    // Generate nonce params
+    // Generate nonce params (timestamp-based)
     const nonceParams = NonceManager.generateNonceParams(
-      ephemeralPubKey,
-      currentBlock,
+      sessionPubKey,
+      currentTimestamp,
       BigInt(this.sessionDuration),
       BigInt(this.renewalGracePeriod)
     );
@@ -152,42 +155,40 @@ export class OAuthWalletManager {
     // Create new session object reusing current session data
     const newSession: OAuthSession = {
       ...currentSession,
-      ephemeralPrivateKey,
-      ephemeralPubKey,
+      sessionPrivateKey,
+      sessionPubKey,
       nonceParams,
       nonce,
+      sessionPolicy: currentSession.sessionPolicy,
     };
 
     return newSession;
   }
 
   /**
-   * Initialize a new OAuth session before redirecting to OAuth provider
-   * Generates ephemeral key and computes nonce
+   * Initialize a new OAuth session before redirecting to OAuth provider.
+   * Generates session key and computes nonce.
    */
-  async initializeSession(): Promise<{ nonce: string }> {
-    // Generate ephemeral key pair
-    // Stark curve order is approximately 2^251, so we generate random bytes and reduce mod order
+  async initializeSession(policy?: SessionKeyPolicy): Promise<{ nonce: string }> {
+    // Generate session key pair
     const STARK_CURVE_ORDER = BigInt('0x800000000000010ffffffffffffffffb781126dcae7b2321e66a241adc64d2f');
 
-    // Generate 32 random bytes and convert to BigInt
     const randomBytes = crypto.getRandomValues(new Uint8Array(32));
     let privateKeyBigInt = BigInt('0x' + Array.from(randomBytes).map(b => b.toString(16).padStart(2, '0')).join(''));
 
-    // Reduce modulo curve order and ensure it's >= 1
     privateKeyBigInt = (privateKeyBigInt % (STARK_CURVE_ORDER - 1n)) + 1n;
 
-    const ephemeralPrivateKey = '0x' + privateKeyBigInt.toString(16);
-    const ephemeralPubKey = ec.starkCurve.getStarkKey(ephemeralPrivateKey);
+    const sessionPrivateKey = '0x' + privateKeyBigInt.toString(16);
+    const sessionPubKey = ec.starkCurve.getStarkKey(sessionPrivateKey);
 
-    // Get current block number for max_block calculation
-    const block = await this.provider.getBlockNumber();
-    const currentBlock = BigInt(block);
+    // Get current block timestamp
+    const block = await this.provider.getBlock('latest');
+    const currentTimestamp = BigInt(block.timestamp);
 
-    // Generate nonce params with configured duration
+    // Generate nonce params with configured duration (timestamp-based)
     const nonceParams = NonceManager.generateNonceParams(
-      ephemeralPubKey,
-      currentBlock,
+      sessionPubKey,
+      currentTimestamp,
       BigInt(this.sessionDuration),
       BigInt(this.renewalGracePeriod)
     );
@@ -195,12 +196,13 @@ export class OAuthWalletManager {
     // Compute nonce
     const nonce = NonceManager.computeNonce(nonceParams);
 
-    // Create session object
+    // Create session object (use explicit policy, fall back to config default)
     this.session = {
-      ephemeralPrivateKey,
-      ephemeralPubKey,
+      sessionPrivateKey,
+      sessionPubKey,
       nonceParams,
       nonce,
+      sessionPolicy: policy ?? this.defaultPolicy,
     };
 
     // Persist pre-auth session to sessionStorage (survives OAuth redirect)
@@ -278,7 +280,7 @@ export class OAuthWalletManager {
    * @param authData The auth data string from callback (contains JWT)
    */
   async handleOAuthCallback(authData: string): Promise<OAuthSession> {
-    // Restore pre-auth session (ephemeral key + nonce)
+    // Restore pre-auth session (session key + nonce)
     this.restorePreAuthSession();
 
     if (!this.session) {
@@ -304,13 +306,11 @@ export class OAuthWalletManager {
 
     // Compute address seed and wallet address
     const addressSeed = this.addressSeedManager.computeAddressSeed(jwtClaims.sub);
-    const deployerAddress = this.config.deployerContractAddress || '0x0';
 
     const walletAddress = this.addressSeedManager.computeContractAddress(
       jwtClaims.sub,
       this.config.cavosAccountClassHash,
       this.config.jwksRegistryAddress,
-      deployerAddress
     );
     // Update session with JWT data
     this.session = {
@@ -334,48 +334,60 @@ export class OAuthWalletManager {
 
   /**
    * Build a lightweight session signature for transactions (SESSION_V1).
-   * Only includes ephemeral key signature - much cheaper for paymaster transactions.
+   * Only includes session key signature - much cheaper for paymaster transactions.
    * Requires the session to be registered first (via deployment with full JWT).
+   *
+   * Merkle proofs for allowed contracts are appended after the session key.
+   * Format: [SESSION_V1, r, s, session_key, proof_len_1, proof_1..., proof_len_2, proof_2..., ...]
    */
-  buildSessionSignature(transactionHash: string): string[] {
-    if (!this.session?.ephemeralPrivateKey || !this.session.ephemeralPubKey) {
-      throw new Error('No ephemeral key in session');
+  buildSessionSignature(transactionHash: string, calls?: { contractAddress: string }[]): string[] {
+    if (!this.session?.sessionPrivateKey || !this.session.sessionPubKey) {
+      throw new Error('No session key in session');
     }
 
-    const { ephemeralPrivateKey, ephemeralPubKey } = this.session;
+    const { sessionPrivateKey, sessionPubKey } = this.session;
 
-    // Sign the transaction hash with the ephemeral key
-    const signature = ec.starkCurve.sign(transactionHash, ephemeralPrivateKey);
+    // Sign the transaction hash with the session key
+    const signature = ec.starkCurve.sign(transactionHash, sessionPrivateKey);
 
     // Build lightweight session signature
     const sig: string[] = [
       '0x53455353494f4e5f5631', // SESSION_V1 magic
-      num.toHex(signature.r),    // eph_r
-      num.toHex(signature.s),    // eph_s
-      ephemeralPubKey,           // eph_pubkey
+      num.toHex(signature.r),
+      num.toHex(signature.s),
+      sessionPubKey,
     ];
+
+    // Append Merkle proofs for each call's target contract
+    if (calls && this.session.sessionPolicy?.allowedContracts?.length) {
+      const allowedContracts = this.session.sessionPolicy.allowedContracts;
+      for (const call of calls) {
+        const proof = OAuthWalletManager.computeMerkleProof(allowedContracts, call.contractAddress);
+        sig.push(num.toHex(proof.length));
+        sig.push(...proof);
+      }
+    }
 
     return sig;
   }
 
   /**
-   * Sign typed data with the ephemeral key.
-   * This allows the user to sign messages/transactions using their OAuth session.
-   * The signature is a standard ECDSA signature from the ephemeral key.
+   * Sign typed data with the session key.
+   * The signature is a standard ECDSA signature from the session key.
    *
    * @param typedDataInput - The typed data to sign (SNIP-12 format)
    * @returns Signature array [r, s]
    */
   signMessage(typedDataInput: TypedData): Signature {
-    if (!this.session?.ephemeralPrivateKey || !this.session.walletAddress) {
+    if (!this.session?.sessionPrivateKey || !this.session.walletAddress) {
       throw new Error('No active session. Please login first.');
     }
 
     // Compute the message hash from typed data
     const messageHash = typedData.getMessageHash(typedDataInput, this.session.walletAddress);
 
-    // Sign with ephemeral key
-    const signature = ec.starkCurve.sign(messageHash, this.session.ephemeralPrivateKey);
+    // Sign with session key
+    const signature = ec.starkCurve.sign(messageHash, this.session.sessionPrivateKey);
 
     return [num.toHex(signature.r), num.toHex(signature.s)];
   }
@@ -385,29 +397,38 @@ export class OAuthWalletManager {
    * This performs expensive RSA verification and registers the session.
    * Only use during deployment - subsequent transactions should use buildSessionSignature().
    *
-   * New signature format with claim offsets:
+   * Signature format with claim offsets and policy fields:
    * [0]  = OAUTH_JWT_V1 magic
-   * [1-3] = ephemeral key (r, s, pubkey)
-   * [4-5] = max_block, randomness
+   * [1-3] = session key (r, s, pubkey)
+   * [4-5] = valid_until, randomness
    * [6-12] = jwt_sub, jwt_nonce, jwt_exp, jwt_kid, jwt_iss, jwt_aud, salt
-   * [13-14] = sub_offset, sub_len (NEW)
-   * [15-16] = nonce_offset, nonce_len (NEW)
-   * [17-18] = kid_offset, kid_len (NEW)
+   * [13-14] = sub_offset, sub_len
+   * [15-16] = nonce_offset, nonce_len
+   * [17-18] = kid_offset, kid_len
    * [19] = RSA sig length (16)
    * [20-35] = RSA signature (16 u128 limbs)
-   * [36] = JWT data length
-   * [37+] = JWT bytes
+   * [36] = n_prime len (16)
+   * [37-52] = n_prime limbs
+   * [53] = r_sq len (16)
+   * [54-69] = r_sq limbs
+   * [70] = jwt_bytes_len
+   * [71+] = packed JWT bytes
+   * [after JWT] = valid_after
+   * [+1] = allowed_contracts_root
+   * [+2] = max_calls_per_tx
+   * [+3] = spending_policies_count
+   * [+4..] = spending_policies: [token, limit_low, limit_high, ...]
    */
   async buildJWTSignatureData(transactionHash: string): Promise<string[]> {
     if (!this.session?.jwt || !this.session.jwtClaims) {
       throw new Error('No JWT in session');
     }
-    const { jwt, ephemeralPrivateKey, ephemeralPubKey, addressSeed } = this.session;
+    const { jwt, sessionPrivateKey, sessionPubKey } = this.session;
     const jwtClaims = this.session.jwtClaims;
     const nonceParams = this.session.nonceParams;
 
-    // Sign the transaction hash with the ephemeral key
-    const signature = ec.starkCurve.sign(transactionHash, ephemeralPrivateKey);
+    // Sign the transaction hash with the session key
+    const signature = ec.starkCurve.sign(transactionHash, sessionPrivateKey);
 
     // Extract RSA signature from JWT
     const jwtParts = jwt.split('.');
@@ -418,15 +439,14 @@ export class OAuthWalletManager {
     const signedData = `${jwtParts[0]}.${jwtParts[1]}`;
     const signedDataBytes = new TextEncoder().encode(signedData);
 
-    // Find claim offsets for on-chain verification (NEW)
+    // Find claim offsets for on-chain verification
     const offsets = this.findClaimOffsets(jwt);
 
     // Build signature array matching contract format
     const jwt_sub_felt = this.subToFelt(jwtClaims.sub);
     const salt_hex = num.toHex(this.config.salt || '0x0');
 
-    // Optimization: Pack signedDataBytes into 31-byte chunks (u248 words)
-    // This significantly reduces calldata size and processing steps on-chain.
+    // Pack signedDataBytes into 31-byte chunks (u248 words)
     const packedBytes: string[] = [];
     const PACK_SIZE = 31;
     for (let i = 0; i < signedDataBytes.length; i += PACK_SIZE) {
@@ -438,28 +458,18 @@ export class OAuthWalletManager {
       packedBytes.push(num.toHex(chunk));
     }
 
-    // Validates a full OAuth JWT signature (OAUTH_JWT_V1).
-    // Performs complete RSA verification and registers the session.
-    // Expensive - only used during deployment or explicit session registration.
-
-    // Calculate Montgomery constants
-    // We need to fetch the RSA key for the kid to get the modulus n
+    // Calculate Montgomery constants for RSA verification
     const kid = this.extractKidFromJwt(jwt);
     const iss = jwtClaims.iss;
     const modulusLimbs = await this.fetchModulusForKid(kid, iss);
-
-    // Calculate n_prime and R^2
     const { n_prime, r_sq } = this.calculateMontgomeryConstants(modulusLimbs);
-
-    const jwt_kid_value = this.extractKidFromJwt(jwt);
-    const jwt_kid_felt = this.stringToFelt(jwt_kid_value);
 
     const sig: string[] = [
       '0x4f415554485f4a57545f5631', // OAUTH_JWT_V1 magic
-      num.toHex(signature.r),      // eph_r [1]
-      num.toHex(signature.s),      // eph_s [2]
-      ephemeralPubKey,              // eph_pubkey [3]
-      num.toHex(nonceParams.maxBlock), // max_block [4]
+      num.toHex(signature.r),      // session_r [1]
+      num.toHex(signature.s),      // session_s [2]
+      sessionPubKey,              // session_key [3]
+      num.toHex(nonceParams.validUntil), // valid_until [4]
       num.toHex(nonceParams.randomness), // randomness [5]
       jwt_sub_felt,                 // jwt_sub [6]
       this.session.nonce,           // jwt_nonce [7]
@@ -468,21 +478,44 @@ export class OAuthWalletManager {
       this.stringToFelt(jwtClaims.iss), // jwt_iss [10]
       this.stringToFelt(jwtClaims.aud), // jwt_aud [11]
       salt_hex,                     // salt [12]
-      num.toHex(offsets.sub_offset),    // sub_offset [13] NEW
-      num.toHex(offsets.sub_len),       // sub_len [14] NEW
-      num.toHex(offsets.nonce_offset),  // nonce_offset [15] NEW
-      num.toHex(offsets.nonce_len),     // nonce_len [16] NEW
-      num.toHex(offsets.kid_offset),    // kid_offset [17] NEW
-      num.toHex(offsets.kid_len),       // kid_len [18] NEW
+      num.toHex(offsets.sub_offset),    // sub_offset [13]
+      num.toHex(offsets.sub_len),       // sub_len [14]
+      num.toHex(offsets.nonce_offset),  // nonce_offset [15]
+      num.toHex(offsets.nonce_len),     // nonce_len [16]
+      num.toHex(offsets.kid_offset),    // kid_offset [17]
+      num.toHex(offsets.kid_len),       // kid_len [18]
       num.toHex(16),                // rsa_sig_len [19]
       ...rsaLimbs,                  // RSA signature as 16 u128 limbs [20-35]
       num.toHex(16),                // n_prime len [36]
       ...n_prime,                   // n_prime limbs [37-52]
       num.toHex(16),                // r_sq len [53]
       ...r_sq,                      // r_sq limbs [54-69]
-      num.toHex(signedDataBytes.length), // jwt_bytes_len (TOTAL BYTES as per protocol) [70]
+      num.toHex(signedDataBytes.length), // jwt_bytes_len [70]
       ...packedBytes,               // packed JWT bytes [71+]
     ];
+
+    // Append policy fields after JWT data
+    const policy = this.session.sessionPolicy;
+    sig.push(num.toHex(nonceParams.validAfter)); // valid_after
+
+    if (policy) {
+      const merkleRoot = policy.allowedContracts.length > 0
+        ? OAuthWalletManager.computeMerkleRoot(policy.allowedContracts)
+        : '0x0';
+      sig.push(merkleRoot); // allowed_contracts_root
+      sig.push(num.toHex(policy.maxCallsPerTx)); // max_calls_per_tx
+      sig.push(num.toHex(policy.spendingLimits.length)); // spending_policies_count
+      for (const limit of policy.spendingLimits) {
+        sig.push(num.toHex(limit.token)); // token address
+        const limitBig = BigInt(limit.limit);
+        sig.push(num.toHex(limitBig & ((1n << 128n) - 1n))); // limit_low
+        sig.push(num.toHex(limitBig >> 128n)); // limit_high
+      }
+    } else {
+      sig.push('0x0'); // allowed_contracts_root (no restriction)
+      sig.push(num.toHex(10)); // max_calls_per_tx (default)
+      sig.push(num.toHex(0)); // spending_policies_count (none)
+    }
 
     return sig;
   }
@@ -588,10 +621,10 @@ export class OAuthWalletManager {
   }
 
   /**
-   * Get ephemeral private key for signing
+   * Get session private key for signing
    */
-  getEphemeralPrivateKey(): string | null {
-    return this.session?.ephemeralPrivateKey || null;
+  getSessionPrivateKey(): string | null {
+    return this.session?.sessionPrivateKey || null;
   }
 
   /**
@@ -633,9 +666,13 @@ export class OAuthWalletManager {
         this.session = JSON.parse(stored);
         // Convert bigints back
         if (this.session?.nonceParams) {
-          this.session.nonceParams.maxBlock = BigInt(this.session.nonceParams.maxBlock);
+          this.session.nonceParams.validAfter = BigInt(this.session.nonceParams.validAfter);
+          this.session.nonceParams.validUntil = BigInt(this.session.nonceParams.validUntil);
           this.session.nonceParams.renewalDeadline = BigInt(this.session.nonceParams.renewalDeadline);
           this.session.nonceParams.randomness = BigInt(this.session.nonceParams.randomness);
+        }
+        if (this.session) {
+          this.session.sessionPolicy = this.deserializePolicy((this.session as any).sessionPolicy) ?? this.defaultPolicy;
         }
         return this.hasValidSession();
       }
@@ -647,6 +684,28 @@ export class OAuthWalletManager {
 
   // ============== Private helpers ==============
 
+  private serializePolicy(policy?: SessionKeyPolicy): any {
+    if (!policy) return undefined;
+    return {
+      ...policy,
+      spendingLimits: policy.spendingLimits.map(sl => ({
+        ...sl,
+        limit: sl.limit.toString(),
+      })),
+    };
+  }
+
+  private deserializePolicy(raw: any): SessionKeyPolicy | undefined {
+    if (!raw) return undefined;
+    return {
+      ...raw,
+      spendingLimits: (raw.spendingLimits || []).map((sl: any) => ({
+        ...sl,
+        limit: BigInt(sl.limit),
+      })),
+    };
+  }
+
   private persistPreAuthSession(): void {
     if (typeof window === 'undefined') return;
     if (this.session) {
@@ -654,17 +713,19 @@ export class OAuthWalletManager {
         ...this.session,
         nonceParams: {
           ...this.session.nonceParams,
-          maxBlock: this.session.nonceParams.maxBlock.toString(),
+          validAfter: this.session.nonceParams.validAfter.toString(),
+          validUntil: this.session.nonceParams.validUntil.toString(),
           renewalDeadline: this.session.nonceParams.renewalDeadline.toString(),
           randomness: this.session.nonceParams.randomness.toString(),
         },
+        sessionPolicy: this.serializePolicy(this.session.sessionPolicy),
       };
       sessionStorage.setItem(PRE_AUTH_STORAGE_KEY, JSON.stringify(toStore));
     }
   }
 
   /**
-   * Freshen the session by generating a new ephemeral key pair.
+   * Freshen the session by generating a new session key pair.
    * This is used for auto-renewal when an existing session expires.
    * It preserves the JWT and wallet address but generates a new nonce and keys.
    */
@@ -675,22 +736,22 @@ export class OAuthWalletManager {
 
     const oldSession = { ...this.session };
 
-    // Generate NEW ephemeral key pair
+    // Generate NEW session key pair
     const STARK_CURVE_ORDER = BigInt('0x800000000000010ffffffffffffffffb781126dcae7b2321e66a241adc64d2f');
     const randomBytes = crypto.getRandomValues(new Uint8Array(32));
     let privateKeyBigInt = BigInt('0x' + Array.from(randomBytes).map(b => b.toString(16).padStart(2, '0')).join(''));
     privateKeyBigInt = (privateKeyBigInt % (STARK_CURVE_ORDER - 1n)) + 1n;
 
-    const ephemeralPrivateKey = '0x' + privateKeyBigInt.toString(16);
-    const ephemeralPubKey = ec.starkCurve.getStarkKey(ephemeralPrivateKey);
+    const sessionPrivateKey = '0x' + privateKeyBigInt.toString(16);
+    const sessionPubKey = ec.starkCurve.getStarkKey(sessionPrivateKey);
 
-    // Get current block number
-    const block = await this.provider.getBlockNumber();
-    const currentBlock = BigInt(block);
-    // New nonce params with configured duration
+    // Get current block timestamp
+    const block = await this.provider.getBlock('latest');
+    const currentTimestamp = BigInt(block.timestamp);
+    // New nonce params with configured duration (timestamp-based)
     const nonceParams = NonceManager.generateNonceParams(
-      ephemeralPubKey,
-      currentBlock,
+      sessionPubKey,
+      currentTimestamp,
       BigInt(this.sessionDuration),
       BigInt(this.renewalGracePeriod)
     );
@@ -699,8 +760,8 @@ export class OAuthWalletManager {
     // Update session
     this.session = {
       ...this.session,
-      ephemeralPrivateKey,
-      ephemeralPubKey,
+      sessionPrivateKey,
+      sessionPubKey,
       nonceParams,
       nonce,
     };
@@ -721,10 +782,12 @@ export class OAuthWalletManager {
           ...parsed,
           nonceParams: {
             ...parsed.nonceParams,
-            maxBlock: BigInt(parsed.nonceParams.maxBlock),
+            validAfter: BigInt(parsed.nonceParams.validAfter),
+            validUntil: BigInt(parsed.nonceParams.validUntil),
             renewalDeadline: BigInt(parsed.nonceParams.renewalDeadline),
             randomness: BigInt(parsed.nonceParams.randomness),
           },
+          sessionPolicy: this.deserializePolicy(parsed.sessionPolicy) ?? this.defaultPolicy,
         };
       }
     } catch {
@@ -739,10 +802,12 @@ export class OAuthWalletManager {
         ...this.session,
         nonceParams: {
           ...this.session.nonceParams,
-          maxBlock: this.session.nonceParams.maxBlock.toString(),
+          validAfter: this.session.nonceParams.validAfter.toString(),
+          validUntil: this.session.nonceParams.validUntil.toString(),
           renewalDeadline: this.session.nonceParams.renewalDeadline.toString(),
           randomness: this.session.nonceParams.randomness.toString(),
         },
+        sessionPolicy: this.serializePolicy(this.session.sessionPolicy),
       };
       sessionStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(toStore));
     }
@@ -1082,13 +1147,11 @@ export class OAuthWalletManager {
 
     // Compute address seed and wallet address
     const addressSeed = this.addressSeedManager.computeAddressSeed(jwtClaims.sub);
-    const deployerAddress = this.config.deployerContractAddress || '0x0';
 
     const walletAddress = this.addressSeedManager.computeContractAddress(
       jwtClaims.sub,
       this.config.cavosAccountClassHash,
       this.config.jwksRegistryAddress,
-      deployerAddress
     );
 
     // Update session with JWT data
@@ -1104,5 +1167,123 @@ export class OAuthWalletManager {
     this.persistSession();
 
     return this.session;
+  }
+
+  // ============== Merkle Tree Utilities ==============
+
+  /**
+   * Compute Merkle root from a list of allowed contract addresses.
+   * Uses Poseidon hash, matching the on-chain verification.
+   * Leaves are sorted for deterministic tree construction.
+   */
+  static computeMerkleRoot(contracts: string[]): string {
+    if (contracts.length === 0) return '0x0';
+
+    // Hash each contract address to get leaves
+    // Uses computePoseidonHashOnElements([c]) which matches Cairo's
+    // PoseidonTrait::new().update(contract).finalize()
+    let leaves = contracts.map(c =>
+      hash.computePoseidonHashOnElements([num.toHex(c)])
+    );
+
+    // Sort leaves for deterministic ordering
+    leaves.sort((a, b) => {
+      const aBig = BigInt(a);
+      const bBig = BigInt(b);
+      if (aBig < bBig) return -1;
+      if (aBig > bBig) return 1;
+      return 0;
+    });
+
+    // Build tree bottom-up
+    while (leaves.length > 1) {
+      const nextLevel: string[] = [];
+      for (let i = 0; i < leaves.length; i += 2) {
+        if (i + 1 < leaves.length) {
+          const left = leaves[i];
+          const right = leaves[i + 1];
+          // Sorted pair hashing (matches contract's PoseidonTrait)
+          const leftBig = BigInt(left);
+          const rightBig = BigInt(right);
+          if (leftBig < rightBig) {
+            nextLevel.push(hash.computePoseidonHashOnElements([left, right]));
+          } else {
+            nextLevel.push(hash.computePoseidonHashOnElements([right, left]));
+          }
+        } else {
+          nextLevel.push(leaves[i]);
+        }
+      }
+      leaves = nextLevel;
+    }
+
+    return leaves[0];
+  }
+
+  /**
+   * Compute Merkle proof for a given contract address.
+   * Returns the sibling hashes needed to verify the leaf.
+   */
+  static computeMerkleProof(contracts: string[], targetContract: string): string[] {
+    if (contracts.length === 0) return [];
+
+    // Hash each contract address to get leaves (must match computeMerkleRoot)
+    let leaves = contracts.map(c =>
+      hash.computePoseidonHashOnElements([num.toHex(c)])
+    );
+
+    // Sort leaves for deterministic ordering
+    leaves.sort((a, b) => {
+      const aBig = BigInt(a);
+      const bBig = BigInt(b);
+      if (aBig < bBig) return -1;
+      if (aBig > bBig) return 1;
+      return 0;
+    });
+
+    // Find target leaf
+    const targetLeaf = hash.computePoseidonHashOnElements([num.toHex(targetContract)]);
+    let targetIdx = leaves.indexOf(targetLeaf);
+    if (targetIdx === -1) return [];
+
+    const proof: string[] = [];
+    let currentLevel = [...leaves];
+
+    while (currentLevel.length > 1) {
+      const nextLevel: string[] = [];
+      let nextTargetIdx = -1;
+
+      for (let i = 0; i < currentLevel.length; i += 2) {
+        if (i + 1 < currentLevel.length) {
+          const left = currentLevel[i];
+          const right = currentLevel[i + 1];
+
+          // Add sibling to proof if target is in this pair
+          if (i === targetIdx || i + 1 === targetIdx) {
+            proof.push(i === targetIdx ? right : left);
+            nextTargetIdx = Math.floor(i / 2);
+          }
+
+          const leftBig = BigInt(left);
+          const rightBig = BigInt(right);
+          if (leftBig < rightBig) {
+            nextLevel.push(hash.computePoseidonHashOnElements([left, right]));
+          } else {
+            nextLevel.push(hash.computePoseidonHashOnElements([right, left]));
+          }
+        } else {
+          // Odd leaf, promoted
+          if (i === targetIdx) {
+            nextTargetIdx = Math.floor(i / 2);
+          }
+          nextLevel.push(currentLevel[i]);
+        }
+      }
+
+      currentLevel = nextLevel;
+      targetIdx = nextTargetIdx;
+    }
+
+    return proof;
   }
 }

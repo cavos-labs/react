@@ -14,6 +14,8 @@ export interface CavosContextValue {
   register: (provider: LoginProvider, credentials: FirebaseCredentials) => Promise<void>;
   execute: (calls: Call | Call[], options?: { gasless?: boolean }) => Promise<string>;
   renewSession: () => Promise<string>;
+  revokeSession: (sessionKey: string) => Promise<string>;
+  emergencyRevokeAllSessions: () => Promise<string>;
   signMessage: (typedData: TypedData) => Promise<Signature>;
   getOnramp: (provider: OnrampProvider) => string;
   logout: () => Promise<void>;
@@ -130,6 +132,14 @@ export function CavosProvider({ config, children }: CavosProviderProps) {
     return cavos.renewSession();
   }, [cavos]);
 
+  const revokeSession = useCallback(async (sessionKey: string) => {
+    return cavos.revokeSession(sessionKey);
+  }, [cavos]);
+
+  const emergencyRevokeAllSessions = useCallback(async () => {
+    return cavos.emergencyRevokeAllSessions();
+  }, [cavos]);
+
   const signMessage = useCallback(async (typedData: TypedData) => {
     return cavos.signMessage(typedData);
   }, [cavos]);
@@ -169,6 +179,8 @@ export function CavosProvider({ config, children }: CavosProviderProps) {
     register,
     execute,
     renewSession,
+    revokeSession,
+    emergencyRevokeAllSessions,
     signMessage,
     getOnramp,
     logout,

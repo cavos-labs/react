@@ -2,9 +2,10 @@
  * OAuthTransactionManager - Manages transactions for OAuth-based wallets
  *
  * Handles:
- * - Transaction signing with ephemeral keys
+ * - Transaction signing with session keys
  * - Building JWT signature data for on-chain verification
  * - Account deployment (self-deploy via paymaster)
+ * - Session revocation
  * - Paymaster integration
  */
 
@@ -40,18 +41,15 @@ class OAuthSigner extends Signer {
 
   async getPubKey(): Promise<string> {
     const session = this.oauthManager.getSession();
-    return session?.ephemeralPubKey || '0x0';
+    return session?.sessionPubKey || '0x0';
   }
 
   async signMessage(typedDataInput: TypedData, accountAddress: string): Promise<Signature> {
-    // For OutsideExecution (paymaster), compute the typed data hash properly
     const msgHash = typedData.getMessageHash(typedDataInput, accountAddress);
 
     if (this.forDeploy) {
-      // For deploy, use full JWT signature
       return await this.oauthManager.buildJWTSignatureData(msgHash);
     } else {
-      // For execute, use lightweight session signature
       return this.oauthManager.buildSessionSignature(msgHash);
     }
   }
@@ -71,8 +69,6 @@ class OAuthSigner extends Signer {
 
   async signDeployAccountTransaction(details: any): Promise<Signature> {
     const txHash = details.transactionHash || '0x0';
-
-    // Deploy always uses full JWT signature
     return await this.oauthManager.buildJWTSignatureData(txHash);
   }
 }
@@ -85,6 +81,8 @@ export class OAuthTransactionManager {
   private network: 'mainnet' | 'sepolia';
   private account: Account | null = null;
   private paymasterRpc: PaymasterRpc;
+  /** Tracks whether we've already sent a JWT tx (which registers the session on-chain) */
+  private sessionRegisteredLocally: boolean = false;
 
   constructor(
     config: OAuthWalletConfig,
@@ -99,7 +97,6 @@ export class OAuthTransactionManager {
     this.paymasterApiKey = paymasterApiKey;
     this.network = network;
 
-    // Initialize PaymasterRpc
     const paymasterUrl = network === 'mainnet'
       ? 'https://starknet.paymaster.avnu.fi'
       : 'https://sepolia.paymaster.avnu.fi';
@@ -133,25 +130,27 @@ export class OAuthTransactionManager {
     registered: boolean;
     expired: boolean;
     canRenew: boolean;
-    maxBlock?: bigint;
+    validUntil?: bigint;
     renewalDeadline?: bigint;
   }> {
     const session = this.oauthManager.getSession();
-    if (!session?.walletAddress || !session.ephemeralPubKey) {
+    if (!session?.walletAddress || !session.sessionPubKey) {
       return { registered: false, expired: false, canRenew: false };
     }
 
     try {
+      console.log('[getSessionStatus] Querying session for key:', session.sessionPubKey, 'at address:', session.walletAddress);
       const result = await this.provider.callContract({
         contractAddress: session.walletAddress,
         entrypoint: 'get_session',
-        calldata: [session.ephemeralPubKey],
+        calldata: [session.sessionPubKey],
       });
+      console.log('[getSessionStatus] Raw result:', result);
 
-      // get_session returns (nonce, max_block, renewal_deadline, registered_at)
+      // get_session returns (nonce, valid_after, valid_until, renewal_deadline, registered_at, allowed_contracts_root, max_calls_per_tx)
       const nonce = BigInt(result[0]);
-      const maxBlock = BigInt(result[1]);
-      const renewalDeadline = BigInt(result[2]);
+      const validUntil = BigInt(result[2]);
+      const renewalDeadline = BigInt(result[3]);
 
       const registered = nonce !== 0n;
 
@@ -159,21 +158,23 @@ export class OAuthTransactionManager {
         return { registered: false, expired: false, canRenew: false };
       }
 
-      // Get current block number
-      const currentBlock = BigInt((await this.provider.getBlockNumber()) || 0);
+      // Get current block timestamp
+      const block = await this.provider.getBlock('latest');
+      const now = BigInt(block.timestamp);
 
-      const expired = currentBlock >= maxBlock;
-      const canRenew = expired && currentBlock < renewalDeadline;
+      const expired = now >= validUntil;
+      const canRenew = expired && now < renewalDeadline;
 
-      return { registered, expired, canRenew, maxBlock, renewalDeadline };
-    } catch {
+      return { registered, expired, canRenew, validUntil, renewalDeadline };
+    } catch (err) {
+      console.error('[getSessionStatus] Error calling get_session:', err);
       return { registered: false, expired: false, canRenew: false };
     }
   }
 
   /**
    * Check if the current session is registered on-chain.
-   * Calls the contract's get_session(ephemeral_pubkey) function.
+   * Calls the contract's get_session(session_key) function.
    * If nonce == 0, the session is NOT registered.
    */
   async isSessionRegistered(): Promise<boolean> {
@@ -198,26 +199,22 @@ export class OAuthTransactionManager {
       throw new Error('No valid session for deployment');
     }
 
-    // Deployer address is legacy - no longer used but kept for contract constructor compatibility
-    const deployerAddress = this.config.deployerContractAddress || '0x0';
-
     // Check if already deployed
     const alreadyDeployed = await this.isDeployed();
     if (alreadyDeployed) {
       return 'already-deployed';
     }
 
-    // Constructor calldata: [address_seed, jwks_registry, deployer]
+    // Constructor calldata: [address_seed, jwks_registry]
     const constructorCalldata = [
       session.addressSeed,
       this.config.jwksRegistryAddress,
-      deployerAddress,
     ].map(c => num.toHex(c));
 
     // Create custom signer for deploy (uses full JWT signature)
     const deploySigner = new OAuthSigner(this.oauthManager, true);
 
-    // Create counterfactual Account with PaymasterRpc (starknet.js v9 syntax)
+    // Create counterfactual Account with PaymasterRpc
     const counterfactualAccount = new Account({
       provider: this.provider,
       address: session.walletAddress,
@@ -225,7 +222,7 @@ export class OAuthTransactionManager {
       paymaster: this.paymasterRpc,
     });
 
-    // Build AccountDeploymentData per starknet.js spec
+    // Build AccountDeploymentData
     const deploymentData = {
       address: session.walletAddress,
       class_hash: this.config.cavosAccountClassHash,
@@ -235,19 +232,16 @@ export class OAuthTransactionManager {
     };
 
     try {
-      // Execute deploy with paymaster sponsorship using starknet.js
       const feesDetails = {
         feeMode: { mode: 'sponsored' as const },
         deploymentData: deploymentData,
       };
 
-      // For DEPLOY_ACCOUNT, call executePaymasterTransaction with empty calls
       const result = await counterfactualAccount.executePaymasterTransaction(
-        [], // No calls - just deploy
+        [],
         feesDetails
       );
 
-      // Wait for confirmation
       await this.provider.waitForTransaction(result.transaction_hash);
 
       return result.transaction_hash;
@@ -260,7 +254,6 @@ export class OAuthTransactionManager {
         errorMsg.includes('already-deployed') ||
         errorMsg.includes('Class hash') && errorMsg.includes('not supported')
       ) {
-        // If class hash not supported, fall back to note
         if (errorMsg.includes('not supported')) {
           throw new Error('Class hash not supported by paymaster. Contact AVNU to whitelist.');
         }
@@ -289,20 +282,17 @@ export class OAuthTransactionManager {
 
     // Check session status on-chain
     const status = await this.getSessionStatus();
+    console.log('[execute] Session status:', JSON.stringify(status, (_, v) => typeof v === 'bigint' ? v.toString() : v));
     // Case 1: Session not registered - use JWT signature via AVNU (registers + executes)
     if (!status.registered) {
+      console.log('[execute] Using JWT signature (session not registered)');
       return this.executeWithAVNUAPI(callsArray, session, true); // forceJWT=true
     }
 
     // Case 2: Session expired but can be renewed - auto-renew then execute
     if (status.expired && status.canRenew) {
-      // Generate new session
       const newSession = await this.oauthManager.generateNewSession();
-
-      // Renew the session
       await this.renewSession(newSession);
-
-      // Now execute with the new session signature
       return this.executeWithAVNUAPI(callsArray, newSession);
     }
 
@@ -361,9 +351,10 @@ export class OAuthTransactionManager {
     const messageHash = this.computeTypedDataHash(paymasterTypedData, session.walletAddress);
 
     // Build signature (JWT for first tx, session for subsequent)
+    // Pass calls for Merkle proof inclusion in session signatures
     const signature = forceJWT
       ? await this.oauthManager.buildJWTSignatureData(messageHash)
-      : this.oauthManager.buildSessionSignature(messageHash);
+      : this.oauthManager.buildSessionSignature(messageHash, calls);
 
     // Execute via paymaster
     const executePayload = {
@@ -385,7 +376,6 @@ export class OAuthTransactionManager {
       if (!executeResponse.ok) {
         const errorText = await executeResponse.text();
 
-        // Check if session expired - developer must handle renewal
         if (errorText.includes('Session expired')) {
           throw new Error('SESSION_EXPIRED: Session has expired. Call renewSession() to renew.');
         }
@@ -405,7 +395,7 @@ export class OAuthTransactionManager {
    */
   private async waitForTransaction(txHash: string, timeout: number = 120000): Promise<void> {
     const startTime = Date.now();
-    const pollInterval = 3000; // Poll every 3 seconds
+    const pollInterval = 3000;
     let attemptCount = 0;
 
     while (Date.now() - startTime < timeout) {
@@ -413,7 +403,6 @@ export class OAuthTransactionManager {
       try {
         const receipt = await this.provider.getTransactionReceipt(txHash);
         if (receipt) {
-          // Check if transaction was successful
           const isSuccessful = (receipt as any).execution_status === 'SUCCEEDED' ||
             (receipt as any).status === 'ACCEPTED_ON_L2' ||
             (receipt as any).finality_status === 'ACCEPTED_ON_L2' ||
@@ -423,14 +412,12 @@ export class OAuthTransactionManager {
             return;
           }
 
-          // Check if transaction failed
           const isFailed = (receipt as any).execution_status === 'REVERTED';
           if (isFailed) {
             throw new Error(`Transaction ${txHash} was reverted`);
           }
         }
       } catch (error: any) {
-        // Transaction not found yet or other error
         if (error.message && error.message.includes('reverted')) {
           throw error;
         }
@@ -443,135 +430,75 @@ export class OAuthTransactionManager {
   }
 
   /**
-   * Internal helper for renewSession using raw session objects
-   */
-  private async renewSessionInternal(oldSession: OAuthSession, newSession: OAuthSession): Promise<string> {
-    if (!oldSession.ephemeralPrivateKey || !oldSession.ephemeralPubKey) {
-      throw new Error('Old session key missing for renewal');
-    }
-
-    // Build the renew_session call
-    const message = hash.computePoseidonHashOnElements([
-      newSession.ephemeralPubKey,
-      newSession.nonce,
-      num.toHex(newSession.nonceParams.maxBlock),
-      num.toHex(newSession.nonceParams.renewalDeadline),
-    ]);
-
-    const oldCurveSignature = ec.starkCurve.sign(message, oldSession.ephemeralPrivateKey);
-
-    const renewCall: Call = {
-      contractAddress: oldSession.walletAddress!,
-      entrypoint: 'renew_session',
-      calldata: [
-        oldSession.ephemeralPubKey,
-        num.toHex(oldCurveSignature.r),
-        num.toHex(oldCurveSignature.s),
-        newSession.ephemeralPubKey,
-        newSession.nonce,
-        num.toHex(newSession.nonceParams.maxBlock),
-        num.toHex(newSession.nonceParams.renewalDeadline),
-      ]
-    };
-
-    const baseUrl = this.network === 'mainnet'
-      ? 'https://starknet.api.avnu.fi'
-      : 'https://sepolia.api.avnu.fi';
-
-    const buildResponse = await fetch(`${baseUrl}/paymaster/v1/build-typed-data`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'api-key': this.paymasterApiKey,
-      },
-      body: JSON.stringify({
-        userAddress: oldSession.walletAddress,
-        calls: [renewCall],
-      }),
-    });
-
-    if (!buildResponse.ok) {
-      throw new Error(`Build renewal failed: ${await buildResponse.text()}`);
-    }
-
-    const paymasterTypedData = await buildResponse.json();
-    const messageHash = this.computeTypedDataHash(paymasterTypedData, oldSession.walletAddress!);
-
-    // Sign with OLD session key
-    const signature = ec.starkCurve.sign(messageHash, oldSession.ephemeralPrivateKey);
-    const formattedSignature = [
-      '0x53455353494f4e5f5631',
-      num.toHex(signature.r),
-      num.toHex(signature.s),
-      oldSession.ephemeralPubKey,
-    ];
-
-    const executeResponse = await fetch(`${baseUrl}/paymaster/v1/execute`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'api-key': this.paymasterApiKey,
-      },
-      body: JSON.stringify({
-        userAddress: oldSession.walletAddress,
-        typedData: JSON.stringify(paymasterTypedData),
-        signature: formattedSignature,
-      }),
-    });
-
-    if (!executeResponse.ok) {
-      const errorText = await executeResponse.text();
-      if (errorText.includes('Renewal period expired')) {
-        throw new Error('Renewal period expired');
-      }
-      throw new Error(`Execution of renewal failed: ${errorText}`);
-    }
-
-    const result = await executeResponse.json();
-    return result.transactionHash;
-  }
-
-  /**
    * Renew session using the grace period (self-custodial).
    * The old session must be expired but within its renewal window.
-   * The old ephemeral key signs the new session params to authorize the renewal.
+   * The old session key signs the new session params to authorize the renewal.
    *
-   * @param newSession The new session data (from a fresh OAuth login)
+   * @param newSession The new session data (from generateNewSession)
    * @returns Transaction hash
    */
   async renewSession(newSession: OAuthSession): Promise<string> {
     const oldSession = this.oauthManager.getSession();
-    if (!oldSession?.walletAddress || !oldSession.ephemeralPrivateKey) {
+    if (!oldSession?.walletAddress || !oldSession.sessionPrivateKey) {
       throw new Error('No old session to renew from');
     }
 
-    if (!newSession.ephemeralPubKey || !newSession.nonce || !newSession.nonceParams) {
+    if (!newSession.sessionPubKey || !newSession.nonce || !newSession.nonceParams) {
       throw new Error('New session data incomplete');
     }
 
-    // Sign the new session params with the OLD ephemeral key
-    // Message = poseidon(new_ephemeral_pubkey, new_nonce, new_max_block, new_renewal_deadline)
+    // Compute allowed_contracts_root for the new session policy
+    const policy = newSession.sessionPolicy;
+    const allowedContractsRoot = policy?.allowedContracts?.length
+      ? OAuthWalletManager.computeMerkleRoot(policy.allowedContracts)
+      : '0x0';
+    const maxCallsPerTx = policy?.maxCallsPerTx ?? 10;
+
+    // Sign the new session params with the OLD session key
+    // Message = poseidon(new_session_key, new_nonce, new_valid_after, new_valid_until,
+    //                    new_renewal_deadline, new_allowed_contracts_root, new_max_calls_per_tx)
     const message = hash.computePoseidonHashOnElements([
-      newSession.ephemeralPubKey,
+      newSession.sessionPubKey,
       newSession.nonce,
-      num.toHex(newSession.nonceParams.maxBlock),
+      num.toHex(newSession.nonceParams.validAfter),
+      num.toHex(newSession.nonceParams.validUntil),
       num.toHex(newSession.nonceParams.renewalDeadline),
+      allowedContractsRoot,
+      num.toHex(maxCallsPerTx),
     ]);
 
-    const oldSignature = ec.starkCurve.sign(message, oldSession.ephemeralPrivateKey);
+    const oldSignature = ec.starkCurve.sign(message, oldSession.sessionPrivateKey);
+
+    // Build spending policies calldata
+    const spendingCalldata: string[] = [];
+    if (policy?.spendingLimits?.length) {
+      spendingCalldata.push(num.toHex(policy.spendingLimits.length));
+      for (const limit of policy.spendingLimits) {
+        spendingCalldata.push(num.toHex(limit.token));
+        const limitBig = BigInt(limit.limit);
+        spendingCalldata.push(num.toHex(limitBig & ((1n << 128n) - 1n))); // low
+        spendingCalldata.push(num.toHex(limitBig >> 128n)); // high
+      }
+    } else {
+      spendingCalldata.push(num.toHex(0));
+    }
 
     // Build the renew_session call
     const renewCall: Call = {
       contractAddress: oldSession.walletAddress,
       entrypoint: 'renew_session',
       calldata: [
-        oldSession.ephemeralPubKey,           // old_ephemeral_pubkey
-        num.toHex(oldSignature.r),            // old_signature_r
-        num.toHex(oldSignature.s),            // old_signature_s
-        newSession.ephemeralPubKey,           // new_ephemeral_pubkey
-        newSession.nonce,                     // new_nonce
-        num.toHex(newSession.nonceParams.maxBlock),        // new_max_block
-        num.toHex(newSession.nonceParams.renewalDeadline), // new_renewal_deadline
+        oldSession.sessionPubKey,              // old_session_key
+        num.toHex(oldSignature.r),             // old_signature_r
+        num.toHex(oldSignature.s),             // old_signature_s
+        newSession.sessionPubKey,              // new_session_key
+        newSession.nonce,                      // new_nonce
+        num.toHex(newSession.nonceParams.validAfter),       // new_valid_after
+        num.toHex(newSession.nonceParams.validUntil),       // new_valid_until
+        num.toHex(newSession.nonceParams.renewalDeadline),  // new_renewal_deadline
+        allowedContractsRoot,                  // new_allowed_contracts_root
+        num.toHex(maxCallsPerTx),              // new_max_calls_per_tx
+        ...spendingCalldata,                   // spending policies
       ]
     };
 
@@ -621,9 +548,8 @@ export class OAuthTransactionManager {
 
     if (!executeResponse.ok) {
       const errorText = await executeResponse.text();
-      // If grace period expired, caller should use registerSessionViaDeployer
       if (errorText.includes('Renewal period expired')) {
-        throw new Error('Grace period expired. Use registerSessionViaDeployer instead.');
+        throw new Error('Grace period expired. Please login again with JWT.');
       }
       throw new Error(`Renew session failed: ${errorText}`);
     }
@@ -633,109 +559,49 @@ export class OAuthTransactionManager {
   }
 
   /**
-   * Register a new session via the deployer (fallback when grace period expired).
-   * This requires the relayer to verify the JWT off-chain.
-   * Less decentralized but always works.
+   * Revoke a specific session key.
+   * Requires JWT verification — builds a full JWT-signed transaction.
    *
-   * @param newSession The new session data (from a fresh OAuth login)
+   * @param sessionKey The session key (public key) to revoke
    * @returns Transaction hash
    */
-  async registerSessionViaDeployer(newSession: OAuthSession): Promise<string> {
-    if (!newSession.walletAddress || !newSession.ephemeralPubKey || !newSession.nonce || !newSession.nonceParams) {
-      throw new Error('New session data incomplete');
+  async revokeSession(sessionKey: string): Promise<string> {
+    const session = this.oauthManager.getSession();
+    if (!session?.walletAddress) {
+      throw new Error('No valid session');
     }
 
-    if (!this.config.deployerContractAddress) {
-      throw new Error('Deployer contract address not configured');
-    }
-
-    if (!this.config.relayerAddress || !this.config.relayerPrivateKey) {
-      throw new Error('Relayer configuration missing');
-    }
-
-    const baseUrl = this.network === 'mainnet'
-      ? 'https://starknet.api.avnu.fi'
-      : 'https://sepolia.api.avnu.fi';
-
-    // Generate valid JWT signature for on-chain verification
-    // Use dummy hash because verify_jwt_and_register_session_internal doesn't check ECDSA
-    const dummyTxHash = '0x0';
-    const jwtSignature = await this.oauthManager.buildJWTSignatureData(dummyTxHash);
-
-    // Build the register_session call (called by relayer on the deployer)
-    // [account_address, ephemeral_pubkey, nonce, max_block, renewal_deadline, signature_len, ...signature]
-    const registerCall: Call = {
-      contractAddress: this.config.deployerContractAddress,
-      entrypoint: 'register_session',
-      calldata: [
-        newSession.walletAddress,                          // account_address
-        newSession.ephemeralPubKey,                        // ephemeral_pubkey
-        newSession.nonce,                                  // nonce
-        num.toHex(newSession.nonceParams.maxBlock),        // max_block
-        num.toHex(newSession.nonceParams.renewalDeadline), // renewal_deadline
-        num.toHex(jwtSignature.length),                    // signature_len
-        ...jwtSignature,                                   // signature span
-      ]
+    const revokeCall: Call = {
+      contractAddress: session.walletAddress,
+      entrypoint: 'revoke_session',
+      calldata: [sessionKey],
     };
 
-    // Execute via relayer
-    const buildResponse = await fetch(`${baseUrl}/paymaster/v1/build-typed-data`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'api-key': this.paymasterApiKey,
-      },
-      body: JSON.stringify({
-        userAddress: this.config.relayerAddress,
-        calls: [{
-          contractAddress: registerCall.contractAddress,
-          entrypoint: registerCall.entrypoint,
-          calldata: registerCall.calldata,
-        }],
-      }),
-    });
+    // Authentication handled by tx validation layer (JWT or session signature)
+    return this.executeWithAVNUAPI([revokeCall], session);
+  }
 
-    if (!buildResponse.ok) {
-      throw new Error(`Build typed data failed: ${await buildResponse.text()}`);
+  /**
+   * Emergency revoke all session keys.
+   * Increments the revocation epoch, invalidating ALL existing sessions.
+   * Requires JWT verification.
+   *
+   * @returns Transaction hash
+   */
+  async emergencyRevokeAllSessions(): Promise<string> {
+    const session = this.oauthManager.getSession();
+    if (!session?.walletAddress) {
+      throw new Error('No valid session');
     }
 
-    const paymasterTypedData = await buildResponse.json();
+    const revokeCall: Call = {
+      contractAddress: session.walletAddress,
+      entrypoint: 'emergency_revoke',
+      calldata: [],
+    };
 
-    // Sign with relayer
-    const relayerAccount = new Account({
-      provider: this.provider,
-      address: this.config.relayerAddress,
-      signer: this.config.relayerPrivateKey
-    });
-
-    const signature = await relayerAccount.signMessage(paymasterTypedData);
-    const formattedSignature = Array.isArray(signature)
-      ? signature.map(s => num.toHex(s))
-      : [num.toHex(signature.r), num.toHex(signature.s)];
-
-    const executeResponse = await fetch(`${baseUrl}/paymaster/v1/execute`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'api-key': this.paymasterApiKey,
-      },
-      body: JSON.stringify({
-        userAddress: this.config.relayerAddress,
-        typedData: JSON.stringify(paymasterTypedData),
-        signature: formattedSignature,
-      }),
-    });
-
-    if (!executeResponse.ok) {
-      throw new Error(`Register session via deployer failed: ${await executeResponse.text()}`);
-    }
-
-    const result = await executeResponse.json();
-
-    // Wait for transaction confirmation
-    await this.provider.waitForTransaction(result.transactionHash);
-
-    return result.transactionHash;
+    // Authentication handled by tx validation layer (JWT or session signature)
+    return this.executeWithAVNUAPI([revokeCall], session);
   }
 
   /**
@@ -747,18 +613,15 @@ export class OAuthTransactionManager {
 
   /**
    * Get a starknet.js Account object for compatibility
-   * Note: This account uses a custom signer that builds OAuth signatures
    */
   getAccount(): Account | null {
     const address = this.oauthManager.getWalletAddress();
-    const privateKey = this.oauthManager.getEphemeralPrivateKey();
+    const privateKey = this.oauthManager.getSessionPrivateKey();
 
     if (!address || !privateKey) {
       return null;
     }
 
-    // Create account with ephemeral key
-    // Note: The actual signature will be built by buildJWTSignatureData
     if (!this.account) {
       this.account = new Account({ provider: this.provider, address, signer: privateKey });
     }
@@ -769,8 +632,6 @@ export class OAuthTransactionManager {
   // ============== Private helpers ==============
 
   private computeTypedDataHash(paymasterTypedData: any, address: string): string {
-    // Use starknet.js typedData utilities to compute the SNIP-12 message hash
-    // This handles SNIP-9 OutsideExecution typed data properly
     try {
       const messageHash = typedData.getMessageHash(paymasterTypedData, address);
       return messageHash;

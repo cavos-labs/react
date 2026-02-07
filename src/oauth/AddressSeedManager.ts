@@ -64,26 +64,22 @@ export class AddressSeedManager {
    * @param sub The OAuth `sub` claim
    * @param classHash The OAuth account contract class hash
    * @param jwksRegistryAddress The JWKS registry contract address
-   * @param deployerAddress The deployer contract address (for session registration)
    */
   computeContractAddress(
     sub: string,
     classHash: string,
     jwksRegistryAddress: string,
-    deployerAddress: string
   ): string {
     const addressSeed = this.computeAddressSeed(sub);
 
-    // Constructor calldata: [address_seed, jwks_registry, deployer]
-    const constructorCalldata = [addressSeed, jwksRegistryAddress, deployerAddress];
+    // Constructor calldata: [address_seed, jwks_registry]
+    const constructorCalldata = [addressSeed, jwksRegistryAddress];
 
-    // Use starknet.js utility to calculate address
-    // This handles the correct hash function (Pedersen vs Poseidon) based on protocol defaults
     const contractAddress = hash.calculateContractAddressFromHash(
       addressSeed, // salt
       classHash,
       constructorCalldata,
-      0 // deployer_address is 0
+      0
     );
 
     return contractAddress;
