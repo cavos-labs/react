@@ -33,6 +33,8 @@ export interface OAuthSession {
   addressSeed?: string;
   /** Session key policy */
   sessionPolicy?: SessionKeyPolicy;
+  /** Wallet name suffix */
+  walletName?: string;
 }
 
 export interface JWTClaims {
@@ -96,12 +98,13 @@ export class OAuthWalletManager {
     if (this.session?.jwtClaims?.sub) {
       const sub = this.session.jwtClaims.sub;
 
-      // Re-compute with new salt
-      const newAddressSeed = this.addressSeedManager.computeAddressSeed(sub);
+      // Re-compute with new salt and current name
+      const newAddressSeed = this.addressSeedManager.computeAddressSeed(sub, this.session.walletName);
       const newWalletAddress = this.addressSeedManager.computeContractAddress(
         sub,
         this.config.cavosAccountClassHash,
         this.config.jwksRegistryAddress,
+        this.session.walletName,
       );
 
       // Update session with new values
@@ -160,9 +163,40 @@ export class OAuthWalletManager {
       nonceParams,
       nonce,
       sessionPolicy: currentSession.sessionPolicy,
+      walletName: currentSession.walletName || 'default', // Ensure walletName is set
     };
 
     return newSession;
+  }
+
+  /**
+   * Switch active wallet by name.
+   * Re-computes address and seed while keeping JWT.
+   */
+  switchWallet(name?: string): void {
+    if (!this.session?.jwtClaims?.sub) {
+      // Just update local name for next login if not authenticated
+      this.session = { ...this.session as any, walletName: name };
+      return;
+    }
+
+    const sub = this.session.jwtClaims.sub;
+    const addressSeed = this.addressSeedManager.computeAddressSeed(sub, name);
+    const walletAddress = this.addressSeedManager.computeContractAddress(
+      sub,
+      this.config.cavosAccountClassHash,
+      this.config.jwksRegistryAddress,
+      name,
+    );
+
+    this.session = {
+      ...this.session,
+      walletName: name,
+      addressSeed,
+      walletAddress,
+    };
+
+    this.persistSession();
   }
 
   /**
@@ -196,6 +230,9 @@ export class OAuthWalletManager {
     // Compute nonce
     const nonce = NonceManager.computeNonce(nonceParams);
 
+    // Set default wallet name if not already set
+    const walletName = this.session?.walletName || 'default';
+
     // Create session object (use explicit policy, fall back to config default)
     this.session = {
       sessionPrivateKey,
@@ -203,6 +240,7 @@ export class OAuthWalletManager {
       nonceParams,
       nonce,
       sessionPolicy: policy ?? this.defaultPolicy,
+      walletName, // Ensure walletName is always set
     };
 
     // Persist pre-auth session to sessionStorage (survives OAuth redirect)
@@ -305,12 +343,13 @@ export class OAuthWalletManager {
     }
 
     // Compute address seed and wallet address
-    const addressSeed = this.addressSeedManager.computeAddressSeed(jwtClaims.sub);
+    const addressSeed = this.addressSeedManager.computeAddressSeed(jwtClaims.sub, this.session.walletName);
 
     const walletAddress = this.addressSeedManager.computeContractAddress(
       jwtClaims.sub,
       this.config.cavosAccountClassHash,
       this.config.jwksRegistryAddress,
+      this.session.walletName,
     );
     // Update session with JWT data
     this.session = {
@@ -319,6 +358,7 @@ export class OAuthWalletManager {
       jwtClaims,
       addressSeed,
       walletAddress,
+      walletName: this.session.walletName,
     };
 
     // Persist full session
@@ -419,13 +459,14 @@ export class OAuthWalletManager {
    * [+3] = spending_policies_count
    * [+4..] = spending_policies: [token, limit_low, limit_high, ...]
    */
-  async buildJWTSignatureData(transactionHash: string): Promise<string[]> {
-    if (!this.session?.jwt || !this.session.jwtClaims) {
+  async buildJWTSignatureData(transactionHash: string, externalSession?: OAuthSession): Promise<string[]> {
+    const session = externalSession || this.session;
+    if (!session?.jwt || !session.jwtClaims) {
       throw new Error('No JWT in session');
     }
-    const { jwt, sessionPrivateKey, sessionPubKey } = this.session;
-    const jwtClaims = this.session.jwtClaims;
-    const nonceParams = this.session.nonceParams;
+    const { jwt, sessionPrivateKey, sessionPubKey } = session;
+    const jwtClaims = session.jwtClaims;
+    const nonceParams = session.nonceParams;
 
     // Sign the transaction hash with the session key
     const signature = ec.starkCurve.sign(transactionHash, sessionPrivateKey);
@@ -472,30 +513,31 @@ export class OAuthWalletManager {
       num.toHex(nonceParams.validUntil), // valid_until [4]
       num.toHex(nonceParams.randomness), // randomness [5]
       jwt_sub_felt,                 // jwt_sub [6]
-      this.session.nonce,           // jwt_nonce [7]
+      session.nonce,                // jwt_nonce [7]
       num.toHex(jwtClaims.exp),    // jwt_exp [8]
       this.stringToFelt(this.extractKidFromJwt(jwt)), // jwt_kid [9]
       this.stringToFelt(jwtClaims.iss), // jwt_iss [10]
       this.stringToFelt(jwtClaims.aud), // jwt_aud [11]
       salt_hex,                     // salt [12]
-      num.toHex(offsets.sub_offset),    // sub_offset [13]
-      num.toHex(offsets.sub_len),       // sub_len [14]
-      num.toHex(offsets.nonce_offset),  // nonce_offset [15]
-      num.toHex(offsets.nonce_len),     // nonce_len [16]
-      num.toHex(offsets.kid_offset),    // kid_offset [17]
-      num.toHex(offsets.kid_len),       // kid_len [18]
-      num.toHex(16),                // rsa_sig_len [19]
-      ...rsaLimbs,                  // RSA signature as 16 u128 limbs [20-35]
-      num.toHex(16),                // n_prime len [36]
-      ...n_prime,                   // n_prime limbs [37-52]
-      num.toHex(16),                // r_sq len [53]
-      ...r_sq,                      // r_sq limbs [54-69]
-      num.toHex(signedDataBytes.length), // jwt_bytes_len [70]
-      ...packedBytes,               // packed JWT bytes [71+]
+      this.stringToFelt(session.walletName || ''), // wallet_name [13]
+      num.toHex(offsets.sub_offset),    // sub_offset [14]
+      num.toHex(offsets.sub_len),       // sub_len [15]
+      num.toHex(offsets.nonce_offset),  // nonce_offset [16]
+      num.toHex(offsets.nonce_len),     // nonce_len [17]
+      num.toHex(offsets.kid_offset),    // kid_offset [18]
+      num.toHex(offsets.kid_len),       // kid_len [19]
+      num.toHex(16),                // rsa_sig_len [20]
+      ...rsaLimbs,                  // RSA signature as 16 u128 limbs [21-36]
+      num.toHex(16),                // n_prime len [37]
+      ...n_prime,                   // n_prime limbs [38-53]
+      num.toHex(16),                // r_sq len [54]
+      ...r_sq,                      // r_sq limbs [55-70]
+      num.toHex(signedDataBytes.length), // jwt_bytes_len [71]
+      ...packedBytes,               // packed JWT bytes [72+]
     ];
 
     // Append policy fields after JWT data
-    const policy = this.session.sessionPolicy;
+    const policy = session.sessionPolicy;
     sig.push(num.toHex(nonceParams.validAfter)); // valid_after
 
     if (policy) {
@@ -639,6 +681,13 @@ export class OAuthWalletManager {
   }
 
   /**
+   * Get the address seed manager.
+   */
+  getAddressSeedManager(): AddressSeedManager {
+    return this.addressSeedManager;
+  }
+
+  /**
    * Check if session exists and is valid
    */
   hasValidSession(): boolean {
@@ -673,6 +722,13 @@ export class OAuthWalletManager {
         }
         if (this.session) {
           this.session.sessionPolicy = this.deserializePolicy((this.session as any).sessionPolicy) ?? this.defaultPolicy;
+
+          // Migration: ensure walletName is set (fix old sessions)
+          if (!this.session.walletName || this.session.walletName === '') {
+            console.log('[restoreSession] Migrating session: setting walletName=default');
+            this.session.walletName = 'default';
+            this.persistSession();
+          }
         }
         return this.hasValidSession();
       }

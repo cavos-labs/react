@@ -324,10 +324,10 @@ interface CavosConfig {
 
 ## Architecture
 
-- **OAuth Wallet**: JWT-based authentication with ephemeral session keys
+- **OAuth Wallet**: JWT-based authentication with session keys
 - **Session Management**: On-chain session registration with `max_block` expiry and grace period
 - **Paymaster**: AVNU Paymaster sponsorship for gasless transactions
-- **Self-Custody**: No server holds keys—JWT + ephemeral key is the auth mechanism
+- **Self-Custody**: No server holds keys—JWT + session key is the auth mechanism
 - **Account Recovery**: Re-login with OAuth to regain access
 
 ## API Reference

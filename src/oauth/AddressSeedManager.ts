@@ -18,16 +18,22 @@ export class AddressSeedManager {
 
   /**
    * Compute the address seed from a user's OAuth `sub` claim
-   * MUST match Cairo: PoseidonTrait::new().update(sub).update(salt).finalize()
+   * MUST match Cairo: PoseidonTrait::new().update(sub).update(salt).update(name).finalize()
    * @param sub The OAuth `sub` claim (user ID)
+   * @param name Optional wallet name suffix for deterministic derivation
    */
-  computeAddressSeed(sub: string): string {
+  computeAddressSeed(sub: string, name?: string): string {
     // Convert sub to felt252 (hash if too long)
     const subFelt = this.subToFelt(sub);
     const saltFelt = num.toHex(this.salt);
 
-    // Poseidon([sub, salt]) - matches Cairo's .update().update().finalize()
-    return hash.computePoseidonHashOnElements([subFelt, saltFelt]);
+    const elements = [subFelt, saltFelt];
+    if (name) {
+      elements.push(this.stringToFelt(name));
+    }
+
+    // Poseidon([sub, salt, name?]) - matches Cairo's .update().update().update().finalize()
+    return hash.computePoseidonHashOnElements(elements);
   }
 
   /**
@@ -69,8 +75,9 @@ export class AddressSeedManager {
     sub: string,
     classHash: string,
     jwksRegistryAddress: string,
+    name?: string,
   ): string {
-    const addressSeed = this.computeAddressSeed(sub);
+    const addressSeed = this.computeAddressSeed(sub, name);
 
     // Constructor calldata: [address_seed, jwks_registry]
     const constructorCalldata = [addressSeed, jwksRegistryAddress];

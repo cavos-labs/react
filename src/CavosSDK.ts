@@ -174,6 +174,9 @@ export class CavosSDK {
     await this.oauthWalletManager.loginWithFirebase(email, password);
     this.initializeTransactionManager();
 
+    // Store in seen wallets for discovery
+    this.addWalletToSeen(this.oauthWalletManager.getSession()?.jwtClaims?.sub, this.oauthWalletManager.getSession()?.walletName);
+
     // Deploy or register session in background (only on login)
     this.deployAccountInBackground();
   }
@@ -209,10 +212,14 @@ export class CavosSDK {
           throw err;
         }
       } else {
-        this.logger.log('Account already deployed. Ready to execute.');
+        this.logger.log('Account already deployed. Checking session status...');
+        // Check if current session key is already registered on-chain
+        const sessionActive = this.transactionManager
+          ? await this.transactionManager.isSessionRegistered()
+          : false;
         this.updateWalletStatus({
           isDeployed: true,
-          isSessionActive: false, // Will be checked/registered on first execute()
+          isSessionActive: sessionActive,
           isReady: true
         });
       }
@@ -234,10 +241,17 @@ export class CavosSDK {
     await this.oauthWalletManager.handleOAuthCallback(authDataString);
     this.initializeTransactionManager();
 
+    // Store in seen wallets for discovery
+    this.addWalletToSeen(this.oauthWalletManager.getSession()?.jwtClaims?.sub, this.oauthWalletManager.getSession()?.walletName);
+
     // Ensure session is registered on-chain (background)
     this.deployAccountInBackground();
   }
 
+
+  /**
+   * Initialize TransactionManager
+   */
   private initializeTransactionManager(): void {
     const session = this.oauthWalletManager.getSession();
     if (!session || !session.walletAddress) return;
@@ -285,13 +299,6 @@ export class CavosSDK {
     return this.execute(calls);
   }
 
-  /**
-   * Create session (Compatibility Alias - Always returns success as OAuth IS a session)
-   */
-  async createSession(_policy?: any): Promise<void> {
-    this.logger.warn('createSession() is deprecated. OAuth flow handles sessions automatically.');
-    return;
-  }
 
   /**
    * Check if has active session (Compatibility Alias)
@@ -305,6 +312,66 @@ export class CavosSDK {
    */
   async clearSession(): Promise<void> {
     await this.logout();
+  }
+
+  /**
+   * Get all wallet addresses associated with the current user.
+   * Scans for SessionRegistered events and checks ownership.
+   */
+  async getAssociatedWallets(): Promise<{ address: string; name?: string }[]> {
+    const session = this.oauthWalletManager.getSession();
+    if (!session?.jwtClaims?.sub) return [];
+
+    const sub = session.jwtClaims.sub;
+    const provider = new RpcProvider({ nodeUrl: this.config.starknetRpcUrl! });
+
+    // 1. Start with the "default" (unnamed) wallet
+    const defaultAddress = this.oauthWalletManager.getWalletAddress();
+    const wallets: { address: string; name?: string }[] = [];
+    if (defaultAddress) wallets.push({ address: defaultAddress });
+
+    try {
+      const SESSION_REGISTERED_KEY = '0x3b884c3fe0cee93e6453d50e9670be6fb54804e1bbbc159a845d9ab244a5ee6';
+      const FROM_BLOCK = this.config.network === 'mainnet' ? 6600000 : 0;
+      const isBrowser = typeof window !== 'undefined';
+      const seenNamesKey = `cavos_seen_wallets_${this.config.appId}_${sub}`;
+      const seenNames = isBrowser ? JSON.parse(localStorage.getItem(seenNamesKey) || '[]') : [];
+
+      for (const name of seenNames) {
+        const addr = this.oauthWalletManager.getAddressSeedManager().computeContractAddress(
+          sub,
+          this.config.oauthWallet!.cavosAccountClassHash!,
+          this.config.oauthWallet!.jwksRegistryAddress!,
+          name
+        );
+        if (!wallets.find(w => w.address === addr)) {
+          wallets.push({ address: addr, name });
+        }
+      }
+
+      return wallets;
+    } catch (err) {
+      this.logger.alwaysError('Discovery failed:', err);
+      return wallets;
+    }
+  }
+
+  /**
+   * Switch the active wallet by name.
+   */
+  async switchWallet(name?: string): Promise<void> {
+    this.oauthWalletManager.switchWallet(name);
+    this.initializeTransactionManager();
+
+    // Store in seen wallets for discovery
+    const session = this.oauthWalletManager.getSession();
+    if (session?.jwtClaims?.sub) {
+      this.addWalletToSeen(session.jwtClaims.sub, name);
+    }
+
+    // Check deployment in background for the newly selected wallet
+    this.deployAccountInBackground();
+    this.notifyWalletStatusListeners();
   }
 
   /**
@@ -346,6 +413,58 @@ export class CavosSDK {
     }
     return this.transactionManager.deployAccount();
   }
+
+  /**
+   * Register the current session key on-chain using the current JWT.
+   * Call this explicitly to pre-register the session before executing transactions.
+   */
+  async registerCurrentSession(): Promise<string> {
+    if (!this.transactionManager) {
+      throw new Error('Wallet not initialized');
+    }
+    const txHash = await this.transactionManager.registerCurrentSession();
+    this.updateWalletStatus({ isSessionActive: true });
+    return txHash;
+  }
+
+  /**
+   * Export the current session as a base64 token for use with the Cavos CLI.
+   * Use: cavos session import <token>
+   */
+  exportSession(): string {
+    const session = this.oauthWalletManager.getSession();
+    if (!session?.walletAddress || !session.sessionPrivateKey) {
+      throw new Error('No active session to export');
+    }
+    // JWT is intentionally excluded — the CLI uses the session key directly
+    // (SESSION_V1 signature). The session must already be registered on-chain.
+    const tokenObj = {
+      sessionPrivateKey: session.sessionPrivateKey,
+      sessionPubKey: session.sessionPubKey,
+      nonceParams: {
+        sessionPubKey: session.nonceParams.sessionPubKey,
+        validAfter: session.nonceParams.validAfter.toString(),
+        validUntil: session.nonceParams.validUntil.toString(),
+        renewalDeadline: session.nonceParams.renewalDeadline.toString(),
+        randomness: session.nonceParams.randomness.toString(),
+      },
+      nonce: session.nonce,
+      walletAddress: session.walletAddress,
+      addressSeed: session.addressSeed ?? '',
+      appSalt: this.appSalt ?? '0x0',
+      walletName: session.walletName,
+      sessionPolicy: session.sessionPolicy ? {
+        spendingLimits: session.sessionPolicy.spendingLimits.map(sl => ({
+          token: sl.token,
+          limit: sl.limit.toString(),
+        })),
+        allowedContracts: session.sessionPolicy.allowedContracts,
+        maxCallsPerTx: session.sessionPolicy.maxCallsPerTx,
+      } : undefined,
+    };
+    return btoa(JSON.stringify(tokenObj));
+  }
+
 
   /**
    * Renew the current session with a new session key.
@@ -494,7 +613,7 @@ export class CavosSDK {
   }
 
   /**
-   * Get account (Not directly available in OAuth flow without eph PK access)
+   * Get account (Not directly available in OAuth flow without session PK access)
    */
   getAccount(): Account | null {
     this.logger.warn('getAccount() is not available in OAuth-only mode. Use execute() instead.');
@@ -637,5 +756,18 @@ export class CavosSDK {
       r: (sig as string[])[0],
       s: (sig as string[])[1],
     };
+  }
+
+  /**
+   * Helper to persist a wallet name for discovery
+   */
+  private addWalletToSeen(sub: string | undefined, name: string | undefined): void {
+    if (!sub || !name || typeof window === 'undefined') return;
+    const seenNamesKey = `cavos_seen_wallets_${this.config.appId}_${sub}`;
+    const seenNames = JSON.parse(localStorage.getItem(seenNamesKey) || '[]');
+    if (!seenNames.includes(name)) {
+      seenNames.push(name);
+      localStorage.setItem(seenNamesKey, JSON.stringify(seenNames));
+    }
   }
 }

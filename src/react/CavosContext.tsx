@@ -22,10 +22,20 @@ export interface CavosContextValue {
   isLoading: boolean;
   isAccountDeployed: () => Promise<boolean>;
   deployAccount: () => Promise<string>;
+  /** Get current balance */
   getBalance: () => Promise<string>;
+  /** Resend verification email */
   resendVerificationEmail: (email: string) => Promise<void>;
   /** Wallet status for tracking deploy/session registration state */
   walletStatus: WalletStatus;
+  /** Get all wallets associated with this user */
+  getAssociatedWallets: () => Promise<{ address: string; name?: string }[]>;
+  /** Switch active wallet */
+  switchWallet: (name?: string) => Promise<void>;
+  /** Register the current session key on-chain using the current JWT */
+  registerCurrentSession: () => Promise<string>;
+  /** Export current session as base64 token for use with Cavos CLI */
+  exportSession: () => string;
 }
 
 const CavosContext = createContext<CavosContextValue | null>(null);
@@ -190,6 +200,13 @@ export function CavosProvider({ config, children }: CavosProviderProps) {
     getBalance,
     resendVerificationEmail,
     walletStatus,
+    getAssociatedWallets: async () => cavos.getAssociatedWallets(),
+    switchWallet: async (name?: string) => {
+      await cavos.switchWallet(name);
+      updateState();
+    },
+    registerCurrentSession: async () => cavos.registerCurrentSession(),
+    exportSession: () => cavos.exportSession(),
   };
 
   return (

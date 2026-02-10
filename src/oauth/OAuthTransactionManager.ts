@@ -283,10 +283,9 @@ export class OAuthTransactionManager {
     // Check session status on-chain
     const status = await this.getSessionStatus();
     console.log('[execute] Session status:', JSON.stringify(status, (_, v) => typeof v === 'bigint' ? v.toString() : v));
-    // Case 1: Session not registered - use JWT signature via AVNU (registers + executes)
+    // Case 1: Session not registered - throw error
     if (!status.registered) {
-      console.log('[execute] Using JWT signature (session not registered)');
-      return this.executeWithAVNUAPI(callsArray, session, true); // forceJWT=true
+      throw new Error('Session not registered on-chain. Please call registerSession() first to authorize this session.');
     }
 
     // Case 2: Session expired but can be renewed - auto-renew then execute
@@ -305,6 +304,25 @@ export class OAuthTransactionManager {
     return this.executeWithAVNUAPI(callsArray, session);
   }
 
+  /**
+   * Register the current session key on-chain using the current JWT.
+   * Call this explicitly before executing transactions to pre-register the session.
+   */
+  async registerCurrentSession(): Promise<string> {
+    const session = this.oauthManager.getSession();
+    if (!session?.jwt || !session.walletAddress) {
+      throw new Error('Must be logged in to register session');
+    }
+
+    const registrationCall: Call = {
+      contractAddress: session.walletAddress,
+      entrypoint: 'get_version',
+      calldata: [],
+    };
+
+    console.log('[registerCurrentSession] Registering current session on-chain...');
+    return this.executeWithAVNUAPI([registrationCall], session, true);
+  }
 
   /**
    * Execute with AVNU API.
@@ -353,7 +371,7 @@ export class OAuthTransactionManager {
     // Build signature (JWT for first tx, session for subsequent)
     // Pass calls for Merkle proof inclusion in session signatures
     const signature = forceJWT
-      ? await this.oauthManager.buildJWTSignatureData(messageHash)
+      ? await this.oauthManager.buildJWTSignatureData(messageHash, session)
       : this.oauthManager.buildSessionSignature(messageHash, calls);
 
     // Execute via paymaster
@@ -577,8 +595,8 @@ export class OAuthTransactionManager {
       calldata: [sessionKey],
     };
 
-    // Authentication handled by tx validation layer (JWT or session signature)
-    return this.executeWithAVNUAPI([revokeCall], session);
+    // revoke_session requires JWT verification on-chain
+    return this.executeWithAVNUAPI([revokeCall], session, true);
   }
 
   /**
@@ -600,8 +618,8 @@ export class OAuthTransactionManager {
       calldata: [],
     };
 
-    // Authentication handled by tx validation layer (JWT or session signature)
-    return this.executeWithAVNUAPI([revokeCall], session);
+    // emergency_revoke requires JWT verification on-chain
+    return this.executeWithAVNUAPI([revokeCall], session, true);
   }
 
   /**
