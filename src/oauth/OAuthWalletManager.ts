@@ -681,6 +681,28 @@ export class OAuthWalletManager {
   }
 
   /**
+   * Update the session policy on the active session.
+   * Call this before registerCurrentSession() to ensure the latest policy
+   * is embedded in the JWT signature and stored on-chain.
+   */
+  updateSessionPolicy(policy: SessionKeyPolicy): void {
+    if (this.session) {
+      this.session.sessionPolicy = policy;
+      this.persistSession();
+    }
+    // Also update defaultPolicy so future sessions pick it up
+    this.defaultPolicy = policy;
+  }
+
+  /**
+   * Update the default policy used for new sessions.
+   * Does NOT update the current session — call updateSessionPolicy() for that.
+   */
+  updateDefaultPolicy(policy: SessionKeyPolicy): void {
+    this.defaultPolicy = policy;
+  }
+
+  /**
    * Get the address seed manager.
    */
   getAddressSeedManager(): AddressSeedManager {

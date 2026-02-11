@@ -2,6 +2,7 @@
 import React, { createContext, useContext, useEffect, useState, useCallback, ReactNode } from 'react';
 import { CavosSDK, WalletStatus } from '../CavosSDK';
 import { CavosConfig, UserInfo, OnrampProvider, LoginProvider, Signature, FirebaseCredentials } from '../types';
+import { SessionKeyPolicy } from '../types/session';
 import { Call, type TypedData } from 'starknet';
 
 export interface CavosContextValue {
@@ -36,6 +37,8 @@ export interface CavosContextValue {
   registerCurrentSession: () => Promise<string>;
   /** Export current session as base64 token for use with Cavos CLI */
   exportSession: () => string;
+  /** Update session policy before registration */
+  updateSessionPolicy: (policy: SessionKeyPolicy) => void;
 }
 
 const CavosContext = createContext<CavosContextValue | null>(null);
@@ -207,6 +210,7 @@ export function CavosProvider({ config, children }: CavosProviderProps) {
     },
     registerCurrentSession: async () => cavos.registerCurrentSession(),
     exportSession: () => cavos.exportSession(),
+    updateSessionPolicy: (policy: SessionKeyPolicy) => cavos.updateSessionPolicy(policy),
   };
 
   return (

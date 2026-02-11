@@ -428,6 +428,15 @@ export class CavosSDK {
   }
 
   /**
+   * Update the session policy on the active session.
+   * Call this before registerCurrentSession() to ensure the latest policy
+   * is embedded in the JWT signature and stored on-chain.
+   */
+  updateSessionPolicy(policy: import('./types/session').SessionKeyPolicy): void {
+    this.oauthWalletManager.updateSessionPolicy(policy);
+  }
+
+  /**
    * Export the current session as a base64 token for use with the Cavos CLI.
    * Use: cavos session import <token>
    */
