@@ -7,8 +7,10 @@ export interface CavosConfig {
   starknetRpcUrl?: string;
   /** Network to use (default: sepolia) */
   network?: 'mainnet' | 'sepolia';
-  /** AVNU Paymaster API key for gasless transactions (optional, uses Cavos shared key if not provided) */
+  /** Paymaster API key for gasless transactions */
   paymasterApiKey?: string;
+  /** Custom paymaster URL (overrides default AVNU URLs) */
+  paymasterUrl?: string;
   /** Enable debug logging (default: false) */
   enableLogging?: boolean;
   /** OAuth Wallet configuration (optional, uses defaults for network if not provided) */

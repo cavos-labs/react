@@ -78,6 +78,7 @@ export class OAuthTransactionManager {
   private provider: RpcProvider;
   private oauthManager: OAuthWalletManager;
   private paymasterApiKey: string;
+  private paymasterApiBaseUrl: string;
   private network: 'mainnet' | 'sepolia';
   private account: Account | null = null;
   private paymasterRpc: PaymasterRpc;
@@ -89,7 +90,8 @@ export class OAuthTransactionManager {
     oauthManager: OAuthWalletManager,
     rpcUrl: string,
     paymasterApiKey: string,
-    network: 'mainnet' | 'sepolia'
+    network: 'mainnet' | 'sepolia',
+    paymasterUrl?: string
   ) {
     this.config = config;
     this.provider = new RpcProvider({ nodeUrl: rpcUrl });
@@ -97,12 +99,17 @@ export class OAuthTransactionManager {
     this.paymasterApiKey = paymasterApiKey;
     this.network = network;
 
-    const paymasterUrl = network === 'mainnet'
-      ? 'https://starknet.paymaster.avnu.fi'
-      : 'https://sepolia.paymaster.avnu.fi';
+    const defaultPaymasterUrl = network === 'mainnet'
+      ? 'https://paymaster.cavos.xyz'
+      : 'https://sepolia-paymaster.cavos.xyz';
+
+    const resolvedPaymasterUrl = paymasterUrl || defaultPaymasterUrl;
+
+    // Both point to the same Cavos JSON-RPC endpoint
+    this.paymasterApiBaseUrl = paymasterUrl || defaultPaymasterUrl;
 
     this.paymasterRpc = new PaymasterRpc({
-      nodeUrl: paymasterUrl,
+      nodeUrl: resolvedPaymasterUrl,
       headers: { 'x-paymaster-api-key': paymasterApiKey },
     });
   }
@@ -139,13 +146,11 @@ export class OAuthTransactionManager {
     }
 
     try {
-      console.log('[getSessionStatus] Querying session for key:', session.sessionPubKey, 'at address:', session.walletAddress);
       const result = await this.provider.callContract({
         contractAddress: session.walletAddress,
         entrypoint: 'get_session',
         calldata: [session.sessionPubKey],
       });
-      console.log('[getSessionStatus] Raw result:', result);
 
       // get_session returns (nonce, valid_after, valid_until, renewal_deadline, registered_at, allowed_contracts_root, max_calls_per_tx)
       const nonce = BigInt(result[0]);
@@ -242,22 +247,22 @@ export class OAuthTransactionManager {
         feesDetails
       );
 
-      await this.provider.waitForTransaction(result.transaction_hash);
+      await this.waitForTransaction(result.transaction_hash);
 
       return result.transaction_hash;
 
     } catch (e: any) {
       const errorMsg = e.message || e.toString();
+      console.error('[deployAccount] Deployment error:', errorMsg, e);
       if (
         errorMsg.includes('contract already deployed') ||
         errorMsg.includes('already deployed') ||
-        errorMsg.includes('already-deployed') ||
-        errorMsg.includes('Class hash') && errorMsg.includes('not supported')
+        errorMsg.includes('already-deployed')
       ) {
-        if (errorMsg.includes('not supported')) {
-          throw new Error('Class hash not supported by paymaster. Contact AVNU to whitelist.');
-        }
         return 'already-deployed';
+      }
+      if (errorMsg.includes('Class hash') && errorMsg.includes('not supported')) {
+        throw new Error('Class hash not supported by paymaster. Contact AVNU to whitelist.');
       }
 
       throw e;
@@ -282,7 +287,6 @@ export class OAuthTransactionManager {
 
     // Check session status on-chain
     const status = await this.getSessionStatus();
-    console.log('[execute] Session status:', JSON.stringify(status, (_, v) => typeof v === 'bigint' ? v.toString() : v));
     // Case 1: Session not registered - throw error
     if (!status.registered) {
       throw new Error('Session not registered on-chain. Please call registerSession() first to authorize this session.');
@@ -320,12 +324,40 @@ export class OAuthTransactionManager {
       calldata: [],
     };
 
-    console.log('[registerCurrentSession] Registering current session on-chain...');
     return this.executeWithAVNUAPI([registrationCall], session, true);
   }
 
   /**
-   * Execute with AVNU API.
+   * Send a JSON-RPC request to the Cavos paymaster.
+   */
+  private async callPaymasterRpc(method: string, params: any[]): Promise<any> {
+    const response = await fetch(this.paymasterApiBaseUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-paymaster-api-key': this.paymasterApiKey,
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', method, id: 1, params }),
+    });
+
+    const text = await response.text();
+    if (!response.ok) {
+      throw new Error(`Paymaster RPC request failed: ${text}`);
+    }
+
+    const data = JSON.parse(text);
+    if (data.error) {
+      const detail = data.error.data
+        ? ` | ${typeof data.error.data === 'string' ? data.error.data : JSON.stringify(data.error.data)}`
+        : '';
+      throw new Error(`Paymaster RPC error [${data.error.code}]: ${data.error.message}${detail}`);
+    }
+
+    return data.result;
+  }
+
+  /**
+   * Execute via Cavos paymaster JSON-RPC (paymaster_buildTransaction + sign + paymaster_executeTransaction).
    * @param forceJWT If true, uses JWT signature (for first tx). Otherwise uses session signature.
    */
   private async executeWithAVNUAPI(calls: Call[], session: OAuthSession, forceJWT: boolean = false): Promise<string> {
@@ -333,37 +365,35 @@ export class OAuthTransactionManager {
       throw new Error('No wallet address in session');
     }
 
-    const baseUrl = this.network === 'mainnet'
-      ? 'https://starknet.api.avnu.fi'
-      : 'https://sepolia.api.avnu.fi';
-
-    // Format calls for AVNU API
+    // Format calls for Cavos JSON-RPC: { to, selector, calldata }
     const formattedCalls = calls.map(call => ({
-      contractAddress: call.contractAddress,
-      entrypoint: call.entrypoint,
+      to: call.contractAddress,
+      selector: hash.getSelectorFromName(call.entrypoint),
       calldata: call.calldata
         ? (call.calldata as string[]).map(c => num.toHex(c))
         : [],
     }));
 
-    // Build typed data
-    const buildResponse = await fetch(`${baseUrl}/paymaster/v1/build-typed-data`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'api-key': this.paymasterApiKey,
+    // Build typed data via paymaster_buildTransaction
+    const buildResult = await this.callPaymasterRpc('paymaster_buildTransaction', [{
+      transaction: {
+        type: 'invoke',
+        invoke: {
+          user_address: session.walletAddress,
+          calls: formattedCalls,
+        },
       },
-      body: JSON.stringify({
-        userAddress: session.walletAddress,
-        calls: formattedCalls,
-      }),
-    });
+      parameters: {
+        version: '0x1',
+        fee_mode: { mode: 'sponsored' },
+      },
+    }]);
 
-    if (!buildResponse.ok) {
-      throw new Error(`Build typed data failed: ${await buildResponse.text()}`);
+    // Response for invoke: { type: 'invoke', typed_data, parameters, fee }
+    const paymasterTypedData = buildResult.typed_data;
+    if (!paymasterTypedData) {
+      throw new Error(`paymaster_buildTransaction returned unexpected format: ${JSON.stringify(buildResult)}`);
     }
-
-    const paymasterTypedData = await buildResponse.json();
 
     // Compute message hash
     const messageHash = this.computeTypedDataHash(paymasterTypedData, session.walletAddress);
@@ -374,38 +404,20 @@ export class OAuthTransactionManager {
       ? await this.oauthManager.buildJWTSignatureData(messageHash, session)
       : this.oauthManager.buildSessionSignature(messageHash, calls);
 
-    // Execute via paymaster
-    const executePayload = {
-      userAddress: session.walletAddress,
-      typedData: JSON.stringify(paymasterTypedData),
-      signature: signature,
-    };
-
-    try {
-      const executeResponse = await fetch(`${baseUrl}/paymaster/v1/execute`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'api-key': this.paymasterApiKey,
+    // Execute via paymaster_executeTransaction
+    const result = await this.callPaymasterRpc('paymaster_executeTransaction', [{
+      transaction: {
+        type: 'invoke',
+        invoke: {
+          user_address: session.walletAddress,
+          typed_data: paymasterTypedData,
+          signature: signature,
         },
-        body: JSON.stringify(executePayload),
-      });
+      },
+      parameters: buildResult.parameters,
+    }]);
 
-      if (!executeResponse.ok) {
-        const errorText = await executeResponse.text();
-
-        if (errorText.includes('Session expired')) {
-          throw new Error('SESSION_EXPIRED: Session has expired. Call renewSession() to renew.');
-        }
-
-        throw new Error(`Execute failed: ${errorText}`);
-      }
-
-      const result = await executeResponse.json();
-      return result.transactionHash;
-    } catch (e: any) {
-      throw e;
-    }
+    return result.transaction_hash;
   }
 
   /**
@@ -432,7 +444,8 @@ export class OAuthTransactionManager {
 
           const isFailed = (receipt as any).execution_status === 'REVERTED';
           if (isFailed) {
-            throw new Error(`Transaction ${txHash} was reverted`);
+            const revertReason = (receipt as any).revert_error || (receipt as any).revert_reason || 'Unknown revert reason';
+            throw new Error(`Transaction ${txHash} was reverted: ${revertReason}`);
           }
         }
       } catch (error: any) {
@@ -520,60 +533,56 @@ export class OAuthTransactionManager {
       ]
     };
 
-    // Execute via paymaster using the OLD session signature
-    const baseUrl = this.network === 'mainnet'
-      ? 'https://starknet.api.avnu.fi'
-      : 'https://sepolia.api.avnu.fi';
-
-    const buildResponse = await fetch(`${baseUrl}/paymaster/v1/build-typed-data`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'api-key': this.paymasterApiKey,
+    // Execute via Cavos paymaster JSON-RPC using the OLD session signature
+    const buildResult = await this.callPaymasterRpc('paymaster_buildTransaction', [{
+      transaction: {
+        type: 'invoke',
+        invoke: {
+          user_address: oldSession.walletAddress,
+          calls: [{
+            to: renewCall.contractAddress,
+            selector: hash.getSelectorFromName(renewCall.entrypoint),
+            calldata: (renewCall.calldata as string[] | undefined) ?? [],
+          }],
+        },
       },
-      body: JSON.stringify({
-        userAddress: oldSession.walletAddress,
-        calls: [{
-          contractAddress: renewCall.contractAddress,
-          entrypoint: renewCall.entrypoint,
-          calldata: renewCall.calldata,
-        }],
-      }),
-    });
+      parameters: {
+        version: '0x1',
+        fee_mode: { mode: 'sponsored' },
+      },
+    }]);
 
-    if (!buildResponse.ok) {
-      throw new Error(`Build typed data failed: ${await buildResponse.text()}`);
+    const paymasterTypedData = buildResult.typed_data;
+    if (!paymasterTypedData) {
+      throw new Error(`paymaster_buildTransaction returned unexpected format: ${JSON.stringify(buildResult)}`);
     }
 
-    const paymasterTypedData = await buildResponse.json();
     const messageHash = this.computeTypedDataHash(paymasterTypedData, oldSession.walletAddress);
 
     // Sign with OLD session (it's in grace period, can only renew, not transact)
     const signature = this.oauthManager.buildSessionSignature(messageHash);
 
-    const executeResponse = await fetch(`${baseUrl}/paymaster/v1/execute`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'api-key': this.paymasterApiKey,
-      },
-      body: JSON.stringify({
-        userAddress: oldSession.walletAddress,
-        typedData: JSON.stringify(paymasterTypedData),
-        signature: signature,
-      }),
-    });
-
-    if (!executeResponse.ok) {
-      const errorText = await executeResponse.text();
-      if (errorText.includes('Renewal period expired')) {
+    let result: any;
+    try {
+      result = await this.callPaymasterRpc('paymaster_executeTransaction', [{
+        transaction: {
+          type: 'invoke',
+          invoke: {
+            user_address: oldSession.walletAddress,
+            typed_data: paymasterTypedData,
+            signature: signature,
+          },
+        },
+        parameters: buildResult.parameters,
+      }]);
+    } catch (e: any) {
+      if (e.message?.includes('Renewal period expired')) {
         throw new Error('Grace period expired. Please login again with JWT.');
       }
-      throw new Error(`Renew session failed: ${errorText}`);
+      throw new Error(`Renew session failed: ${e.message}`);
     }
 
-    const result = await executeResponse.json();
-    return result.transactionHash;
+    return result.transaction_hash;
   }
 
   /**

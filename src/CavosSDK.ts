@@ -39,8 +39,6 @@ export class CavosSDK {
   };
   private walletStatusListeners: Set<WalletStatusListener> = new Set();
 
-  // Default Cavos shared paymaster API key for Sepolia
-  public static readonly DEFAULT_PAYMASTER_KEY = 'c37c52b7-ea5a-4426-8121-329a78354b0b';
   private static readonly DEFAULT_RPC_MAINNET = 'https://starknet-mainnet.g.alchemy.com/starknet/version/rpc/v0_10/dql5pMT88iueZWl7L0yzT56uVk0EBU4L';
   private static readonly DEFAULT_RPC_SEPOLIA = 'https://starknet-sepolia.g.alchemy.com/starknet/version/rpc/v0_10/dql5pMT88iueZWl7L0yzT56uVk0EBU4L';
 
@@ -51,7 +49,7 @@ export class CavosSDK {
     this.config = {
       ...config,
       network,
-      paymasterApiKey: config.paymasterApiKey || CavosSDK.DEFAULT_PAYMASTER_KEY,
+      paymasterApiKey: config.paymasterApiKey,
       starknetRpcUrl: config.starknetRpcUrl || (
         network === 'mainnet'
           ? CavosSDK.DEFAULT_RPC_MAINNET
@@ -194,13 +192,24 @@ export class CavosSDK {
         this.logger.log('Account not deployed. Deploying with session...');
         this.updateWalletStatus({ isDeploying: true });
         try {
-          await this.deployAccount();
-          this.updateWalletStatus({
-            isDeploying: false,
-            isDeployed: true,
-            isSessionActive: false, // Session will be registered on first execute()
-            isReady: true
-          });
+          const deployHash = await this.deployAccount();
+          this.logger.log('Account deployment triggered. TxHash:', deployHash);
+
+          if (deployHash !== 'already-deployed') {
+            this.updateWalletStatus({
+              isDeploying: false,
+              isDeployed: true,
+              isSessionActive: false, // Session will be registered on first execute()
+              isReady: true
+            });
+          } else {
+            this.updateWalletStatus({
+              isDeploying: false,
+              isDeployed: true,
+              isSessionActive: false, // Session will be registered on first execute()
+              isReady: true
+            });
+          }
           // Track wallet deployment for MAU
           const address = this.getAddress();
           const email = this.oauthWalletManager.getSession()?.jwtClaims?.sub;
@@ -261,7 +270,8 @@ export class CavosSDK {
       this.oauthWalletManager,
       this.config.starknetRpcUrl!,
       this.config.paymasterApiKey!,
-      this.config.network || 'sepolia'
+      this.config.network || 'sepolia',
+      this.config.paymasterUrl
     );
   }
 

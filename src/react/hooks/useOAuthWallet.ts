@@ -84,8 +84,9 @@ export function useOAuthWallet(hookConfig: UseOAuthWalletConfig): UseOAuthWallet
       hookConfig.config,
       walletManager,
       hookConfig.rpcUrl,
-      hookConfig.apiKey || CavosSDK.DEFAULT_PAYMASTER_KEY,
-      hookConfig.network || 'sepolia'
+      hookConfig.apiKey || '',
+      hookConfig.network || 'sepolia',
+      hookConfig.paymasterUrl
     );
 
     setManager(walletManager);
@@ -170,10 +171,21 @@ export function useOAuthWallet(hookConfig: UseOAuthWalletConfig): UseOAuthWallet
         if (!deployed) {
           setStage('deploying');
           const deployHash = await txManager.deployAccount();
-          console.log('[useOAuthWallet] Account deployed. Hash:', deployHash);
+          console.log('[useOAuthWallet] Deploy attempt finished. Hash:', deployHash);
+
+          // Verify the account is actually on-chain — the tx may have reverted
+          // or deployAccount() may have returned 'already-deployed' as a false positive.
+          const deployConfirmed = await txManager.isDeployed();
+          if (!deployConfirmed) {
+            throw new Error(
+              `Deploy transaction submitted (${deployHash}) but account is not deployed on-chain. ` +
+              'The transaction may have reverted.'
+            );
+          }
           setIsDeployed(true);
         } else {
           console.log('[useOAuthWallet] Account already deployed.');
+          setIsDeployed(true);
         }
         setStage('ready');
       } catch (e: any) {
