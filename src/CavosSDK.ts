@@ -26,7 +26,6 @@ export class CavosSDK {
   private sessionManager: SessionManager;
   private paymaster: PaymasterIntegration;
   private analyticsManager: AnalyticsManager;
-  private isLimitExceeded: boolean = false;
   private appSalt: string | null = null;
 
   // Wallet status state
@@ -656,21 +655,11 @@ export class CavosSDK {
 
       const result = response.data;
 
-      if (!result.allowed) {
-        this.isLimitExceeded = true;
-        this.logger.warn('MAU limit exceeded.');
-        return;
-      }
-
       // Store app_salt for per-app wallet derivation
       if (result.app_salt) {
         this.appSalt = result.app_salt;
         // Update OAuthWalletManager with the per-app salt
         this.oauthWalletManager.setAppSalt(result.app_salt);
-      }
-
-      if (result.warning) {
-        this.logger.warn(result.message);
       }
     } catch (error: any) {
       this.logger.warn('Validation check failed:', error.message);

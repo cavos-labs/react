@@ -447,12 +447,8 @@ export class OAuthWalletManager {
    * [17-18] = kid_offset, kid_len
    * [19] = RSA sig length (16)
    * [20-35] = RSA signature (16 u128 limbs)
-   * [36] = n_prime len (16)
-   * [37-52] = n_prime limbs
-   * [53] = r_sq len (16)
-   * [54-69] = r_sq limbs
-   * [70] = jwt_bytes_len
-   * [71+] = packed JWT bytes
+   * [36] = jwt_bytes_len
+   * [37+] = packed JWT bytes
    * [after JWT] = valid_after
    * [+1] = allowed_contracts_root
    * [+2] = max_calls_per_tx
@@ -499,11 +495,7 @@ export class OAuthWalletManager {
       packedBytes.push(num.toHex(chunk));
     }
 
-    // Calculate Montgomery constants for RSA verification
-    const kid = this.extractKidFromJwt(jwt);
-    const iss = jwtClaims.iss;
-    const modulusLimbs = await this.fetchModulusForKid(kid, iss);
-    const { n_prime, r_sq } = this.calculateMontgomeryConstants(modulusLimbs);
+
 
     const sig: string[] = [
       '0x4f415554485f4a57545f5631', // OAUTH_JWT_V1 magic
@@ -528,12 +520,8 @@ export class OAuthWalletManager {
       num.toHex(offsets.kid_len),       // kid_len [19]
       num.toHex(16),                // rsa_sig_len [20]
       ...rsaLimbs,                  // RSA signature as 16 u128 limbs [21-36]
-      num.toHex(16),                // n_prime len [37]
-      ...n_prime,                   // n_prime limbs [38-53]
-      num.toHex(16),                // r_sq len [54]
-      ...r_sq,                      // r_sq limbs [55-70]
-      num.toHex(signedDataBytes.length), // jwt_bytes_len [71]
-      ...packedBytes,               // packed JWT bytes [72+]
+      num.toHex(signedDataBytes.length), // jwt_bytes_len [37]
+      ...packedBytes,               // packed JWT bytes [38+]
     ];
 
     // Append policy fields after JWT data
@@ -562,91 +550,7 @@ export class OAuthWalletManager {
     return sig;
   }
 
-  // Fetch RSA modulus (n) for the given Key ID (kid) from issuer's JWKS
-  private async fetchModulusForKid(kid: string, issuer?: string): Promise<bigint[]> {
-    try {
-      let jwksUrl = 'https://www.googleapis.com/oauth2/v3/certs'; // Default to Google
 
-      if (issuer === 'https://appleid.apple.com') {
-        jwksUrl = 'https://appleid.apple.com/auth/keys';
-      } else if (issuer === 'https://cavos.app/firebase') {
-        jwksUrl = `${this.backendUrl}/api/jwks/firebase`;
-      }
-
-      const response = await fetch(jwksUrl);
-      const data = await response.json();
-
-      // Firebase endpoint returns { jwks: { keys: [...] }, contract: {...} }
-      // Google/Apple return { keys: [...] }
-      const jwks = data.jwks || data;
-
-      if (!jwks.keys || !Array.isArray(jwks.keys)) {
-        throw new Error(`Invalid JWKS response from ${jwksUrl}: ${JSON.stringify(data)}`);
-      }
-
-      const key = jwks.keys.find((k: any) => k.kid === kid);
-
-      if (!key || !key.n) {
-        throw new Error(`Key not found for kid: ${kid} from issuer: ${issuer || 'Google'}`);
-      }
-
-      // key.n is base64url encoded modulus
-      const modulusBytes = this.base64UrlToBytes(key.n);
-      // Convert to 16 u128 limbs
-      const limbs = this.bytesToU128Limbs(modulusBytes);
-      // specific implementation returns hex strings, convert to bigints for calculation
-      return limbs.map(l => BigInt(l));
-    } catch (error) {
-      throw error;
-    }
-  }
-
-  private calculateMontgomeryConstants(n_limbs: bigint[]): { n_prime: string[], r_sq: string[] } {
-    // Reconstruct n from limbs
-    let n = 0n;
-    for (let i = 0; i < n_limbs.length; i++) {
-      n += n_limbs[i] * (1n << (BigInt(i) * 128n));
-    }
-
-    const R = 1n << 2048n;
-
-    // Calculate n_prime = -n^-1 mod R
-    function modInverse(n: bigint, mod: bigint): bigint {
-      let t = 0n;
-      let newt = 1n;
-      let r = mod;
-      let newr = n;
-
-      while (newr !== 0n) {
-        let quotient = r / newr;
-        [t, newt] = [newt, t - quotient * newt];
-        [r, newr] = [newr, r - quotient * newr];
-      }
-
-      if (r > 1n) throw new Error("n is not invertible");
-      if (t < 0n) t = t + mod;
-      return t;
-    }
-
-    const n_inv = modInverse(n, R);
-    const n_prime_val = (R - n_inv) % R;
-    const r_sq_val = (R * R) % n;
-
-    // Convert back to limbs
-    const toLimbs = (val: bigint): string[] => {
-      const limbs: string[] = [];
-      for (let i = 0; i < 16; i++) {
-        const limb = (val >> (BigInt(i) * 128n)) & ((1n << 128n) - 1n);
-        limbs.push(num.toHex(limb));
-      }
-      return limbs;
-    }
-
-    return {
-      n_prime: toLimbs(n_prime_val),
-      r_sq: toLimbs(r_sq_val)
-    };
-  }
 
   /**
    * Get the current session
