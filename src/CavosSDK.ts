@@ -109,14 +109,19 @@ export class CavosSDK {
   }
 
   /**
-   * Handle OAuth login redirect or Firebase email/password login
+   * Login with OAuth (Google/Apple) or Firebase email/password.
+   * 
+   * For OAuth providers, opens a popup window by default. If the popup is 
+   * blocked, falls back to redirect. Your app never loses state.
+   * 
+   * @example
+   * ```ts
+   * await cavos.login('google');   // popup opens, user auths, resolves
+   * await cavos.login('apple');    // same with Apple
+   * await cavos.login('firebase', { email, password }); // no popup needed
+   * ```
    */
   async login(provider: LoginProvider, credentials?: FirebaseCredentials): Promise<void> {
-    // Ensure app_salt is fetched before starting OAuth flow
-    if (!this.appSalt) {
-      await this.validateAccess();
-    }
-
     if (provider === 'firebase') {
       if (!credentials) {
         throw new Error('Firebase login requires email and password');
@@ -125,20 +130,159 @@ export class CavosSDK {
       return;
     }
 
-    // OAuth providers (google, apple)
-    const redirectUri = (typeof window !== 'undefined' ? window.location.href : undefined);
-
-    let url: string;
-    if (provider === 'google') {
-      url = await this.oauthWalletManager.getGoogleOAuthUrl(redirectUri);
-    } else if (provider === 'apple') {
-      url = await this.oauthWalletManager.getAppleOAuthUrl(redirectUri);
-    } else {
-      throw new Error(`Unsupported login provider: ${provider}`);
+    if (typeof window === 'undefined') {
+      throw new Error('OAuth login requires a browser environment');
     }
 
-    if (typeof window !== 'undefined') {
-      window.location.href = url;
+    console.log('[CavosSDK] Opening popup synchronously...');
+    // OPEN POPUP SYNCHRONOUSLY to bypass browser popup blockers
+    const width = 500;
+    const height = 600;
+    const left = window.screenX + (window.innerWidth - width) / 2;
+    const top = window.screenY + (window.innerHeight - height) / 2;
+    const popup = window.open(
+      '',
+      'cavos-oauth',
+      `width=${width},height=${height},left=${left},top=${top},popup=true`
+    );
+
+    if (popup) {
+      popup.document.write('<p style="font-family:sans-serif;text-align:center;margin-top:40vh;color:#888;">Preparing authentication...</p>');
+    } else {
+      console.warn('[CavosSDK] window.open() returned null synchronously. Popup blocked.');
+    }
+
+    try {
+      // Ensure app_salt is fetched before starting OAuth flow
+      if (!this.appSalt) {
+        await this.validateAccess();
+      }
+
+      const redirectUri = window.location.origin + window.location.pathname;
+      let url: string;
+      if (provider === 'google') {
+        url = await this.oauthWalletManager.getGoogleOAuthUrl(redirectUri);
+      } else if (provider === 'apple') {
+        url = await this.oauthWalletManager.getAppleOAuthUrl(redirectUri);
+      } else {
+        throw new Error(`Unsupported login provider: ${provider}`);
+      }
+
+      if (!popup || popup.closed) {
+        console.warn('[CavosSDK] Popup blocked or closed by user, falling back to redirect');
+        sessionStorage.setItem('cavos_fallback_redirect', 'true');
+        window.location.href = url;
+        return;
+      }
+
+      console.log('[CavosSDK] Navigating popup to OAuth URL...');
+      popup.location.href = url;
+    } catch (e) {
+      console.error('[CavosSDK] Error preparing OAuth URL:', e);
+      if (popup && !popup.closed) popup.close();
+      throw e;
+    }
+
+    console.log('[CavosSDK] Waiting for popup message...');
+    // Wait for popup to send auth_data back via postMessage
+    const authData = await new Promise<string>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        cleanup();
+        reject(new Error('OAuth login timed out (120s).'));
+      }, 120_000);
+
+      const interval = setInterval(() => {
+        try {
+          if (popup && popup.closed) {
+            cleanup();
+            reject(new Error('Login popup was closed.'));
+          }
+        } catch (e) {
+          // COOP might block reading popup.closed
+        }
+      }, 500);
+
+      const onMessage = (event: MessageEvent) => {
+        if (event.origin !== window.location.origin) return;
+        if (event.data?.type === 'cavos-oauth-callback' && event.data?.auth_data) {
+          cleanup();
+          resolve(event.data.auth_data);
+        } else if (event.data?.type === 'cavos-oauth-close') {
+          cleanup();
+          reject(new Error('Login popup was closed.'));
+        }
+      };
+
+      const cleanup = () => {
+        clearTimeout(timeout);
+        clearInterval(interval);
+        window.removeEventListener('message', onMessage);
+        try { popup?.close(); } catch { }
+      };
+
+      window.addEventListener('message', onMessage);
+    });
+
+    // Process the callback
+    await this.handleCallback(authData);
+  }
+
+  /**
+   * Detect and handle OAuth popup callback. Call at app startup.
+   * If the page is a popup callback, sends auth_data to opener and closes.
+   * 
+   * @returns true if this was a popup callback (app should stop initializing)
+   */
+  static handlePopupCallback(): boolean {
+    if (typeof window === 'undefined') return false;
+
+    // Check if we have auth_data in the URL
+    const params = new URLSearchParams(window.location.search);
+    const authData = params.get('auth_data') || params.get('zk_auth_data');
+    if (!authData) return false;
+
+    // Check if this was a redirect fallback we explicitly triggered
+    if (sessionStorage.getItem('cavos_fallback_redirect') === 'true') {
+      console.log('[CavosSDK] Found auth_data, but this was a redirect fallback. Not closing window.');
+      sessionStorage.removeItem('cavos_fallback_redirect');
+      return false; // Let handleCallback take over
+    }
+
+    let hasOpener = false;
+    try {
+      hasOpener = !!window.opener && window.opener !== window;
+    } catch {
+      // COOP might block accessing window.opener, but if we're in a popup we should
+      // still try to postMessage back to whoever opened us
+      hasOpener = true;
+    }
+
+    // We have auth_data. If we are NOT in a popup (no opener), we shouldn't close the window.
+    // Instead, we might need to handle it normally (redirect flow).
+    if (!hasOpener) {
+      console.warn('[CavosSDK] Found auth_data but no window.opener. This looks like a redirect callback, not a popup.');
+      return false; // Let handleCallback take over
+    }
+
+    console.log('[CavosSDK] Popup callback detected. Sending message to opener...');
+    try {
+      window.opener.postMessage({
+        type: 'cavos-oauth-callback',
+        auth_data: authData,
+      }, '*'); // Use '*' to avoid strict cross-origin drops if domains differ slightly
+
+      // Safely close the popup. In COOP environments, window.close() might be blocked.
+      setTimeout(() => {
+        console.log('[CavosSDK] Closing popup window...');
+        try { window.close(); } catch { }
+        try { window.opener.postMessage({ type: 'cavos-oauth-close' }, '*'); } catch { }
+        // If it doesn't close, show a friendly message to the user
+        document.body.innerHTML = '<div style="display:flex;justify-content:center;align-items:center;height:100vh;font-family:sans-serif;color:#333;background:#f9f9f9;flex-direction:column;"><h2>Authentication Successful</h2><p>You can safely close this window.</p></div>';
+      }, 100);
+      return true;
+    } catch (e) {
+      console.error('[CavosSDK] Error posting message from popup:', e);
+      return false;
     }
   }
 
@@ -194,30 +338,25 @@ export class CavosSDK {
           const deployHash = await this.deployAccount();
           this.logger.log('Account deployment triggered. TxHash:', deployHash);
 
-          if (deployHash !== 'already-deployed') {
-            this.updateWalletStatus({
-              isDeploying: false,
-              isDeployed: true,
-              isSessionActive: false, // Session will be registered on first execute()
-              isReady: true
-            });
-          } else {
-            this.updateWalletStatus({
-              isDeploying: false,
-              isDeployed: true,
-              isSessionActive: false, // Session will be registered on first execute()
-              isReady: true
-            });
-          }
+          this.updateWalletStatus({
+            isDeploying: false,
+            isDeployed: true,
+            isSessionActive: false,
+            isReady: false, // NOT ready yet — session needs registration
+          });
+
           // Track wallet deployment for MAU
           const address = this.getAddress();
           const email = this.oauthWalletManager.getSession()?.jwtClaims?.sub;
           if (address) {
             this.analyticsManager.trackWalletDeployment(address, email);
           }
+
+          // Auto-register session after deploy
+          await this.autoRegisterSession();
         } catch (err) {
           this.updateWalletStatus({ isDeploying: false });
-          throw err;
+          this.logger.alwaysError('Background deployment failed:', err);
         }
       } else {
         this.logger.log('Account already deployed. Checking session status...');
@@ -225,15 +364,52 @@ export class CavosSDK {
         const sessionActive = this.transactionManager
           ? await this.transactionManager.isSessionRegistered()
           : false;
-        this.updateWalletStatus({
-          isDeployed: true,
-          isSessionActive: sessionActive,
-          isReady: true
-        });
+
+        if (sessionActive) {
+          this.updateWalletStatus({
+            isDeployed: true,
+            isSessionActive: true,
+            isReady: true,
+          });
+        } else {
+          this.updateWalletStatus({
+            isDeployed: true,
+            isSessionActive: false,
+            isReady: false,
+          });
+          // Auto-register session if not active
+          await this.autoRegisterSession();
+        }
       }
     }).catch(err => {
       this.logger.alwaysError('Background deployment check failed:', err);
     });
+  }
+
+  /**
+   * Auto-register session after deploy or when session is not active.
+   * Updates walletStatus progressively.
+   */
+  private async autoRegisterSession(): Promise<void> {
+    if (!this.transactionManager) return;
+
+    try {
+      this.updateWalletStatus({ isRegistering: true });
+      this.logger.log('Auto-registering session on-chain...');
+      const txHash = await this.transactionManager.registerCurrentSession();
+      this.logger.log('Session registered. TxHash:', txHash);
+      this.updateWalletStatus({
+        isRegistering: false,
+        isSessionActive: true,
+        isReady: true,
+      });
+    } catch (err) {
+      this.logger.alwaysError('Auto session registration failed:', err);
+      this.updateWalletStatus({
+        isRegistering: false,
+        isReady: true, // Still mark as ready — execute() can try JWT fallback
+      });
+    }
   }
 
   /**

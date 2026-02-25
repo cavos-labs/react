@@ -287,9 +287,10 @@ export class OAuthTransactionManager {
 
     // Check session status on-chain
     const status = await this.getSessionStatus();
-    // Case 1: Session not registered - throw error
+    // Case 1: Session not registered — use JWT to auto-register + execute in one tx
     if (!status.registered) {
-      throw new Error('Session not registered on-chain. Please call registerSession() first to authorize this session.');
+      console.log('[OAuthTransactionManager] Session not registered. Using JWT signature (auto-register + execute).');
+      return this.executeWithAVNUAPI(callsArray, session, true);
     }
 
     // Case 2: Session expired but can be renewed - auto-renew then execute
