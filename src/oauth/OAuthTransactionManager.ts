@@ -289,7 +289,6 @@ export class OAuthTransactionManager {
     const status = await this.getSessionStatus();
     // Case 1: Session not registered — use JWT to auto-register + execute in one tx
     if (!status.registered) {
-      console.log('[OAuthTransactionManager] Session not registered. Using JWT signature (auto-register + execute).');
       return this.executeWithAVNUAPI(callsArray, session, true);
     }
 

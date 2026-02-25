@@ -651,7 +651,6 @@ export class OAuthWalletManager {
 
           // Migration: ensure walletName is set (fix old sessions)
           if (!this.session.walletName || this.session.walletName === '') {
-            console.log('[restoreSession] Migrating session: setting walletName=default');
             this.session.walletName = 'default';
             this.persistSession();
           }

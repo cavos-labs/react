@@ -325,14 +325,14 @@ export class SessionManager {
     policy: SessionPolicy,
     accountPrivateKey: string,
   ): Promise<void> {
-    console.log('[SessionManager] Creating session...');
+    //  Creating session...');
 
     // Store private key for later use
     this.accountPrivateKey = accountPrivateKey;
 
     // Generate session keypair
     this.sessionKey = new StarknetKeyPair();
-    console.log('[SessionManager] Generated session key');
+    //  Generated session key');
 
     // Derive guardian key from account private key
     // Use a derived key (hash of private key + "guardian") for guardian
@@ -348,7 +348,7 @@ export class SessionManager {
     }
     const guardianHex = '0x' + guardianHexStr;
     this.guardianKey = new StarknetKeyPair(guardianHex);
-    console.log('[SessionManager] Derived guardian key');
+    //  Derived guardian key');
 
     // Convert policy to AllowedMethod format
     const allowedMethods: AllowedMethod[] = policy.allowedMethods.map(m => ({
@@ -363,19 +363,19 @@ export class SessionManager {
       policy.metadata || JSON.stringify({ metadata: 'cavos-session', max_fee: 0 }),
       this.sessionKey.guid,
     );
-    console.log('[SessionManager] Created session object');
+    //  Created session object');
 
     // Get session typed data and sign with account (owner)
     const sessionTypedData = await this.currentSession.getTypedData(this.chainId);
-    console.log('[SessionManager] Requesting user signature...');
+    //  Requesting user signature...');
 
     const ownerSignature = await account.signMessage(sessionTypedData);
-    console.log('[SessionManager] User signed session');
+    //  User signed session');
 
     // Also sign with guardian key  
     const sessionHash = typedData.getMessageHash(sessionTypedData, account.address);
     const guardianSigResult = await this.guardianKey.sign(sessionHash);
-    console.log('[SessionManager] Guardian signed session');
+    //  Guardian signed session');
 
     // Get owner public key from account
     // The account's public key is needed for the SignerSignature format
@@ -428,7 +428,7 @@ export class SessionManager {
       ...ownerSigCompiled.map(s => s.toString()),
       ...guardianSigCompiled.map(s => s.toString()),
     ];
-    console.log('[SessionManager] Combined signatures for session_authorization');
+    //  Combined signatures for session_authorization');
 
     this.accountAddress = account.address;
     this.ownerPublicKey = ownerPubKey.toString();
@@ -436,7 +436,7 @@ export class SessionManager {
     // Auto-save session to storage for persistence
     this.saveSessionToStorage();
 
-    console.log('[SessionManager] Session created and saved successfully');
+    //  Session created and saved successfully');
   }
 
   /**
@@ -456,7 +456,7 @@ export class SessionManager {
     }
 
     const callsArray = Array.isArray(calls) ? calls : [calls];
-    console.log('[SessionManager] Executing with session:', callsArray.length, 'calls');
+    //  Executing with session:', callsArray.length, 'calls');
 
     // Validate calls against session policy
     for (const call of callsArray) {
@@ -470,10 +470,10 @@ export class SessionManager {
 
     // For now, execute directly with the account (which has the private key)
     // In production, you would build the session signature and submit via RPC
-    console.log('[SessionManager] Executing transaction with account...');
+    //  Executing transaction with account...');
 
     const result = await account.execute(callsArray);
-    console.log('[SessionManager] Transaction submitted:', result.transaction_hash);
+    //  Transaction submitted:', result.transaction_hash);
 
     return result.transaction_hash;
   }
@@ -505,11 +505,11 @@ export class SessionManager {
       }
     }
 
-    console.log('[SessionManager] Signing typed data with session key...');
+    //  Signing typed data with session key...');
 
     // Calculate the message hash for the paymaster typed data
     const messageHash = typedData.getMessageHash(paymasterTypedData, accountAddress);
-    console.log('[SessionManager] Message hash:', messageHash);
+    //  Message hash:', messageHash);
 
     // Sign with session key
     const sessionWithMsgHash = await this.currentSession.hashWithTransaction(
@@ -518,11 +518,11 @@ export class SessionManager {
       this.chainId,
     );
     const sessionSignature = await this.sessionKey.sign(sessionWithMsgHash);
-    console.log('[SessionManager] Session key signed');
+    //  Session key signed');
 
     // Sign with guardian key
     const guardianSignature = await this.guardianKey.sign(sessionWithMsgHash);
-    console.log('[SessionManager] Guardian key signed');
+    //  Guardian key signed');
 
     // Build session token
     const sessionToken = new SessionToken({
@@ -537,7 +537,7 @@ export class SessionManager {
 
     // Compile and return signature
     const compiledSignature = sessionToken.compileSignature();
-    console.log('[SessionManager] Compiled session token signature');
+    //  Compiled session token signature');
 
     return compiledSignature;
   }
@@ -622,7 +622,7 @@ export class SessionManager {
    */
   saveSessionToStorage(): void {
     if (!this.currentSession || !this.sessionKey || !this.guardianKey || !this.sessionAuthorization) {
-      console.warn('[SessionManager] Cannot save - no active session');
+      //  Cannot save - no active session');
       return;
     }
 
@@ -653,7 +653,7 @@ export class SessionManager {
       };
 
       sessionStorage.setItem(SessionManager.SESSION_STORAGE_KEY, JSON.stringify(sessionData));
-      console.log('[SessionManager] Session saved to storage');
+      //  Session saved to storage');
     } catch (error) {
       console.error('[SessionManager] Failed to save session:', error);
     }
@@ -675,7 +675,7 @@ export class SessionManager {
 
       // Validate expiry
       if (data.expiresAt * 1000 <= Date.now()) {
-        console.log('[SessionManager] Stored session expired, clearing');
+        //  Stored session expired, clearing');
         this.clearSessionStorage();
         return false;
       }
@@ -699,7 +699,7 @@ export class SessionManager {
       this.ownerPublicKey = data.ownerPublicKey;
       this.sessionAuthorization = data.sessionAuthorization;
 
-      console.log('[SessionManager] Session restored from storage');
+      //  Session restored from storage');
       return true;
     } catch (error) {
       console.error('[SessionManager] Failed to load session:', error);
@@ -715,7 +715,7 @@ export class SessionManager {
     try {
       if (typeof window === 'undefined') return;
       sessionStorage.removeItem(SessionManager.SESSION_STORAGE_KEY);
-      console.log('[SessionManager] Session storage cleared');
+      //  Session storage cleared');
     } catch (error) {
       console.error('[SessionManager] Failed to clear session storage:', error);
     }

@@ -91,15 +91,15 @@ export class CavosSDK {
    * Initialize SDK and restore session if available
    */
   async init(): Promise<void> {
-    console.log('[CavosSDK] init() called');
+    this.logger.log('init() called');
 
     // CRITICAL: Restore session FIRST so that setAppSalt() can recalculate the address
     const sessionRestored = this.oauthWalletManager.restoreSession();
-    console.log('[CavosSDK] restoreSession result:', sessionRestored, 'wallet before salt:', this.oauthWalletManager.getWalletAddress());
+    this.logger.log('restoreSession result:', sessionRestored);
 
     // Now fetch app_salt and apply it (will recalculate wallet if session exists)
     await this.validateAccess();
-    console.log('[CavosSDK] after validateAccess, appSalt:', this.appSalt, 'wallet after salt:', this.oauthWalletManager.getWalletAddress());
+    this.logger.log('init complete');
 
     if (sessionRestored) {
       this.initializeTransactionManager();
@@ -111,14 +111,15 @@ export class CavosSDK {
   /**
    * Login with OAuth (Google/Apple) or Firebase email/password.
    * 
-   * For OAuth providers, opens a popup window by default. If the popup is 
-   * blocked, falls back to redirect. Your app never loses state.
+   * For OAuth providers, opens a new window/tab. After authentication,
+   * the auth window writes to localStorage and closes. The original tab
+   * picks up the auth data via 'storage' events.
    * 
    * @example
    * ```ts
-   * await cavos.login('google');   // popup opens, user auths, resolves
+   * await cavos.login('google');   // window opens, user auths, resolves
    * await cavos.login('apple');    // same with Apple
-   * await cavos.login('firebase', { email, password }); // no popup needed
+   * await cavos.login('firebase', { email, password }); // no window needed
    * ```
    */
   async login(provider: LoginProvider, credentials?: FirebaseCredentials): Promise<void> {
@@ -134,22 +135,17 @@ export class CavosSDK {
       throw new Error('OAuth login requires a browser environment');
     }
 
-    console.log('[CavosSDK] Opening popup synchronously...');
-    // OPEN POPUP SYNCHRONOUSLY to bypass browser popup blockers
-    const width = 500;
-    const height = 600;
-    const left = window.screenX + (window.innerWidth - width) / 2;
-    const top = window.screenY + (window.innerHeight - height) / 2;
-    const popup = window.open(
-      '',
-      'cavos-oauth',
-      `width=${width},height=${height},left=${left},top=${top},popup=true`
-    );
+    // Clear any stale auth result
+    localStorage.removeItem('cavos_auth_result');
 
-    if (popup) {
-      popup.document.write('<p style="font-family:sans-serif;text-align:center;margin-top:40vh;color:#888;">Preparing authentication...</p>');
+    this.logger.log('Opening auth window...');
+    // Open window synchronously to avoid popup blockers
+    const authWindow = window.open('', 'cavos-oauth');
+
+    if (authWindow) {
+      authWindow.document.write('<p style="font-family:sans-serif;text-align:center;margin-top:40vh;color:#888;">Preparing authentication...</p>');
     } else {
-      console.warn('[CavosSDK] window.open() returned null synchronously. Popup blocked.');
+      this.logger.alwaysError('window.open() returned null. Popup blocked.');
     }
 
     try {
@@ -168,59 +164,66 @@ export class CavosSDK {
         throw new Error(`Unsupported login provider: ${provider}`);
       }
 
-      if (!popup || popup.closed) {
-        console.warn('[CavosSDK] Popup blocked or closed by user, falling back to redirect');
+      if (!authWindow || authWindow.closed) {
+        this.logger.log('Window blocked or closed, falling back to redirect');
         sessionStorage.setItem('cavos_fallback_redirect', 'true');
         window.location.href = url;
         return;
       }
 
-      console.log('[CavosSDK] Navigating popup to OAuth URL...');
-      popup.location.href = url;
+      this.logger.log('Navigating auth window to OAuth URL...');
+      authWindow.location.href = url;
     } catch (e) {
-      console.error('[CavosSDK] Error preparing OAuth URL:', e);
-      if (popup && !popup.closed) popup.close();
+      this.logger.alwaysError('Error preparing OAuth URL:', e);
+      if (authWindow && !authWindow.closed) authWindow.close();
       throw e;
     }
 
-    console.log('[CavosSDK] Waiting for popup message...');
-    // Wait for popup to send auth_data back via postMessage
+    this.logger.log('Waiting for auth window to complete...');
+    // Wait for auth result via localStorage 'storage' event
     const authData = await new Promise<string>((resolve, reject) => {
       const timeout = setTimeout(() => {
         cleanup();
         reject(new Error('OAuth login timed out (120s).'));
       }, 120_000);
 
+      // Poll: check if the window was closed without auth completing
       const interval = setInterval(() => {
+        // Check localStorage directly (storage event doesn't fire in the same tab)
+        const result = localStorage.getItem('cavos_auth_result');
+        if (result) {
+          cleanup();
+          localStorage.removeItem('cavos_auth_result');
+          resolve(result);
+          return;
+        }
         try {
-          if (popup && popup.closed) {
+          if (authWindow && authWindow.closed) {
             cleanup();
-            reject(new Error('Login popup was closed.'));
+            reject(new Error('Login window was closed without completing authentication.'));
           }
-        } catch (e) {
-          // COOP might block reading popup.closed
+        } catch {
+          // COOP might block reading authWindow.closed — ignore
         }
       }, 500);
 
-      const onMessage = (event: MessageEvent) => {
-        if (event.origin !== window.location.origin) return;
-        if (event.data?.type === 'cavos-oauth-callback' && event.data?.auth_data) {
+      // Listen for storage event (fires when another tab writes to localStorage)
+      const onStorage = (event: StorageEvent) => {
+        if (event.key === 'cavos_auth_result' && event.newValue) {
           cleanup();
-          resolve(event.data.auth_data);
-        } else if (event.data?.type === 'cavos-oauth-close') {
-          cleanup();
-          reject(new Error('Login popup was closed.'));
+          localStorage.removeItem('cavos_auth_result');
+          resolve(event.newValue);
         }
       };
 
       const cleanup = () => {
         clearTimeout(timeout);
         clearInterval(interval);
-        window.removeEventListener('message', onMessage);
-        try { popup?.close(); } catch { }
+        window.removeEventListener('storage', onStorage);
+        try { authWindow?.close(); } catch { }
       };
 
-      window.addEventListener('message', onMessage);
+      window.addEventListener('storage', onStorage);
     });
 
     // Process the callback
@@ -228,10 +231,11 @@ export class CavosSDK {
   }
 
   /**
-   * Detect and handle OAuth popup callback. Call at app startup.
-   * If the page is a popup callback, sends auth_data to opener and closes.
+   * Detect and handle OAuth callback in the auth window. Call at app startup.
+   * If auth_data is in the URL, writes it to localStorage so the original tab
+   * can pick it up, then closes this window.
    * 
-   * @returns true if this was a popup callback (app should stop initializing)
+   * @returns true if this was an auth callback (app should stop initializing)
    */
   static handlePopupCallback(): boolean {
     if (typeof window === 'undefined') return false;
@@ -243,45 +247,21 @@ export class CavosSDK {
 
     // Check if this was a redirect fallback we explicitly triggered
     if (sessionStorage.getItem('cavos_fallback_redirect') === 'true') {
-      console.log('[CavosSDK] Found auth_data, but this was a redirect fallback. Not closing window.');
+      // Redirect fallback — let handleCallback take over
       sessionStorage.removeItem('cavos_fallback_redirect');
       return false; // Let handleCallback take over
     }
 
-    let hasOpener = false;
+    // Auth callback detected — write to localStorage for the original tab
     try {
-      hasOpener = !!window.opener && window.opener !== window;
-    } catch {
-      // COOP might block accessing window.opener, but if we're in a popup we should
-      // still try to postMessage back to whoever opened us
-      hasOpener = true;
-    }
-
-    // We have auth_data. If we are NOT in a popup (no opener), we shouldn't close the window.
-    // Instead, we might need to handle it normally (redirect flow).
-    if (!hasOpener) {
-      console.warn('[CavosSDK] Found auth_data but no window.opener. This looks like a redirect callback, not a popup.');
-      return false; // Let handleCallback take over
-    }
-
-    console.log('[CavosSDK] Popup callback detected. Sending message to opener...');
-    try {
-      window.opener.postMessage({
-        type: 'cavos-oauth-callback',
-        auth_data: authData,
-      }, '*'); // Use '*' to avoid strict cross-origin drops if domains differ slightly
-
-      // Safely close the popup. In COOP environments, window.close() might be blocked.
+      localStorage.setItem('cavos_auth_result', authData);
       setTimeout(() => {
-        console.log('[CavosSDK] Closing popup window...');
         try { window.close(); } catch { }
-        try { window.opener.postMessage({ type: 'cavos-oauth-close' }, '*'); } catch { }
-        // If it doesn't close, show a friendly message to the user
-        document.body.innerHTML = '<div style="display:flex;justify-content:center;align-items:center;height:100vh;font-family:sans-serif;color:#333;background:#f9f9f9;flex-direction:column;"><h2>Authentication Successful</h2><p>You can safely close this window.</p></div>';
-      }, 100);
+      }, 500);
+
       return true;
     } catch (e) {
-      console.error('[CavosSDK] Error posting message from popup:', e);
+      // Error writing auth data — fall through to handleCallback
       return false;
     }
   }

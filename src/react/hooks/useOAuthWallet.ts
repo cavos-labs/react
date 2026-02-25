@@ -171,7 +171,6 @@ export function useOAuthWallet(hookConfig: UseOAuthWalletConfig): UseOAuthWallet
         if (!deployed) {
           setStage('deploying');
           const deployHash = await txManager.deployAccount();
-          console.log('[useOAuthWallet] Deploy attempt finished. Hash:', deployHash);
 
           // Verify the account is actually on-chain — the tx may have reverted
           // or deployAccount() may have returned 'already-deployed' as a false positive.
@@ -184,7 +183,6 @@ export function useOAuthWallet(hookConfig: UseOAuthWalletConfig): UseOAuthWallet
           }
           setIsDeployed(true);
         } else {
-          console.log('[useOAuthWallet] Account already deployed.');
           setIsDeployed(true);
         }
         setStage('ready');
