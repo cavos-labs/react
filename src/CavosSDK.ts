@@ -14,6 +14,17 @@ export interface WalletStatus {
   isRegistering: boolean;
   isSessionActive: boolean;
   isReady: boolean;
+  /** Tx hash of a pending deploy whose confirmation timed out. Useful to show an explorer link. */
+  pendingDeployTxHash?: string;
+}
+
+/** Thrown when the JWT has expired and the user must re-login to continue. */
+export class JwtExpiredError extends Error {
+  readonly code = 'JWT_EXPIRED';
+  constructor(message = 'JWT has expired. Please login again.') {
+    super(message);
+    this.name = 'JwtExpiredError';
+  }
 }
 
 export type WalletStatusListener = (status: WalletStatus) => void;
@@ -27,6 +38,12 @@ export class CavosSDK {
   private paymaster: PaymasterIntegration;
   private analyticsManager: AnalyticsManager;
   private appSalt: string | null = null;
+  /** Prevents concurrent deployAccountInBackground() runs */
+  private _deployingInBackground = false;
+  /** Shared RpcProvider instance to avoid creating one per call */
+  private provider: RpcProvider;
+
+  private static readonly PENDING_DEPLOY_TX_KEY = 'cavos_pending_deploy_tx';
 
   // Wallet status state
   private _walletStatus: WalletStatus = {
@@ -77,6 +94,8 @@ export class CavosSDK {
       sessionConfig
     );
 
+    this.provider = new RpcProvider({ nodeUrl: this.config.starknetRpcUrl! });
+
     this.analyticsManager = new AnalyticsManager(this.config);
 
     this.sessionManager = new SessionManager(
@@ -106,6 +125,13 @@ export class CavosSDK {
       // Check deployment status and update walletStatus
       this.deployAccountInBackground();
     }
+  }
+
+  /** Returns true if the stored JWT is expired (or missing). */
+  private isJwtExpired(): boolean {
+    const session = this.oauthWalletManager.getSession();
+    if (!session?.jwtClaims?.exp) return true;
+    return Math.floor(Date.now() / 1000) >= session.jwtClaims.exp;
   }
 
   /**
@@ -139,8 +165,9 @@ export class CavosSDK {
     localStorage.removeItem('cavos_auth_result');
 
     this.logger.log('Opening auth window...');
-    // Open window synchronously to avoid popup blockers
-    const authWindow = window.open('', 'cavos-oauth');
+    // Open new tab synchronously to avoid popup blockers.
+    // '_blank' always opens a new tab; named targets can be reused as popups.
+    const authWindow = window.open('', '_blank');
 
     if (authWindow) {
       authWindow.document.write('<p style="font-family:sans-serif;text-align:center;margin-top:40vh;color:#888;">Preparing authentication...</p>');
@@ -303,26 +330,84 @@ export class CavosSDK {
   }
 
   /**
-   * Deploy account in background
-   *
-   * Note: Session registration is no longer needed here!
-   * The first execute() call will automatically register the session using JWT signature.
-   * This eliminates the relayer dependency completely.
+   * Deploy account in background.
+   * Deduplicated — concurrent calls are no-ops.
+   * Persists the deploy tx hash to localStorage so a timeout doesn't lose it.
    */
   private deployAccountInBackground(): void {
-    this.isAccountDeployed().then(async (deployed) => {
+    if (this._deployingInBackground) {
+      this.logger.log('deployAccountInBackground: already running, skipping duplicate call.');
+      return;
+    }
+    this._deployingInBackground = true;
+
+    this._runDeployBackground().finally(() => {
+      this._deployingInBackground = false;
+    });
+  }
+
+  private async _runDeployBackground(): Promise<void> {
+    try {
+      // ── Step 0: Re-poll a previous deploy tx that timed out ─────────────────
+      const pendingTxHash = typeof localStorage !== 'undefined'
+        ? localStorage.getItem(CavosSDK.PENDING_DEPLOY_TX_KEY)
+        : null;
+
+      if (pendingTxHash) {
+        this.logger.log('Found pending deploy tx from previous session, re-polling:', pendingTxHash);
+        this.updateWalletStatus({ isDeploying: true, pendingDeployTxHash: pendingTxHash });
+        try {
+          // Poll up to 3 min — tx is probably already confirmed
+          await this._waitForDeployTx(pendingTxHash, 180_000);
+          localStorage.removeItem(CavosSDK.PENDING_DEPLOY_TX_KEY);
+          this.logger.log('Pending deploy tx confirmed:', pendingTxHash);
+          this.updateWalletStatus({
+            isDeploying: false,
+            isDeployed: true,
+            pendingDeployTxHash: undefined,
+          });
+          await this.autoRegisterSession();
+          return;
+        } catch (err) {
+          // Still not confirmed — leave the hash and let user check explorer
+          this.logger.alwaysError('Re-poll of pending deploy tx failed:', err);
+          this.updateWalletStatus({ isDeploying: false });
+          return;
+        }
+      }
+
+      // ── Step 1: Check current deploy status ──────────────────────────────────
+      const deployed = await this.isAccountDeployed();
+
       if (!deployed) {
-        this.logger.log('Account not deployed. Deploying with session...');
+        this.logger.log('Account not deployed. Deploying...');
         this.updateWalletStatus({ isDeploying: true });
         try {
           const deployHash = await this.deployAccount();
-          this.logger.log('Account deployment triggered. TxHash:', deployHash);
 
+          if (deployHash === 'already-deployed') {
+            // Race: deployed between the check and now
+            this.updateWalletStatus({ isDeploying: false, isDeployed: true });
+            await this.autoRegisterSession();
+            return;
+          }
+
+          this.logger.log('Deploy tx submitted:', deployHash);
+          // Persist in case of timeout
+          if (typeof localStorage !== 'undefined') {
+            localStorage.setItem(CavosSDK.PENDING_DEPLOY_TX_KEY, deployHash);
+          }
+          this.updateWalletStatus({ pendingDeployTxHash: deployHash });
+
+          // deployAccount() already calls waitForTransaction internally —
+          // if it resolved without throwing, the tx is confirmed.
+          localStorage.removeItem(CavosSDK.PENDING_DEPLOY_TX_KEY);
           this.updateWalletStatus({
             isDeploying: false,
             isDeployed: true,
             isSessionActive: false,
-            isReady: false, // NOT ready yet — session needs registration
+            isReady: false,
+            pendingDeployTxHash: undefined,
           });
 
           // Track wallet deployment for MAU
@@ -332,52 +417,80 @@ export class CavosSDK {
             this.analyticsManager.trackWalletDeployment(address, email);
           }
 
-          // Auto-register session after deploy
           await this.autoRegisterSession();
-        } catch (err) {
-          this.updateWalletStatus({ isDeploying: false });
-          this.logger.alwaysError('Background deployment failed:', err);
+        } catch (err: any) {
+          const msg: string = err?.message || String(err);
+          if (msg.includes('timeout')) {
+            // The tx was submitted but we lost the confirmation — keep the hash for next init()
+            this.logger.alwaysError('Deploy confirmation timed out. Hash persisted for recovery.', err);
+            this.updateWalletStatus({ isDeploying: false });
+          } else {
+            localStorage.removeItem(CavosSDK.PENDING_DEPLOY_TX_KEY);
+            this.updateWalletStatus({ isDeploying: false, pendingDeployTxHash: undefined });
+            this.logger.alwaysError('Background deployment failed:', err);
+          }
         }
       } else {
         this.logger.log('Account already deployed. Checking session status...');
-        // Check if current session key is already registered on-chain
         const sessionActive = this.transactionManager
           ? await this.transactionManager.isSessionRegistered()
           : false;
 
         if (sessionActive) {
-          this.updateWalletStatus({
-            isDeployed: true,
-            isSessionActive: true,
-            isReady: true,
-          });
+          this.updateWalletStatus({ isDeployed: true, isSessionActive: true, isReady: true });
         } else {
-          this.updateWalletStatus({
-            isDeployed: true,
-            isSessionActive: false,
-            isReady: false,
-          });
-          // Auto-register session if not active
+          this.updateWalletStatus({ isDeployed: true, isSessionActive: false, isReady: false });
           await this.autoRegisterSession();
         }
       }
-    }).catch(err => {
+    } catch (err) {
       this.logger.alwaysError('Background deployment check failed:', err);
-    });
+    }
+  }
+
+  /** Poll a known tx hash until confirmed. Used for deploy tx recovery. */
+  private async _waitForDeployTx(txHash: string, timeout: number): Promise<void> {
+    const start = Date.now();
+    while (Date.now() - start < timeout) {
+      try {
+        const receipt = await this.provider.getTransactionReceipt(txHash);
+        if (receipt) {
+          const ok = (receipt as any).execution_status === 'SUCCEEDED' ||
+            (receipt as any).finality_status === 'ACCEPTED_ON_L2' ||
+            (receipt as any).finality_status === 'ACCEPTED_ON_L1';
+          if (ok) return;
+          if ((receipt as any).execution_status === 'REVERTED') {
+            throw new Error(`Deploy tx reverted: ${(receipt as any).revert_error || 'unknown'}`);
+          }
+        }
+      } catch (e: any) {
+        if (e?.message?.includes('reverted')) throw e;
+      }
+      await new Promise(r => setTimeout(r, 3000));
+    }
+    throw new Error(`Deploy tx ${txHash} still unconfirmed after ${timeout}ms`);
   }
 
   /**
    * Auto-register session after deploy or when session is not active.
-   * Updates walletStatus progressively.
+   * Skips gracefully if JWT is expired — execute() will surface the error to the user
+   * clearly via JwtExpiredError instead of failing silently here.
    */
   private async autoRegisterSession(): Promise<void> {
     if (!this.transactionManager) return;
+
+    // Don't attempt registration with an expired JWT — it will always fail on-chain.
+    if (this.isJwtExpired()) {
+      this.logger.log('Auto-registration skipped: JWT is expired. User must re-login.');
+      this.updateWalletStatus({ isRegistering: false, isReady: false });
+      return;
+    }
 
     try {
       this.updateWalletStatus({ isRegistering: true });
       this.logger.log('Auto-registering session on-chain...');
       const txHash = await this.transactionManager.registerCurrentSession();
-      this.logger.log('Session registered. TxHash:', txHash);
+      this.logger.log('Session registered on-chain. TxHash:', txHash);
       this.updateWalletStatus({
         isRegistering: false,
         isSessionActive: true,
@@ -385,10 +498,9 @@ export class CavosSDK {
       });
     } catch (err) {
       this.logger.alwaysError('Auto session registration failed:', err);
-      this.updateWalletStatus({
-        isRegistering: false,
-        isReady: true, // Still mark as ready — execute() can try JWT fallback
-      });
+      // Do NOT mark isReady: true — the session is not registered.
+      // execute() will fallback to JWT path; if JWT is expired execute() will throw clearly.
+      this.updateWalletStatus({ isRegistering: false, isReady: false });
     }
   }
 
@@ -444,6 +556,12 @@ export class CavosSDK {
       throw new Error('Wallet not initialized. Please login first.');
     }
 
+    // Before attempting a JWT-path tx, surface a clear error if JWT is expired.
+    const status = await this.transactionManager.getSessionStatus();
+    if (!status.registered && this.isJwtExpired()) {
+      throw new JwtExpiredError();
+    }
+
     // The transactionManager.execute() will automatically detect if session is registered
     // and use the appropriate signature type (JWT for first tx, session for subsequent)
     const txHash = await this.transactionManager.execute(calls);
@@ -477,6 +595,14 @@ export class CavosSDK {
    */
   async clearSession(): Promise<void> {
     await this.logout();
+  }
+
+  /**
+   * Get the public key of the current session key (safe to display).
+   * Returns null if not authenticated.
+   */
+  getSessionPublicKey(): string | null {
+    return this.oauthWalletManager.getSession()?.sessionPubKey ?? null;
   }
 
   /**
@@ -561,8 +687,7 @@ export class CavosSDK {
     if (!address) return false;
 
     try {
-      const provider = new RpcProvider({ nodeUrl: this.config.starknetRpcUrl! });
-      const classHash = await provider.getClassHashAt(address);
+      const classHash = await this.provider.getClassHashAt(address);
       return !!classHash;
     } catch {
       return false;
@@ -773,9 +898,9 @@ export class CavosSDK {
 
     return {
       id: session.jwtClaims.sub,
-      email: '',
-      name: '',
-      picture: ''
+      email: session.jwtClaims.email ?? '',
+      name: session.jwtClaims.name ?? '',
+      picture: session.jwtClaims.picture ?? '',
     };
   }
 

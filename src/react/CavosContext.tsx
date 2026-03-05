@@ -39,6 +39,8 @@ export interface CavosContextValue {
   exportSession: () => string;
   /** Update session policy before registration */
   updateSessionPolicy: (policy: SessionKeyPolicy) => void;
+  /** Public key of the current session key (safe to display) */
+  sessionPublicKey: string | null;
 }
 
 const CavosContext = createContext<CavosContextValue | null>(null);
@@ -64,12 +66,14 @@ export function CavosProvider({ config, children }: CavosProviderProps) {
   const [hasActiveSession, setHasActiveSession] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
   const [walletStatus, setWalletStatus] = useState<WalletStatus>(DEFAULT_WALLET_STATUS);
+  const [sessionPublicKey, setSessionPublicKey] = useState<string | null>(null);
 
   const updateState = useCallback(() => {
     setIsAuthenticated(cavos.isAuthenticated());
     setUser(cavos.getUserInfo());
     setAddress(cavos.getAddress());
     setHasActiveSession(cavos.isAuthenticated());
+    setSessionPublicKey(cavos.getSessionPublicKey());
   }, [cavos]);
 
   // Subscribe to wallet status changes
@@ -89,7 +93,12 @@ export function CavosProvider({ config, children }: CavosProviderProps) {
 
       try {
         if (authData) {
-          // Handle OAuth callback
+          // If this is the child auth tab (opened via window.open), write auth data
+          // to localStorage so the original tab picks it up, then close this tab.
+          // handlePopupCallback() returns true for child tabs, false for redirect fallbacks.
+          CavosSDK.handlePopupCallback();
+          // Process auth in this tab regardless — handles the redirect-fallback case,
+          // and provides a usable state if window.close() is blocked by the browser.
           console.log('[CavosContext] calling handleCallback()');
           await cavos.handleCallback(authData);
           // Clean up URL
@@ -138,8 +147,11 @@ export function CavosProvider({ config, children }: CavosProviderProps) {
   }, [cavos, updateState]);
 
   const execute = useCallback(async (calls: Call | Call[], _options?: { gasless?: boolean }) => {
-    return cavos.execute(calls);
-  }, [cavos]);
+    const txHash = await cavos.execute(calls);
+    // If this was the first tx (JWT path), the session is now registered — update React state
+    updateState();
+    return txHash;
+  }, [cavos, updateState]);
 
   const renewSession = useCallback(async () => {
     return cavos.renewSession();
@@ -211,6 +223,7 @@ export function CavosProvider({ config, children }: CavosProviderProps) {
     registerCurrentSession: async () => cavos.registerCurrentSession(),
     exportSession: () => cavos.exportSession(),
     updateSessionPolicy: (policy: SessionKeyPolicy) => cavos.updateSessionPolicy(policy),
+    sessionPublicKey,
   };
 
   return (

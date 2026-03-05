@@ -1,5 +1,5 @@
 // Main SDK
-export { CavosSDK } from './CavosSDK';
+export { CavosSDK, JwtExpiredError } from './CavosSDK';
 export type { WalletStatus, WalletStatusListener } from './CavosSDK';
 
 // Types

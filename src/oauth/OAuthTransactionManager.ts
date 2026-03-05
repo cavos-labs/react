@@ -82,8 +82,6 @@ export class OAuthTransactionManager {
   private network: 'mainnet' | 'sepolia';
   private account: Account | null = null;
   private paymasterRpc: PaymasterRpc;
-  /** Tracks whether we've already sent a JWT tx (which registers the session on-chain) */
-  private sessionRegisteredLocally: boolean = false;
 
   constructor(
     config: OAuthWalletConfig,
@@ -146,11 +144,14 @@ export class OAuthTransactionManager {
     }
 
     try {
-      const result = await this.provider.callContract({
-        contractAddress: session.walletAddress,
-        entrypoint: 'get_session',
-        calldata: [session.sessionPubKey],
-      });
+      const [result, block] = await Promise.all([
+        this.provider.callContract({
+          contractAddress: session.walletAddress,
+          entrypoint: 'get_session',
+          calldata: [session.sessionPubKey],
+        }),
+        this.provider.getBlock('latest'),
+      ]);
 
       // get_session returns (nonce, valid_after, valid_until, renewal_deadline, registered_at, allowed_contracts_root, max_calls_per_tx)
       const nonce = BigInt(result[0]);
@@ -163,8 +164,6 @@ export class OAuthTransactionManager {
         return { registered: false, expired: false, canRenew: false };
       }
 
-      // Get current block timestamp
-      const block = await this.provider.getBlock('latest');
       const now = BigInt(block.timestamp);
 
       const expired = now >= validUntil;
@@ -318,13 +317,17 @@ export class OAuthTransactionManager {
       throw new Error('Must be logged in to register session');
     }
 
+    // A minimal no-op call — the JWT signature in the tx is what registers the session on-chain
     const registrationCall: Call = {
       contractAddress: session.walletAddress,
       entrypoint: 'get_version',
       calldata: [],
     };
 
-    return this.executeWithAVNUAPI([registrationCall], session, true);
+    const txHash = await this.executeWithAVNUAPI([registrationCall], session, true);
+    // Wait for the tx to be confirmed so callers can rely on the session being live on-chain
+    await this.waitForTransaction(txHash);
+    return txHash;
   }
 
   /**
@@ -423,7 +426,7 @@ export class OAuthTransactionManager {
   /**
    * Wait for a transaction to be confirmed on-chain
    */
-  private async waitForTransaction(txHash: string, timeout: number = 120000): Promise<void> {
+  private async waitForTransaction(txHash: string, timeout: number = 180_000): Promise<void> {
     const startTime = Date.now();
     const pollInterval = 3000;
     let attemptCount = 0;

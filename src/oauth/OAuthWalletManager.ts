@@ -43,6 +43,9 @@ export interface JWTClaims {
   exp: number;
   iss: string;
   aud: string;
+  email?: string;
+  name?: string;
+  picture?: string;
 }
 
 export interface ClaimOffsets {
@@ -56,6 +59,214 @@ export interface ClaimOffsets {
 
 const SESSION_STORAGE_KEY = 'cavos_oauth_session';
 const PRE_AUTH_STORAGE_KEY = 'cavos_oauth_pre_auth';
+
+// ── Schwartz-Zippel RSA witness generation (Tier 5) ────────────────────────────
+// With carry polynomial (BigT) for correct polynomial identity verification.
+//
+// Integer: a² = q·n + r
+// Polynomial: A(X)² - Q(X)·N(X) - R(X) = (X - B) · T(X)  where B = 2^128
+// Batched: BigT = Σ αⁱ · Tᵢ  (30 coefficients, degree 29)
+
+/** The Stark prime p = 2^251 + 17·2^192 + 1 */
+const STARK_PRIME = 3618502788666131213697322783095070105623107215331596699973092056135872020481n;
+
+/** Base for limb representation: B = 2^128 */
+const LIMB_BASE = 1n << 128n;
+
+/** Modular reduction: returns x mod p in [0, p). Handles negative values. */
+function modp(x: bigint): bigint {
+  const r = x % STARK_PRIME;
+  return r < 0n ? r + STARK_PRIME : r;
+}
+
+interface RSAWitnesses {
+  /** x1..x16: 16 squarings of sig (each as 16 u128 limbs, little-endian) */
+  intermediates: bigint[][];
+  /** sig^65537 mod n (16 u128 limbs, little-endian) */
+  result: bigint[];
+  /** q1..q17: quotients for squarings and final mul (each 16 u128 limbs) */
+  quotients: bigint[][];
+  /** BigT carry polynomial — 30 felt252 coefficients (degree 29) */
+  carryCoeffs: bigint[];
+}
+
+/** Convert a bigint to 16 × 128-bit limbs in little-endian order. */
+function bigIntToLimbs(n: bigint): bigint[] {
+  const limbs: bigint[] = [];
+  const MASK = (1n << 128n) - 1n;
+  for (let i = 0; i < 16; i++) {
+    limbs.push((n >> (BigInt(i) * 128n)) & MASK);
+  }
+  return limbs;
+}
+
+/**
+ * Polynomial convolution: compute coefficients of P(X) = A(X) · B(X) mod p.
+ * Both inputs have 16 coefficients (degree 15); output has 31 (degree 30).
+ */
+function polyConv(a: bigint[], b: bigint[]): bigint[] {
+  const result: bigint[] = new Array(a.length + b.length - 1).fill(0n);
+  for (let i = 0; i < a.length; i++) {
+    for (let j = 0; j < b.length; j++) {
+      result[i + j] = modp(result[i + j] + modp(a[i] * b[j]));
+    }
+  }
+  return result;
+}
+
+/**
+ * Synthetic division of polynomial P(X) by (X - B) in F_p.
+ * P must satisfy P(B) ≡ 0 (mod p).
+ * Input: coefficients [c0, c1, ..., c_n] of degree n polynomial.
+ * Output: coefficients of degree (n-1) quotient polynomial.
+ */
+function syntheticDivByXMinusB(coeffs: bigint[], B: bigint): bigint[] {
+  const n = coeffs.length - 1; // degree of input
+  const t: bigint[] = new Array(n).fill(0n);
+  // Start from highest degree: t[n-1] = c[n]
+  t[n - 1] = modp(coeffs[n]);
+  // Work downward: t[k] = c[k+1] + B · t[k+1]
+  for (let k = n - 2; k >= 0; k--) {
+    t[k] = modp(coeffs[k + 1] + modp(B * t[k + 1]));
+  }
+  // Verify: remainder = c[0] + B · t[0] should be 0 mod p
+  // (Skip assertion in production — the on-chain check will catch errors)
+  return t;
+}
+
+/**
+ * Compute Poseidon hash matching Cairo's poseidon_hash_span.
+ * Uses the already-imported starknet.js `hash` module.
+ */
+function poseidonHashMany(values: bigint[]): bigint {
+  const hexValues = values.map((v) => '0x' + v.toString(16));
+  const result = hash.computePoseidonHashOnElements(hexValues);
+  return BigInt(result);
+}
+
+/**
+ * Precompute RSA witnesses for sig^65537 mod n via 16 squarings + 1 final mul.
+ * Includes the carry polynomial BigT for correct Schwartz-Zippel verification.
+ *
+ * Witness layout:
+ *   x0  = sig
+ *   x_i = x_{i-1}^2 mod n     (i = 1..16)
+ *   result = x16 * sig mod n   (= sig^65537 mod n)
+ *   q_i s.t. x_{i-1}^2 = q_i * n + x_i     (i = 1..16)
+ *   q_17 s.t. x16 * sig = q_17 * n + result
+ *   BigT: carry polynomial s.t. Σ αⁱ · Cᵢ(X) = (X - B) · BigT(X)
+ */
+function generateRSAWitnesses(sig: bigint, n: bigint): RSAWitnesses {
+  const steps: bigint[] = [sig];
+  const quotients: bigint[][] = [];
+  let curr = sig;
+
+  for (let i = 0; i < 16; i++) {
+    const sq = curr * curr;
+    const q = sq / n;
+    quotients.push(bigIntToLimbs(q));
+    curr = sq % n;
+    steps.push(curr);
+  }
+
+  // Final: result = x16 * sig mod n  (sig^{65536} * sig = sig^{65537})
+  const finalProd = curr * sig;
+  const finalQ = finalProd / n;
+  quotients.push(bigIntToLimbs(finalQ));
+  const result = finalProd % n;
+
+  const intermediateLimbs = steps.slice(1).map(bigIntToLimbs);
+  const resultLimbs = bigIntToLimbs(result);
+  const nLimbs = bigIntToLimbs(n).map(modp);
+  const sigLimbs = bigIntToLimbs(sig).map(modp);
+
+  // ── Compute carry polynomials for each step ──────────────────────────────────
+  // For each step i: C_i(X) = A_i(X)² - Q_i(X)·N(X) - R_i(X)
+  // where A_0 = sig, A_i = intermediates[i-1] for squaring steps
+  // T_i(X) = C_i(X) / (X - B)    (in F_p)
+  const carryPolys: bigint[][] = [];
+  const B = modp(LIMB_BASE);
+
+  // Squaring steps (i = 0..15)
+  for (let i = 0; i < 16; i++) {
+    const aLimbs = (i === 0 ? sigLimbs : intermediateLimbs[i - 1]).map(modp);
+    const qLimbs = quotients[i].map(modp);
+    const rLimbs = intermediateLimbs[i].map(modp);
+
+    // C = A·A - Q·N - R (polynomial coefficients mod p)
+    const aa = polyConv(aLimbs, aLimbs);
+    const qn = polyConv(qLimbs, nLimbs);
+
+    const C: bigint[] = new Array(31).fill(0n);
+    for (let k = 0; k < 31; k++) {
+      let val = aa[k] ?? 0n;
+      val = modp(val - (qn[k] ?? 0n));
+      if (k < 16) val = modp(val - rLimbs[k]);
+      C[k] = val;
+    }
+
+    const T = syntheticDivByXMinusB(C, B);
+    carryPolys.push(T); // 30 coefficients each
+  }
+
+  // Final multiplication step: C_17 = prev·sig - Q_17·N - result
+  {
+    const prevLimbs = intermediateLimbs[15].map(modp); // x_16
+    const qLimbs = quotients[16].map(modp);
+    const rLimbs = resultLimbs.map(modp);
+
+    const ps = polyConv(prevLimbs, sigLimbs);
+    const qn = polyConv(qLimbs, nLimbs);
+
+    const C: bigint[] = new Array(31).fill(0n);
+    for (let k = 0; k < 31; k++) {
+      let val = ps[k] ?? 0n;
+      val = modp(val - (qn[k] ?? 0n));
+      if (k < 16) val = modp(val - rLimbs[k]);
+      C[k] = val;
+    }
+
+    const T = syntheticDivByXMinusB(C, B);
+    carryPolys.push(T);
+  }
+
+  // ── Derive α and compute BigT = Σ αⁱ · Tᵢ ─────────────────────────────────
+  // Phase I hash: Poseidon(sig_limbs, n_limbs, intermediate_limbs, result_limbs, quotient_limbs)
+  const phase1Values: bigint[] = [];
+  // sig (16 limbs)
+  phase1Values.push(...sigLimbs);
+  // n (16 limbs)
+  phase1Values.push(...nLimbs);
+  // intermediates x1..x16 (16 × 16 = 256 limbs)
+  for (const inter of intermediateLimbs) {
+    phase1Values.push(...inter.map(modp));
+  }
+  // result (16 limbs)
+  phase1Values.push(...resultLimbs.map(modp));
+  // quotients q1..q17 (17 × 16 = 272 limbs)
+  for (const q of quotients) {
+    phase1Values.push(...q.map(modp));
+  }
+
+  const alpha = poseidonHashMany(phase1Values);
+
+  // BigT[k] = Σ αⁱ · Tᵢ[k]  for k = 0..29
+  const bigT: bigint[] = new Array(30).fill(0n);
+  let alphaPow = 1n;
+  for (let i = 0; i < 17; i++) {
+    for (let k = 0; k < 30; k++) {
+      bigT[k] = modp(bigT[k] + modp(alphaPow * carryPolys[i][k]));
+    }
+    alphaPow = modp(alphaPow * alpha);
+  }
+
+  return {
+    intermediates: intermediateLimbs,
+    result: resultLimbs,
+    quotients,
+    carryCoeffs: bigT,
+  };
+}
 
 export class OAuthWalletManager {
   private config: OAuthWalletConfig;
@@ -437,23 +648,23 @@ export class OAuthWalletManager {
    * This performs expensive RSA verification and registers the session.
    * Only use during deployment - subsequent transactions should use buildSessionSignature().
    *
-   * Signature format with claim offsets and policy fields:
-   * [0]  = OAUTH_JWT_V1 magic
-   * [1-3] = session key (r, s, pubkey)
-   * [4-5] = valid_until, randomness
-   * [6-12] = jwt_sub, jwt_nonce, jwt_exp, jwt_kid, jwt_iss, jwt_aud, salt
-   * [13-14] = sub_offset, sub_len
-   * [15-16] = nonce_offset, nonce_len
-   * [17-18] = kid_offset, kid_len
-   * [19] = RSA sig length (16)
-   * [20-35] = RSA signature (16 u128 limbs)
-   * [36] = jwt_bytes_len
-   * [37+] = packed JWT bytes
-   * [after JWT] = valid_after
-   * [+1] = allowed_contracts_root
-   * [+2] = max_calls_per_tx
-   * [+3] = spending_policies_count
-   * [+4..] = spending_policies: [token, limit_low, limit_high, ...]
+   * Signature format with claim offsets, witnesses, and policy fields (Tier 5):
+   * [0]      = OAUTH_JWT_V1 magic
+   * [1-3]    = session key (r, s, pubkey)
+   * [4-5]    = valid_until, randomness
+   * [6-13]   = jwt_sub, jwt_nonce, jwt_exp, jwt_kid, jwt_iss, jwt_aud, salt, wallet_name
+   * [14-19]  = claim offsets (sub_offset, sub_len, nonce_offset, nonce_len, kid_offset, kid_len)
+   * [20]     = RSA sig length (16)
+   * [21-36]  = RSA signature (16 u128 limbs)
+   * [37]     = witnesses_len (574)
+   * [38-293] = intermediates x1..x16 (16×16 u128 limbs)
+   * [294-309]= result (16 u128 limbs, sig^65537 mod n)
+   * [310-581]= quotients q1..q17 (17×16 u128 limbs)
+   * [582-611]= BigT carry polynomial (30 felt252 coefficients)
+   * [612]    = jwt_bytes_len
+   * [613+]   = packed JWT bytes (31-byte chunks)
+   * [after JWT] = valid_after, allowed_contracts_root, max_calls_per_tx,
+   *               spending_policies_count, spending_policies...
    */
   async buildJWTSignatureData(transactionHash: string, externalSession?: OAuthSession): Promise<string[]> {
     const session = externalSession || this.session;
@@ -471,6 +682,31 @@ export class OAuthWalletManager {
     const jwtParts = jwt.split('.');
     const rsaSignature = this.base64UrlToBytes(jwtParts[2]);
     const rsaLimbs = this.bytesToU128Limbs(rsaSignature);
+
+    // Convert RSA sig limbs to bigint (little-endian: limb[0] is LSB)
+    const sigBigInt = rsaLimbs.reduce(
+      (acc: bigint, limb: string, i: number) => acc + BigInt(limb) * (1n << (BigInt(i) * 128n)),
+      0n,
+    );
+
+    // Fetch the RSA modulus n from the on-chain registry and convert to bigint
+    const kid = this.extractKidFromJwt(jwt);
+    const nLimbHexes = await this.fetchNFromRegistry(kid);
+    const nBigInt = nLimbHexes.reduce(
+      (acc: bigint, limb: string, i: number) => acc + BigInt(limb) * (1n << (BigInt(i) * 128n)),
+      0n,
+    );
+
+    if (nBigInt === 0n) {
+      throw new Error(
+        `JWKS key not found or invalid: kid="${kid}" is not registered in the on-chain JWKS registry. ` +
+        `Make sure the JWKS registry has been populated for this network.`
+      );
+    }
+
+    // Generate Schwartz-Zippel witnesses for sig^65537 mod n (with carry polynomial)
+    const witnesses = generateRSAWitnesses(sigBigInt, nBigInt);
+    const h = (v: bigint) => num.toHex(v);
 
     // Get signed data (header.payload)
     const signedData = `${jwtParts[0]}.${jwtParts[1]}`;
@@ -490,38 +726,45 @@ export class OAuthWalletManager {
       let chunk = 0n;
       const end = Math.min(i + PACK_SIZE, signedDataBytes.length);
       for (let j = i; j < end; j++) {
-        chunk = (chunk * 256n) + BigInt(signedDataBytes[j]);
+        chunk = chunk * 256n + BigInt(signedDataBytes[j]);
       }
       packedBytes.push(num.toHex(chunk));
     }
 
-
-
     const sig: string[] = [
-      '0x4f415554485f4a57545f5631', // OAUTH_JWT_V1 magic
-      num.toHex(signature.r),      // session_r [1]
-      num.toHex(signature.s),      // session_s [2]
-      sessionPubKey,              // session_key [3]
-      num.toHex(nonceParams.validUntil), // valid_until [4]
-      num.toHex(nonceParams.randomness), // randomness [5]
-      jwt_sub_felt,                 // jwt_sub [6]
-      session.nonce,                // jwt_nonce [7]
-      num.toHex(jwtClaims.exp),    // jwt_exp [8]
-      this.stringToFelt(this.extractKidFromJwt(jwt)), // jwt_kid [9]
-      this.stringToFelt(jwtClaims.iss), // jwt_iss [10]
-      this.stringToFelt(jwtClaims.aud), // jwt_aud [11]
-      salt_hex,                     // salt [12]
+      '0x4f415554485f4a57545f5631',               // OAUTH_JWT_V1 magic [0]
+      num.toHex(signature.r),                       // session_r [1]
+      num.toHex(signature.s),                       // session_s [2]
+      sessionPubKey,                                // session_key [3]
+      num.toHex(nonceParams.validUntil),            // valid_until [4]
+      num.toHex(nonceParams.randomness),            // randomness [5]
+      jwt_sub_felt,                                 // jwt_sub [6]
+      session.nonce,                                // jwt_nonce [7]
+      num.toHex(jwtClaims.exp),                    // jwt_exp [8]
+      this.stringToFelt(kid),                       // jwt_kid [9]
+      this.stringToFelt(jwtClaims.iss),            // jwt_iss [10]
+      this.stringToFelt(jwtClaims.aud),            // jwt_aud [11]
+      salt_hex,                                     // salt [12]
       this.stringToFelt(session.walletName || ''), // wallet_name [13]
-      num.toHex(offsets.sub_offset),    // sub_offset [14]
-      num.toHex(offsets.sub_len),       // sub_len [15]
-      num.toHex(offsets.nonce_offset),  // nonce_offset [16]
-      num.toHex(offsets.nonce_len),     // nonce_len [17]
-      num.toHex(offsets.kid_offset),    // kid_offset [18]
-      num.toHex(offsets.kid_len),       // kid_len [19]
-      num.toHex(16),                // rsa_sig_len [20]
-      ...rsaLimbs,                  // RSA signature as 16 u128 limbs [21-36]
-      num.toHex(signedDataBytes.length), // jwt_bytes_len [37]
-      ...packedBytes,               // packed JWT bytes [38+]
+      num.toHex(offsets.sub_offset),               // sub_offset [14]
+      num.toHex(offsets.sub_len),                  // sub_len [15]
+      num.toHex(offsets.nonce_offset),             // nonce_offset [16]
+      num.toHex(offsets.nonce_len),                // nonce_len [17]
+      num.toHex(offsets.kid_offset),               // kid_offset [18]
+      num.toHex(offsets.kid_len),                  // kid_len [19]
+      num.toHex(16),                               // rsa_sig_len [20]
+      ...rsaLimbs,                                 // RSA sig (16 u128 limbs) [21-36]
+      num.toHex(574),                              // witnesses_len [37]
+      // intermediates x1..x16: 16 × 16 = 256 felts [38-293]
+      ...witnesses.intermediates.flatMap((limbs) => limbs.map(h)),
+      // result (16 felts) [294-309]
+      ...witnesses.result.map(h),
+      // quotients q1..q17: 17 × 16 = 272 felts [310-581]
+      ...witnesses.quotients.flatMap((limbs) => limbs.map(h)),
+      // BigT carry polynomial: 30 felt252 coefficients [582-611]
+      ...witnesses.carryCoeffs.map(h),
+      num.toHex(signedDataBytes.length),           // jwt_bytes_len [612]
+      ...packedBytes,                              // packed JWT bytes [613+]
     ];
 
     // Append policy fields after JWT data
@@ -808,7 +1051,26 @@ export class OAuthWalletManager {
       exp: payload.exp,
       iss: payload.iss,
       aud: Array.isArray(payload.aud) ? payload.aud[0] : payload.aud,
+      email: payload.email,
+      name: payload.name,
+      picture: payload.picture,
     };
+  }
+
+  /**
+   * Fetch the RSA modulus n of a JWKS key from the on-chain registry.
+   * Returns the 16 limbs as an array of hex strings (little-endian, limb 0 = LSB).
+   */
+  private async fetchNFromRegistry(kid: string): Promise<string[]> {
+    const kidFelt = this.stringToFelt(kid);
+    const result = await this.provider.callContract({
+      contractAddress: this.config.jwksRegistryAddress,
+      entrypoint: 'get_key',
+      calldata: [kidFelt],
+    });
+    // Slim JWKSKey: [n0..n15 (16 u128), provider (felt252), valid_until (u64), is_active (bool)]
+    // We only need the 16 n limbs (indices 0..15).
+    return (result as string[]).slice(0, 16);
   }
 
   private extractKidFromJwt(jwt: string): string {

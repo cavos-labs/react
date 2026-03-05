@@ -27,13 +27,15 @@ export class AddressSeedManager {
     const subFelt = this.subToFelt(sub);
     const saltFelt = num.toHex(this.salt);
 
-    const elements = [subFelt, saltFelt];
     if (name) {
-      elements.push(this.stringToFelt(name));
+      // Cairo: PoseidonTrait::new().update(sub).update(salt).update(name).finalize()
+      // Matches computePoseidonHashOnElements (sponge starting at (0,0,0))
+      return hash.computePoseidonHashOnElements([subFelt, saltFelt, this.stringToFelt(name)]);
     }
 
-    // Poseidon([sub, salt, name?]) - matches Cairo's .update().update().update().finalize()
-    return hash.computePoseidonHashOnElements(elements);
+    // Cairo: let (h, _, _) = hades_permutation(jwt_sub, salt, 2);
+    // computePoseidonHash(a, b) = hades_permutation(a, b, 2)[0]
+    return hash.computePoseidonHash(subFelt, saltFelt);
   }
 
   /**
