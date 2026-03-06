@@ -1,13 +1,13 @@
 import { OAuthWalletConfig } from '../types/config';
 
 export const DEFAULT_OAUTH_CONFIG_SEPOLIA: OAuthWalletConfig = {
-    jwksRegistryAddress: '0x074e56464afb566ca9d7c753eb378dbcc7c77f30b280737164c803c83355c75f',
-    cavosAccountClassHash: '0x60ff7e871fde02c13c1f85bec33a48ca9dfdced09c8017f169e04cde6310e4f',
+    jwksRegistryAddress: '0x059e9f82d07557ebdf16a9a09a86ad9f8a129b04ae4939103ef4baa9d6cfd021',
+    cavosAccountClassHash: '0x32c636754e41c2ac5c1667045a7a8933571acb3b4a880facce9fae45de0a417',
     salt: '0x0',
 };
 
 export const DEFAULT_OAUTH_CONFIG_MAINNET: OAuthWalletConfig = {
-    jwksRegistryAddress: '0x060bb574466f7ac59df3ad58f3bd31c0ca94b563b2249340367cf82aea4c6c93',
-    cavosAccountClassHash: '0x60ff7e871fde02c13c1f85bec33a48ca9dfdced09c8017f169e04cde6310e4f',
+    jwksRegistryAddress: '0x0012117d272d8eaab706d9488b3a9838c6d686342823e72348d8c466c71e89b4',
+    cavosAccountClassHash: '0x32c636754e41c2ac5c1667045a7a8933571acb3b4a880facce9fae45de0a417',
     salt: '0x0',
 };

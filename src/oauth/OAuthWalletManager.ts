@@ -8,7 +8,17 @@
  * - Session persistence across page reloads
  */
 
-import { ec, num, hash, RpcProvider, typedData, type TypedData, type Signature } from 'starknet';
+import {
+  CallData,
+  byteArray,
+  ec,
+  num,
+  hash,
+  RpcProvider,
+  typedData,
+  type TypedData,
+  type Signature,
+} from 'starknet';
 import { NonceManager, NonceParams } from './NonceManager';
 import { AddressSeedManager } from './AddressSeedManager';
 import { OAuthWalletConfig } from '../types/config';
@@ -64,14 +74,16 @@ const PRE_AUTH_STORAGE_KEY = 'cavos_oauth_pre_auth';
 // With carry polynomial (BigT) for correct polynomial identity verification.
 //
 // Integer: a² = q·n + r
-// Polynomial: A(X)² - Q(X)·N(X) - R(X) = (X - B) · T(X)  where B = 2^128
-// Batched: BigT = Σ αⁱ · Tᵢ  (30 coefficients, degree 29)
+// Polynomial: A(X)² - Q(X)·N(X) - R(X) = (X - B) · T(X)  where B = 2^123
+// Batched: BigT = Σ αⁱ · Tᵢ  (32 coefficients, degree 31)
 
 /** The Stark prime p = 2^251 + 17·2^192 + 1 */
 const STARK_PRIME = 3618502788666131213697322783095070105623107215331596699973092056135872020481n;
 
-/** Base for limb representation: B = 2^128 */
-const LIMB_BASE = 1n << 128n;
+/** Safe proof base for the Schwartz-Zippel construction: B = 2^123 */
+const PROOF_LIMB_BASE = 1n << 123n;
+const PROOF_LIMB_COUNT = 17;
+const RAW_RSA_LIMB_BASE = 1n << 128n;
 
 /** Modular reduction: returns x mod p in [0, p). Handles negative values. */
 function modp(x: bigint): bigint {
@@ -80,29 +92,29 @@ function modp(x: bigint): bigint {
 }
 
 interface RSAWitnesses {
-  /** x1..x16: 16 squarings of sig (each as 16 u128 limbs, little-endian) */
+  /** x1..x16: 16 squarings of sig (each as 17 proof limbs, little-endian) */
   intermediates: bigint[][];
-  /** sig^65537 mod n (16 u128 limbs, little-endian) */
+  /** sig^65537 mod n (17 proof limbs, little-endian) */
   result: bigint[];
-  /** q1..q17: quotients for squarings and final mul (each 16 u128 limbs) */
+  /** q1..q17: quotients for squarings and final mul (each 17 proof limbs) */
   quotients: bigint[][];
-  /** BigT carry polynomial — 30 felt252 coefficients (degree 29) */
+  /** BigT carry polynomial — 32 felt252 coefficients (degree 31) */
   carryCoeffs: bigint[];
 }
 
-/** Convert a bigint to 16 × 128-bit limbs in little-endian order. */
-function bigIntToLimbs(n: bigint): bigint[] {
+/** Convert a bigint to 17 × 123-bit proof limbs in little-endian order. */
+function bigIntToProofLimbs(n: bigint): bigint[] {
   const limbs: bigint[] = [];
-  const MASK = (1n << 128n) - 1n;
-  for (let i = 0; i < 16; i++) {
-    limbs.push((n >> (BigInt(i) * 128n)) & MASK);
+  const MASK = PROOF_LIMB_BASE - 1n;
+  for (let i = 0; i < PROOF_LIMB_COUNT; i++) {
+    limbs.push((n >> (BigInt(i) * 123n)) & MASK);
   }
   return limbs;
 }
 
 /**
  * Polynomial convolution: compute coefficients of P(X) = A(X) · B(X) mod p.
- * Both inputs have 16 coefficients (degree 15); output has 31 (degree 30).
+ * Both inputs have 17 coefficients (degree 16); output has 33 (degree 32).
  */
 function polyConv(a: bigint[], b: bigint[]): bigint[] {
   const result: bigint[] = new Array(a.length + b.length - 1).fill(0n);
@@ -164,7 +176,7 @@ function generateRSAWitnesses(sig: bigint, n: bigint): RSAWitnesses {
   for (let i = 0; i < 16; i++) {
     const sq = curr * curr;
     const q = sq / n;
-    quotients.push(bigIntToLimbs(q));
+    quotients.push(bigIntToProofLimbs(q));
     curr = sq % n;
     steps.push(curr);
   }
@@ -172,20 +184,20 @@ function generateRSAWitnesses(sig: bigint, n: bigint): RSAWitnesses {
   // Final: result = x16 * sig mod n  (sig^{65536} * sig = sig^{65537})
   const finalProd = curr * sig;
   const finalQ = finalProd / n;
-  quotients.push(bigIntToLimbs(finalQ));
+  quotients.push(bigIntToProofLimbs(finalQ));
   const result = finalProd % n;
 
-  const intermediateLimbs = steps.slice(1).map(bigIntToLimbs);
-  const resultLimbs = bigIntToLimbs(result);
-  const nLimbs = bigIntToLimbs(n).map(modp);
-  const sigLimbs = bigIntToLimbs(sig).map(modp);
+  const intermediateLimbs = steps.slice(1).map(bigIntToProofLimbs);
+  const resultLimbs = bigIntToProofLimbs(result);
+  const nLimbs = bigIntToProofLimbs(n).map(modp);
+  const sigLimbs = bigIntToProofLimbs(sig).map(modp);
 
   // ── Compute carry polynomials for each step ──────────────────────────────────
   // For each step i: C_i(X) = A_i(X)² - Q_i(X)·N(X) - R_i(X)
   // where A_0 = sig, A_i = intermediates[i-1] for squaring steps
   // T_i(X) = C_i(X) / (X - B)    (in F_p)
   const carryPolys: bigint[][] = [];
-  const B = modp(LIMB_BASE);
+  const B = modp(PROOF_LIMB_BASE);
 
   // Squaring steps (i = 0..15)
   for (let i = 0; i < 16; i++) {
@@ -197,16 +209,16 @@ function generateRSAWitnesses(sig: bigint, n: bigint): RSAWitnesses {
     const aa = polyConv(aLimbs, aLimbs);
     const qn = polyConv(qLimbs, nLimbs);
 
-    const C: bigint[] = new Array(31).fill(0n);
-    for (let k = 0; k < 31; k++) {
+    const C: bigint[] = new Array(33).fill(0n);
+    for (let k = 0; k < 33; k++) {
       let val = aa[k] ?? 0n;
       val = modp(val - (qn[k] ?? 0n));
-      if (k < 16) val = modp(val - rLimbs[k]);
+      if (k < PROOF_LIMB_COUNT) val = modp(val - rLimbs[k]);
       C[k] = val;
     }
 
     const T = syntheticDivByXMinusB(C, B);
-    carryPolys.push(T); // 30 coefficients each
+    carryPolys.push(T); // 32 coefficients each
   }
 
   // Final multiplication step: C_17 = prev·sig - Q_17·N - result
@@ -218,11 +230,11 @@ function generateRSAWitnesses(sig: bigint, n: bigint): RSAWitnesses {
     const ps = polyConv(prevLimbs, sigLimbs);
     const qn = polyConv(qLimbs, nLimbs);
 
-    const C: bigint[] = new Array(31).fill(0n);
-    for (let k = 0; k < 31; k++) {
+    const C: bigint[] = new Array(33).fill(0n);
+    for (let k = 0; k < 33; k++) {
       let val = ps[k] ?? 0n;
       val = modp(val - (qn[k] ?? 0n));
-      if (k < 16) val = modp(val - rLimbs[k]);
+      if (k < PROOF_LIMB_COUNT) val = modp(val - rLimbs[k]);
       C[k] = val;
     }
 
@@ -233,28 +245,28 @@ function generateRSAWitnesses(sig: bigint, n: bigint): RSAWitnesses {
   // ── Derive α and compute BigT = Σ αⁱ · Tᵢ ─────────────────────────────────
   // Phase I hash: Poseidon(sig_limbs, n_limbs, intermediate_limbs, result_limbs, quotient_limbs)
   const phase1Values: bigint[] = [];
-  // sig (16 limbs)
+  // sig (17 proof limbs)
   phase1Values.push(...sigLimbs);
-  // n (16 limbs)
+  // n (17 proof limbs)
   phase1Values.push(...nLimbs);
-  // intermediates x1..x16 (16 × 16 = 256 limbs)
+  // intermediates x1..x16 (16 × 17 = 272 limbs)
   for (const inter of intermediateLimbs) {
     phase1Values.push(...inter.map(modp));
   }
-  // result (16 limbs)
+  // result (17 proof limbs)
   phase1Values.push(...resultLimbs.map(modp));
-  // quotients q1..q17 (17 × 16 = 272 limbs)
+  // quotients q1..q17 (17 × 17 = 289 limbs)
   for (const q of quotients) {
     phase1Values.push(...q.map(modp));
   }
 
   const alpha = poseidonHashMany(phase1Values);
 
-  // BigT[k] = Σ αⁱ · Tᵢ[k]  for k = 0..29
-  const bigT: bigint[] = new Array(30).fill(0n);
+  // BigT[k] = Σ αⁱ · Tᵢ[k]  for k = 0..31
+  const bigT: bigint[] = new Array(32).fill(0n);
   let alphaPow = 1n;
   for (let i = 0; i < 17; i++) {
-    for (let k = 0; k < 30; k++) {
+    for (let k = 0; k < 32; k++) {
       bigT[k] = modp(bigT[k] + modp(alphaPow * carryPolys[i][k]));
     }
     alphaPow = modp(alphaPow * alpha);
@@ -656,13 +668,13 @@ export class OAuthWalletManager {
    * [14-19]  = claim offsets (sub_offset, sub_len, nonce_offset, nonce_len, kid_offset, kid_len)
    * [20]     = RSA sig length (16)
    * [21-36]  = RSA signature (16 u128 limbs)
-   * [37]     = witnesses_len (574)
-   * [38-293] = intermediates x1..x16 (16×16 u128 limbs)
-   * [294-309]= result (16 u128 limbs, sig^65537 mod n)
-   * [310-581]= quotients q1..q17 (17×16 u128 limbs)
-   * [582-611]= BigT carry polynomial (30 felt252 coefficients)
-   * [612]    = jwt_bytes_len
-   * [613+]   = packed JWT bytes (31-byte chunks)
+   * [37]     = witnesses_len (610)
+   * [38-309] = intermediates x1..x16 (16×17 proof limbs)
+   * [310-326]= result (17 proof limbs, sig^65537 mod n)
+   * [327-615]= quotients q1..q17 (17×17 proof limbs)
+   * [616-647]= BigT carry polynomial (32 felt252 coefficients)
+   * [648]    = jwt_bytes_len
+   * [649+]   = packed JWT bytes (31-byte chunks)
    * [after JWT] = valid_after, allowed_contracts_root, max_calls_per_tx,
    *               spending_policies_count, spending_policies...
    */
@@ -685,15 +697,16 @@ export class OAuthWalletManager {
 
     // Convert RSA sig limbs to bigint (little-endian: limb[0] is LSB)
     const sigBigInt = rsaLimbs.reduce(
-      (acc: bigint, limb: string, i: number) => acc + BigInt(limb) * (1n << (BigInt(i) * 128n)),
+      (acc: bigint, limb: string, i: number) => acc + BigInt(limb) * (RAW_RSA_LIMB_BASE ** BigInt(i)),
       0n,
     );
 
-    // Fetch the RSA modulus n from the on-chain registry and convert to bigint
+    // Fetch the RSA modulus n from the on-chain registry in 17 x 123-bit proof limbs
+    // and reconstruct the integer modulus.
     const kid = this.extractKidFromJwt(jwt);
     const nLimbHexes = await this.fetchNFromRegistry(kid);
     const nBigInt = nLimbHexes.reduce(
-      (acc: bigint, limb: string, i: number) => acc + BigInt(limb) * (1n << (BigInt(i) * 128n)),
+      (acc: bigint, limb: string, i: number) => acc + BigInt(limb) * (PROOF_LIMB_BASE ** BigInt(i)),
       0n,
     );
 
@@ -741,7 +754,7 @@ export class OAuthWalletManager {
       jwt_sub_felt,                                 // jwt_sub [6]
       session.nonce,                                // jwt_nonce [7]
       num.toHex(jwtClaims.exp),                    // jwt_exp [8]
-      this.stringToFelt(kid),                       // jwt_kid [9]
+      this.hashStringToFelt(kid),                   // jwt_kid [9]
       this.stringToFelt(jwtClaims.iss),            // jwt_iss [10]
       this.stringToFelt(jwtClaims.aud),            // jwt_aud [11]
       salt_hex,                                     // salt [12]
@@ -754,17 +767,17 @@ export class OAuthWalletManager {
       num.toHex(offsets.kid_len),                  // kid_len [19]
       num.toHex(16),                               // rsa_sig_len [20]
       ...rsaLimbs,                                 // RSA sig (16 u128 limbs) [21-36]
-      num.toHex(574),                              // witnesses_len [37]
-      // intermediates x1..x16: 16 × 16 = 256 felts [38-293]
+      num.toHex(610),                              // witnesses_len [37]
+      // intermediates x1..x16: 16 × 17 = 272 felts [38-309]
       ...witnesses.intermediates.flatMap((limbs) => limbs.map(h)),
-      // result (16 felts) [294-309]
+      // result (17 felts) [310-326]
       ...witnesses.result.map(h),
-      // quotients q1..q17: 17 × 16 = 272 felts [310-581]
+      // quotients q1..q17: 17 × 17 = 289 felts [327-615]
       ...witnesses.quotients.flatMap((limbs) => limbs.map(h)),
-      // BigT carry polynomial: 30 felt252 coefficients [582-611]
+      // BigT carry polynomial: 32 felt252 coefficients [616-647]
       ...witnesses.carryCoeffs.map(h),
-      num.toHex(signedDataBytes.length),           // jwt_bytes_len [612]
-      ...packedBytes,                              // packed JWT bytes [613+]
+      num.toHex(signedDataBytes.length),           // jwt_bytes_len [648]
+      ...packedBytes,                              // packed JWT bytes [649+]
     ];
 
     // Append policy fields after JWT data
@@ -1059,18 +1072,17 @@ export class OAuthWalletManager {
 
   /**
    * Fetch the RSA modulus n of a JWKS key from the on-chain registry.
-   * Returns the 16 limbs as an array of hex strings (little-endian, limb 0 = LSB).
+   * Returns the 17 proof limbs as an array of hex strings (little-endian, limb 0 = LSB).
    */
   private async fetchNFromRegistry(kid: string): Promise<string[]> {
-    const kidFelt = this.stringToFelt(kid);
+    const kidFelt = this.hashStringToFelt(kid);
     const result = await this.provider.callContract({
       contractAddress: this.config.jwksRegistryAddress,
       entrypoint: 'get_key',
       calldata: [kidFelt],
     });
-    // Slim JWKSKey: [n0..n15 (16 u128), provider (felt252), valid_until (u64), is_active (bool)]
-    // We only need the 16 n limbs (indices 0..15).
-    return (result as string[]).slice(0, 16);
+    // Slim JWKSKey: [n0..n16 (17 x 123-bit limbs), provider, valid_until, is_active]
+    return (result as string[]).slice(0, 17);
   }
 
   private extractKidFromJwt(jwt: string): string {
@@ -1147,6 +1159,11 @@ export class OAuthWalletManager {
       result = result * 256n + BigInt(bytes[i]);
     }
     return num.toHex(result);
+  }
+
+  private hashStringToFelt(str: string): string {
+    const value = byteArray.byteArrayFromString(str);
+    return hash.computePoseidonHashOnElements(CallData.compile(value));
   }
 
   private findClaimOffsets(jwt: string): ClaimOffsets {
