@@ -47,7 +47,7 @@ export interface UseOAuthWalletReturn {
   /** Handle OAuth callback (call after redirect) */
   handleCallback: (authData: string) => Promise<void>;
   /** Execute transaction(s) */
-  execute: (calls: Call | Call[]) => Promise<string>;
+  execute: (calls: Call | Call[], options?: { gasless?: boolean }) => Promise<string>;
   /** Deploy account if not deployed */
   deployAccount: () => Promise<string>;
   /** Log out and clear session */
@@ -198,7 +198,7 @@ export function useOAuthWallet(hookConfig: UseOAuthWalletConfig): UseOAuthWallet
   );
 
   const execute = useCallback(
-    async (calls: Call | Call[]): Promise<string> => {
+    async (calls: Call | Call[], options?: { gasless?: boolean }): Promise<string> => {
       if (!txManager) throw new Error('Transaction manager not initialized');
       if (stage !== 'ready') throw new Error('Not authenticated');
 
@@ -206,7 +206,7 @@ export function useOAuthWallet(hookConfig: UseOAuthWalletConfig): UseOAuthWallet
       setError(null);
 
       try {
-        const hash = await txManager.execute(calls);
+        const hash = await txManager.execute(calls, options);
         return hash;
       } catch (e: any) {
         setError(e.message);

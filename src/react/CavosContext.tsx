@@ -146,8 +146,8 @@ export function CavosProvider({ config, children }: CavosProviderProps) {
     }
   }, [cavos, updateState]);
 
-  const execute = useCallback(async (calls: Call | Call[], _options?: { gasless?: boolean }) => {
-    const txHash = await cavos.execute(calls);
+  const execute = useCallback(async (calls: Call | Call[], options?: { gasless?: boolean }) => {
+    const txHash = await cavos.execute(calls, options);
     // If this was the first tx (JWT path), the session is now registered — update React state
     updateState();
     return txHash;

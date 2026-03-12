@@ -19,6 +19,7 @@ import {
   hash,
   ec,
   Signer,
+  EDAMode,
   type Signature,
   type TypedData,
 } from 'starknet';
@@ -55,7 +56,7 @@ class OAuthSigner extends Signer {
   }
 
   async signTransaction(
-    _transactions: Call[],
+    transactions: Call[],
     details: any
   ): Promise<Signature> {
     const txHash = details.transactionHash || '0x0';
@@ -63,7 +64,7 @@ class OAuthSigner extends Signer {
     if (this.forDeploy) {
       return await this.oauthManager.buildJWTSignatureData(txHash);
     } else {
-      return this.oauthManager.buildSessionSignature(txHash);
+      return this.oauthManager.buildSessionSignature(txHash, transactions);
     }
   }
 
@@ -269,42 +270,264 @@ export class OAuthTransactionManager {
   }
 
   /**
-   * Execute calls using the OAuth wallet with paymaster.
-   * Uses AVNU API with automatic session handling:
-   * - Session NOT registered: Uses JWT signature (registers + executes in one tx)
-   * - Session expired but renewable: Auto-renews then executes
-   * - Session active: Uses lightweight session signature
-   * - Session expired outside grace: Throws error (user must re-login)
+   * Execute calls using the OAuth wallet.
+   *
+   * @param options.gasless - When true (default), gas is sponsored via AVNU Paymaster.
+   *   When false, the wallet pays gas itself (requires STRK balance and a registered session).
+   *
+   * Session handling:
+   * - Session NOT registered: Uses JWT signature (registers + executes in one tx). Requires gasless.
+   * - Session expired but renewable: Auto-renews then executes.
+   * - Session active + gasless: Uses AVNU Paymaster (sponsored).
+   * - Session active + non-gasless: Uses standard Account.execute() (user pays gas).
+   * - Session expired outside grace: Throws — user must re-login.
    */
-  async execute(calls: Call | Call[]): Promise<string> {
+  async execute(calls: Call | Call[], options?: { gasless?: boolean }): Promise<string> {
     const session = this.oauthManager.getSession();
     if (!session?.walletAddress) {
       throw new Error('No valid session');
     }
 
+    const gasless = options?.gasless !== false; // default true
     const callsArray = Array.isArray(calls) ? calls : [calls];
 
     // Check session status on-chain
     const status = await this.getSessionStatus();
-    // Case 1: Session not registered — use JWT to auto-register + execute in one tx
+
+    // Case 1: Session not registered — use JWT to auto-register + execute in one tx (always sponsored)
     if (!status.registered) {
+      if (!gasless) {
+        throw new Error(
+          'Cannot execute a non-sponsored transaction without a registered session. ' +
+          'Execute one sponsored transaction first to register the session on-chain.'
+        );
+      }
       return this.executeWithAVNUAPI(callsArray, session, true);
     }
 
-    // Case 2: Session expired but can be renewed - auto-renew then execute
+    // Case 2: Session expired but can be renewed — auto-renew then execute
     if (status.expired && status.canRenew) {
       const newSession = await this.oauthManager.generateNewSession();
       await this.renewSession(newSession);
-      return this.executeWithAVNUAPI(callsArray, newSession);
+      return gasless
+        ? this.executeWithAVNUAPI(callsArray, newSession)
+        : this.executeWithUserFees(callsArray, newSession);
     }
 
-    // Case 3: Session expired and outside grace period - cannot renew
+    // Case 3: Session expired and outside grace period — cannot proceed
     if (status.expired && !status.canRenew) {
       throw new Error('SESSION_EXPIRED: Session has expired outside grace period. Please login again.');
     }
 
-    // Case 4: Session is active - use session signature (cheap)
-    return this.executeWithAVNUAPI(callsArray, session);
+    // Case 4: Session is active
+    return gasless
+      ? this.executeWithAVNUAPI(callsArray, session)
+      : this.executeWithUserFees(callsArray, session);
+  }
+
+  /**
+   * Execute calls paying gas from the wallet's own balance (no paymaster).
+   *
+   * Bypasses account.execute() entirely — builds, signs, and submits the
+   * v3 INVOKE transaction directly via raw RPC to avoid starknet.js
+   * zeroing out resource_bounds or calling fee estimation with empty sigs.
+   */
+  private async executeWithUserFees(calls: Call[], session: OAuthSession): Promise<string> {
+    if (!session.walletAddress) {
+      throw new Error('No wallet address in session');
+    }
+
+    const rpcUrl = (this.provider as any).channel?.nodeUrl
+      || (this.provider as any).nodeUrl
+      || '';
+    if (!rpcUrl) {
+      throw new Error('Cannot resolve RPC URL from provider');
+    }
+
+    // 1. Get nonce + chainId in parallel
+    const [nonce, chainId] = await Promise.all([
+      this.provider.getNonceForAddress(session.walletAddress),
+      this.provider.getChainId(),
+    ]);
+
+    // 2. Build multicall calldata: [n_calls, to, selector, len, ...data, ...]
+    const calldata: string[] = [num.toHex(calls.length)];
+    for (const call of calls) {
+      calldata.push(num.toHex(call.contractAddress));
+      calldata.push(num.toHex(hash.getSelectorFromName(call.entrypoint)));
+      const cd = (call.calldata as string[] | undefined) ?? [];
+      calldata.push(num.toHex(cd.length));
+      calldata.push(...cd.map(c => num.toHex(c)));
+    }
+
+    // 3. Estimate resource bounds via raw RPC with dummy SESSION_V1 sig
+    const resourceBounds = await this.estimateUserFeeBounds(calls, session, nonce, rpcUrl);
+
+    // 4. Compute the transaction hash — must match EXACTLY what we submit
+    const txHash = hash.calculateInvokeTransactionHash({
+      senderAddress: session.walletAddress,
+      version: '0x3',  // ETransactionVersion3.V3
+      compiledCalldata: calldata,
+      chainId,
+      nonce,
+      accountDeploymentData: [],
+      nonceDataAvailabilityMode: EDAMode.L1,
+      feeDataAvailabilityMode: EDAMode.L1,
+      resourceBounds,
+      tip: 0n,
+      paymasterData: [],
+    });
+
+    console.log('[executeWithUserFees] txHash:', txHash);
+    console.log('[executeWithUserFees] resourceBounds:', resourceBounds);
+
+    // 5. Sign with session key (SESSION_V1 + Merkle proof per call)
+    const signature = this.oauthManager.buildSessionSignature(txHash, calls);
+
+    // 6. Submit directly — no starknet.js Account wrapper involved
+    const resp = await fetch(rpcUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'starknet_addInvokeTransaction',
+        params: {
+          invoke_transaction: {
+            type: 'INVOKE',
+            version: '0x3',
+            sender_address: session.walletAddress,
+            calldata,
+            signature: (signature as string[]).map(s => num.toHex(s)),
+            nonce: num.toHex(nonce),
+            resource_bounds: {
+              l1_gas: {
+                max_amount: num.toHex(resourceBounds.l1_gas.max_amount),
+                max_price_per_unit: num.toHex(resourceBounds.l1_gas.max_price_per_unit),
+              },
+              l2_gas: {
+                max_amount: num.toHex(resourceBounds.l2_gas.max_amount),
+                max_price_per_unit: num.toHex(resourceBounds.l2_gas.max_price_per_unit),
+              },
+              l1_data_gas: {
+                max_amount: num.toHex(resourceBounds.l1_data_gas.max_amount),
+                max_price_per_unit: num.toHex(resourceBounds.l1_data_gas.max_price_per_unit),
+              },
+            },
+            tip: '0x0',
+            paymaster_data: [],
+            account_deployment_data: [],
+            nonce_data_availability_mode: 'L1',
+            fee_data_availability_mode: 'L1',
+          },
+        },
+      }),
+    });
+
+    const json = await resp.json() as any;
+    if (json.error) {
+      throw new Error(`starknet_addInvokeTransaction failed: ${JSON.stringify(json.error)}`);
+    }
+
+    return json.result.transaction_hash;
+  }
+
+  /**
+   * Estimate resource bounds for a user-paid transaction.
+   * Uses a dummy SESSION_V1 signature (non-empty) so __execute__ can read the
+   * magic without going out-of-bounds during SKIP_VALIDATE fee estimation.
+   */
+  private async estimateUserFeeBounds(
+    calls: Call[],
+    session: OAuthSession,
+    nonce: string | number,
+    rpcUrl: string,
+  ): Promise<{
+    l1_gas: { max_amount: bigint; max_price_per_unit: bigint };
+    l2_gas: { max_amount: bigint; max_price_per_unit: bigint };
+    l1_data_gas: { max_amount: bigint; max_price_per_unit: bigint };
+  }> {
+    // SESSION_V1 dummy signature: magic + r + s + pubkey + proof_len=0 per call
+    const dummySig = [
+      '0x53455353494f4e5f5631', // SESSION_V1 magic
+      '0x1',                    // r (dummy)
+      '0x1',                    // s (dummy)
+      session.sessionPubKey || '0x0',
+      ...calls.map(() => '0x0'), // proof_len = 0 for each call
+    ];
+
+    // Build calldata in starknet.js multicall format:
+    // [n_calls, to_1, selector_1, calldata_len_1, ...calldata_1, ...]
+    const calldata: string[] = [num.toHex(calls.length)];
+    for (const call of calls) {
+      calldata.push(num.toHex(call.contractAddress));
+      calldata.push(num.toHex(hash.getSelectorFromName(call.entrypoint)));
+      const cd = (call.calldata as string[] | undefined) ?? [];
+      calldata.push(num.toHex(cd.length));
+      calldata.push(...cd.map(c => num.toHex(c)));
+    }
+
+    const estimateReq = {
+      jsonrpc: '2.0',
+      method: 'starknet_estimateFee',
+      id: 1,
+      params: {
+        request: [
+          {
+            type: 'INVOKE',
+            version: '0x100000000000000000000000000000003',
+            sender_address: session.walletAddress,
+            calldata,
+            signature: dummySig,
+            nonce: num.toHex(nonce),
+            resource_bounds: {
+              l2_gas: { max_amount: '0x0', max_price_per_unit: '0x0' },
+              l1_gas: { max_amount: '0x0', max_price_per_unit: '0x0' },
+              l1_data_gas: { max_amount: '0x0', max_price_per_unit: '0x0' },
+            },
+            tip: '0x0',
+            paymaster_data: [],
+            nonce_data_availability_mode: 'L1',
+            fee_data_availability_mode: 'L1',
+            account_deployment_data: [],
+          },
+        ],
+        block_id: 'latest',
+        simulation_flags: ['SKIP_VALIDATE'],
+      },
+    };
+
+    const resp = await fetch(rpcUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(estimateReq),
+    });
+
+    const json = await resp.json() as any;
+    if (json.error) {
+      throw new Error(`Fee estimation failed: ${JSON.stringify(json.error)}`);
+    }
+
+    const est = Array.isArray(json.result) ? json.result[0] : json.result;
+
+    // SKIP_VALIDATE estimation omits the gas used by __validate__.
+    // Our session-key validation (Poseidon hashing + Merkle proof + ECDSA) consumes
+    // roughly 3-5M L2 gas.  Add a fixed overhead so the tx isn't rejected with
+    // "Out of gas" inside __validate__.
+    const VALIDATION_GAS_OVERHEAD = 5_000_000n;
+
+    const l2Exec   = BigInt(est?.l2_gas_consumed      ?? '0x0') * 2n || 500_000n;
+    const l2Amount = l2Exec + VALIDATION_GAS_OVERHEAD;
+    const l2Price  = BigInt(est?.l2_gas_price          ?? '0x5f5e100') * 2n;
+    const ldAmount = BigInt(est?.l1_data_gas_consumed  ?? '0x0') * 2n || 2_000n;
+    const ldPrice  = BigInt(est?.l1_data_gas_price     ?? '0x5f5e100') * 2n;
+    const l1Price  = BigInt(est?.l1_gas_price          ?? '0x5f5e100') * 2n;
+
+    return {
+      l1_gas:      { max_amount: 0n, max_price_per_unit: l1Price },
+      l2_gas:      { max_amount: l2Amount, max_price_per_unit: l2Price },
+      l1_data_gas: { max_amount: ldAmount, max_price_per_unit: ldPrice },
+    };
   }
 
   /**

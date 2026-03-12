@@ -551,7 +551,7 @@ export class CavosSDK {
    *
    * No manual session registration needed - it's all handled transparently!
    */
-  async execute(calls: Call | Call[], _options?: { gasless?: boolean }): Promise<string> {
+  async execute(calls: Call | Call[], options?: { gasless?: boolean }): Promise<string> {
     if (!this.transactionManager) {
       throw new Error('Wallet not initialized. Please login first.');
     }
@@ -564,7 +564,7 @@ export class CavosSDK {
 
     // The transactionManager.execute() will automatically detect if session is registered
     // and use the appropriate signature type (JWT for first tx, session for subsequent)
-    const txHash = await this.transactionManager.execute(calls);
+    const txHash = await this.transactionManager.execute(calls, options);
 
     // Track transaction for MAU
     const address = this.getAddress();
