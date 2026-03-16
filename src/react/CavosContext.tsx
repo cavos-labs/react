@@ -4,9 +4,20 @@ import { CavosSDK, WalletStatus } from '../CavosSDK';
 import { CavosConfig, UserInfo, OnrampProvider, LoginProvider, Signature, FirebaseCredentials } from '../types';
 import { SessionKeyPolicy } from '../types/session';
 import { Call, type TypedData } from 'starknet';
+import { CavosAuthModal } from './components/CavosAuthModal';
+
+export interface CavosModalConfig {
+  appName?: string;
+  appLogo?: string;
+  providers?: ('google' | 'apple' | 'email')[];
+  primaryColor?: string;
+  onSuccess?: (address: string) => void;
+}
 
 export interface CavosContextValue {
   cavos: CavosSDK;
+  openModal: () => void;
+  closeModal: () => void;
   isAuthenticated: boolean;
   user: UserInfo | null;
   address: string | null;
@@ -47,6 +58,7 @@ const CavosContext = createContext<CavosContextValue | null>(null);
 
 export interface CavosProviderProps {
   config: CavosConfig;
+  modal?: CavosModalConfig;
   children: ReactNode;
 }
 
@@ -58,7 +70,7 @@ const DEFAULT_WALLET_STATUS: WalletStatus = {
   isReady: false,
 };
 
-export function CavosProvider({ config, children }: CavosProviderProps) {
+export function CavosProvider({ config, modal, children }: CavosProviderProps) {
   const [cavos] = useState(() => new CavosSDK(config));
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [user, setUser] = useState<UserInfo | null>(null);
@@ -67,6 +79,10 @@ export function CavosProvider({ config, children }: CavosProviderProps) {
   const [isLoading, setIsLoading] = useState(true);
   const [walletStatus, setWalletStatus] = useState<WalletStatus>(DEFAULT_WALLET_STATUS);
   const [sessionPublicKey, setSessionPublicKey] = useState<string | null>(null);
+  const [modalOpen, setModalOpen] = useState(false);
+
+  const openModal = useCallback(() => setModalOpen(true), []);
+  const closeModal = useCallback(() => setModalOpen(false), []);
 
   const updateState = useCallback(() => {
     setIsAuthenticated(cavos.isAuthenticated());
@@ -81,6 +97,13 @@ export function CavosProvider({ config, children }: CavosProviderProps) {
     const unsubscribe = cavos.onWalletStatusChange(setWalletStatus);
     return unsubscribe;
   }, [cavos]);
+
+  // Auto-open modal if wallet setup is still in progress on page load (e.g. after OAuth redirect)
+  useEffect(() => {
+    if (!isLoading && isAuthenticated && (walletStatus.isDeploying || walletStatus.isRegistering)) {
+      setModalOpen(true);
+    }
+  }, [isLoading, isAuthenticated, walletStatus.isDeploying, walletStatus.isRegistering]);
 
   useEffect(() => {
     const initialize = async () => {
@@ -196,6 +219,8 @@ export function CavosProvider({ config, children }: CavosProviderProps) {
 
   const value: CavosContextValue = {
     cavos,
+    openModal,
+    closeModal,
     isAuthenticated,
     user,
     address,
@@ -229,6 +254,17 @@ export function CavosProvider({ config, children }: CavosProviderProps) {
   return (
     <CavosContext.Provider value={value}>
       {children}
+      {modal !== undefined && (
+        <CavosAuthModal
+          open={modalOpen}
+          onClose={closeModal}
+          onSuccess={modal.onSuccess}
+          appName={modal.appName}
+          appLogo={modal.appLogo}
+          providers={modal.providers}
+          primaryColor={modal.primaryColor}
+        />
+      )}
     </CavosContext.Provider>
   );
 }

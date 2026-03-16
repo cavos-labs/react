@@ -323,7 +323,11 @@ export class CavosSDK {
     this.initializeTransactionManager();
 
     // Store in seen wallets for discovery
-    this.addWalletToSeen(this.oauthWalletManager.getSession()?.jwtClaims?.sub, this.oauthWalletManager.getSession()?.walletName);
+    this.addWalletToSeen(
+      this.oauthWalletManager.getSession()?.jwtClaims?.iss,
+      this.oauthWalletManager.getSession()?.jwtClaims?.sub,
+      this.oauthWalletManager.getSession()?.walletName,
+    );
 
     // Deploy or register session in background (only on login)
     this.deployAccountInBackground();
@@ -412,9 +416,8 @@ export class CavosSDK {
 
           // Track wallet deployment for MAU
           const address = this.getAddress();
-          const email = this.oauthWalletManager.getSession()?.jwtClaims?.sub;
           if (address) {
-            this.analyticsManager.trackWalletDeployment(address, email);
+            this.analyticsManager.trackWalletDeployment(address);
           }
 
           await this.autoRegisterSession();
@@ -431,7 +434,7 @@ export class CavosSDK {
           }
         }
       } else {
-        this.logger.log('Account already deployed. Checking session status...');
+      this.logger.log('Account already deployed. Checking session status...');
         const sessionActive = this.transactionManager
           ? await this.transactionManager.isSessionRegistered()
           : false;
@@ -491,10 +494,11 @@ export class CavosSDK {
       this.logger.log('Auto-registering session on-chain...');
       const txHash = await this.transactionManager.registerCurrentSession();
       this.logger.log('Session registered on-chain. TxHash:', txHash);
+      const status = await this.transactionManager.getSessionStatus();
       this.updateWalletStatus({
         isRegistering: false,
-        isSessionActive: true,
-        isReady: true,
+        isSessionActive: status.active && !status.expired,
+        isReady: status.active && !status.expired,
       });
     } catch (err) {
       this.logger.alwaysError('Auto session registration failed:', err);
@@ -518,7 +522,11 @@ export class CavosSDK {
     this.initializeTransactionManager();
 
     // Store in seen wallets for discovery
-    this.addWalletToSeen(this.oauthWalletManager.getSession()?.jwtClaims?.sub, this.oauthWalletManager.getSession()?.walletName);
+    this.addWalletToSeen(
+      this.oauthWalletManager.getSession()?.jwtClaims?.iss,
+      this.oauthWalletManager.getSession()?.jwtClaims?.sub,
+      this.oauthWalletManager.getSession()?.walletName,
+    );
 
     // Ensure session is registered on-chain (background)
     this.deployAccountInBackground();
@@ -569,7 +577,7 @@ export class CavosSDK {
     // Track transaction for MAU
     const address = this.getAddress();
     if (address) {
-      this.analyticsManager.trackTransaction(txHash, address, 'confirmed');
+      this.analyticsManager.trackTransaction(address);
     }
 
     return txHash;
@@ -613,6 +621,7 @@ export class CavosSDK {
     const session = this.oauthWalletManager.getSession();
     if (!session?.jwtClaims?.sub) return [];
 
+    const issuer = session.jwtClaims.iss;
     const sub = session.jwtClaims.sub;
     const provider = new RpcProvider({ nodeUrl: this.config.starknetRpcUrl! });
 
@@ -625,11 +634,15 @@ export class CavosSDK {
       const SESSION_REGISTERED_KEY = '0x3b884c3fe0cee93e6453d50e9670be6fb54804e1bbbc159a845d9ab244a5ee6';
       const FROM_BLOCK = this.config.network === 'mainnet' ? 6600000 : 0;
       const isBrowser = typeof window !== 'undefined';
-      const seenNamesKey = `cavos_seen_wallets_${this.config.appId}_${sub}`;
+      const seenNamesKey = this.getSeenWalletsStorageKey(issuer, sub);
+      if (!seenNamesKey) {
+        return wallets;
+      }
       const seenNames = isBrowser ? JSON.parse(localStorage.getItem(seenNamesKey) || '[]') : [];
 
       for (const name of seenNames) {
         const addr = this.oauthWalletManager.getAddressSeedManager().computeContractAddress(
+          issuer,
           sub,
           this.config.oauthWallet!.cavosAccountClassHash!,
           this.config.oauthWallet!.jwksRegistryAddress!,
@@ -656,8 +669,8 @@ export class CavosSDK {
 
     // Store in seen wallets for discovery
     const session = this.oauthWalletManager.getSession();
-    if (session?.jwtClaims?.sub) {
-      this.addWalletToSeen(session.jwtClaims.sub, name);
+    if (session?.jwtClaims?.iss && session.jwtClaims.sub) {
+      this.addWalletToSeen(session.jwtClaims.iss, session.jwtClaims.sub, name);
     }
 
     // Check deployment in background for the newly selected wallet
@@ -897,7 +910,7 @@ export class CavosSDK {
     if (!session || !session.jwtClaims) return null;
 
     return {
-      id: session.jwtClaims.sub,
+      id: `${session.jwtClaims.iss}:${session.jwtClaims.sub}`,
       email: session.jwtClaims.email ?? '',
       name: session.jwtClaims.name ?? '',
       picture: session.jwtClaims.picture ?? '',
@@ -1050,13 +1063,25 @@ export class CavosSDK {
   /**
    * Helper to persist a wallet name for discovery
    */
-  private addWalletToSeen(sub: string | undefined, name: string | undefined): void {
-    if (!sub || !name || typeof window === 'undefined') return;
-    const seenNamesKey = `cavos_seen_wallets_${this.config.appId}_${sub}`;
+  private addWalletToSeen(
+    issuer: string | undefined,
+    sub: string | undefined,
+    name: string | undefined,
+  ): void {
+    const seenNamesKey = this.getSeenWalletsStorageKey(issuer, sub);
+    if (!seenNamesKey || !name || typeof window === 'undefined') return;
     const seenNames = JSON.parse(localStorage.getItem(seenNamesKey) || '[]');
     if (!seenNames.includes(name)) {
       seenNames.push(name);
       localStorage.setItem(seenNamesKey, JSON.stringify(seenNames));
     }
+  }
+
+  private getSeenWalletsStorageKey(
+    issuer: string | undefined,
+    sub: string | undefined,
+  ): string | null {
+    if (!issuer || !sub) return null;
+    return `cavos_seen_wallets_${this.config.appId}_${issuer}:${sub}`;
   }
 }

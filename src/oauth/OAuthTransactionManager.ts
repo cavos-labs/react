@@ -134,14 +134,16 @@ export class OAuthTransactionManager {
    */
   async getSessionStatus(): Promise<{
     registered: boolean;
+    active: boolean;
     expired: boolean;
     canRenew: boolean;
+    validAfter?: bigint;
     validUntil?: bigint;
     renewalDeadline?: bigint;
   }> {
     const session = this.oauthManager.getSession();
     if (!session?.walletAddress || !session.sessionPubKey) {
-      return { registered: false, expired: false, canRenew: false };
+      return { registered: false, active: false, expired: false, canRenew: false };
     }
 
     try {
@@ -156,24 +158,25 @@ export class OAuthTransactionManager {
 
       // get_session returns (nonce, valid_after, valid_until, renewal_deadline, registered_at, allowed_contracts_root, max_calls_per_tx)
       const nonce = BigInt(result[0]);
+      const validAfter = BigInt(result[1]);
       const validUntil = BigInt(result[2]);
       const renewalDeadline = BigInt(result[3]);
 
       const registered = nonce !== 0n;
 
       if (!registered) {
-        return { registered: false, expired: false, canRenew: false };
+        return { registered: false, active: false, expired: false, canRenew: false };
       }
 
       const now = BigInt(block.timestamp);
-
+      const active = now >= validAfter;
       const expired = now >= validUntil;
       const canRenew = expired && now < renewalDeadline;
 
-      return { registered, expired, canRenew, validUntil, renewalDeadline };
+      return { registered, active, expired, canRenew, validAfter, validUntil, renewalDeadline };
     } catch (err) {
       console.error('[getSessionStatus] Error calling get_session:', err);
-      return { registered: false, expired: false, canRenew: false };
+      return { registered: false, active: false, expired: false, canRenew: false };
     }
   }
 
@@ -184,7 +187,7 @@ export class OAuthTransactionManager {
    */
   async isSessionRegistered(): Promise<boolean> {
     const status = await this.getSessionStatus();
-    return status.registered && !status.expired;
+    return status.registered && status.active && !status.expired;
   }
 
   /**
@@ -317,6 +320,12 @@ export class OAuthTransactionManager {
     // Case 3: Session expired and outside grace period — cannot proceed
     if (status.expired && !status.canRenew) {
       throw new Error('SESSION_EXPIRED: Session has expired outside grace period. Please login again.');
+    }
+
+    if (!status.active) {
+      throw new Error(
+        `SESSION_NOT_ACTIVE: Session activates at ${status.validAfter?.toString() || 'unknown'}.`
+      );
     }
 
     // Case 4: Session is active

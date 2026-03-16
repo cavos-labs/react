@@ -36,6 +36,7 @@
     "react-dom": "^18.0.0 || ^19.0.0"
   },
   "dependencies": {
+    "@cavos/react": "file:cavos-react-1.1.6.tgz",
     "axios": "^1.7.7",
     "node-fetch": "^3.3.2",
     "starknet": "^9.2.1"

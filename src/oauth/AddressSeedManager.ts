@@ -1,10 +1,10 @@
 /**
  * AddressSeedManager - Computes deterministic wallet addresses from OAuth identity
  *
- * address_seed = Poseidon(sub, salt)
+ * address_seed = Poseidon(issuer, sub, salt)
  *
  * The address_seed uniquely identifies a wallet owner based on their
- * OAuth `sub` claim and a salt value. Same Google account = same wallet.
+ * OAuth issuer + `sub` claim pair and a salt value.
  */
 
 import { hash, num } from 'starknet';
@@ -17,25 +17,30 @@ export class AddressSeedManager {
   }
 
   /**
-   * Compute the address seed from a user's OAuth `sub` claim
-   * MUST match Cairo: PoseidonTrait::new().update(sub).update(salt).update(name).finalize()
+   * Compute the address seed from a user's OAuth issuer + `sub` claim pair.
+   * MUST match Cairo: PoseidonTrait::new().update(iss).update(sub).update(salt)[.update(name)].finalize()
+   * @param issuer The OAuth `iss` claim
    * @param sub The OAuth `sub` claim (user ID)
    * @param name Optional wallet name suffix for deterministic derivation
    */
-  computeAddressSeed(sub: string, name?: string): string {
+  computeAddressSeed(issuer: string, sub: string, name?: string): string {
+    const issuerFelt = this.stringToFelt(issuer);
     // Convert sub to felt252 (hash if too long)
     const subFelt = this.subToFelt(sub);
     const saltFelt = num.toHex(this.salt);
 
     if (name) {
-      // Cairo: PoseidonTrait::new().update(sub).update(salt).update(name).finalize()
+      // Cairo: PoseidonTrait::new().update(iss).update(sub).update(salt).update(name).finalize()
       // Matches computePoseidonHashOnElements (sponge starting at (0,0,0))
-      return hash.computePoseidonHashOnElements([subFelt, saltFelt, this.stringToFelt(name)]);
+      return hash.computePoseidonHashOnElements([
+        issuerFelt,
+        subFelt,
+        saltFelt,
+        this.stringToFelt(name),
+      ]);
     }
 
-    // Cairo: let (h, _, _) = hades_permutation(jwt_sub, salt, 2);
-    // computePoseidonHash(a, b) = hades_permutation(a, b, 2)[0]
-    return hash.computePoseidonHash(subFelt, saltFelt);
+    return hash.computePoseidonHashOnElements([issuerFelt, subFelt, saltFelt]);
   }
 
   /**
@@ -74,12 +79,13 @@ export class AddressSeedManager {
    * @param jwksRegistryAddress The JWKS registry contract address
    */
   computeContractAddress(
+    issuer: string,
     sub: string,
     classHash: string,
     jwksRegistryAddress: string,
     name?: string,
   ): string {
-    const addressSeed = this.computeAddressSeed(sub, name);
+    const addressSeed = this.computeAddressSeed(issuer, sub, name);
 
     // Constructor calldata: [address_seed, jwks_registry]
     const constructorCalldata = [addressSeed, jwksRegistryAddress];

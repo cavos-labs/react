@@ -55,6 +55,12 @@ export interface ClaimOffsets {
   nonce_len: number;
   kid_offset: number;
   kid_len: number;
+  exp_offset: number;
+  exp_len: number;
+  iss_offset: number;
+  iss_len: number;
+  aud_offset: number;
+  aud_len: number;
 }
 
 const SESSION_STORAGE_KEY = 'cavos_oauth_session';
@@ -182,13 +188,19 @@ export class OAuthWalletManager {
     this.config.salt = salt;
     this.addressSeedManager = new AddressSeedManager(salt);
 
-    // If session exists and has a sub claim, re-compute the wallet address
-    if (this.session?.jwtClaims?.sub) {
+    // If session exists and has issuer/sub claims, re-compute the wallet address
+    if (this.session?.jwtClaims?.sub && this.session.jwtClaims.iss) {
+      const issuer = this.session.jwtClaims.iss;
       const sub = this.session.jwtClaims.sub;
 
       // Re-compute with new salt and current name
-      const newAddressSeed = this.addressSeedManager.computeAddressSeed(sub, this.session.walletName);
+      const newAddressSeed = this.addressSeedManager.computeAddressSeed(
+        issuer,
+        sub,
+        this.session.walletName,
+      );
       const newWalletAddress = this.addressSeedManager.computeContractAddress(
+        issuer,
         sub,
         this.config.cavosAccountClassHash,
         this.config.jwksRegistryAddress,
@@ -268,9 +280,11 @@ export class OAuthWalletManager {
       return;
     }
 
+    const issuer = this.session.jwtClaims.iss;
     const sub = this.session.jwtClaims.sub;
-    const addressSeed = this.addressSeedManager.computeAddressSeed(sub, name);
+    const addressSeed = this.addressSeedManager.computeAddressSeed(issuer, sub, name);
     const walletAddress = this.addressSeedManager.computeContractAddress(
+      issuer,
       sub,
       this.config.cavosAccountClassHash,
       this.config.jwksRegistryAddress,
@@ -431,9 +445,14 @@ export class OAuthWalletManager {
     }
 
     // Compute address seed and wallet address
-    const addressSeed = this.addressSeedManager.computeAddressSeed(jwtClaims.sub, this.session.walletName);
+    const addressSeed = this.addressSeedManager.computeAddressSeed(
+      jwtClaims.iss,
+      jwtClaims.sub,
+      this.session.walletName,
+    );
 
     const walletAddress = this.addressSeedManager.computeContractAddress(
+      jwtClaims.iss,
       jwtClaims.sub,
       this.config.cavosAccountClassHash,
       this.config.jwksRegistryAddress,
@@ -529,12 +548,14 @@ export class OAuthWalletManager {
    * [0]      = OAUTH_JWT_V1 magic
    * [1-3]    = session key (r, s, pubkey)
    * [4-5]    = valid_until, randomness
-   * [6-13]   = jwt_sub, jwt_nonce, jwt_exp, jwt_kid, jwt_iss, jwt_aud, salt, wallet_name
-   * [14-19]  = claim offsets (sub_offset, sub_len, nonce_offset, nonce_len, kid_offset, kid_len)
-   * [20]     = garaga_rsa_len (864)
-   * [21-884] = Garaga RSA calldata (sig_24 + expected_msg_24 + 17×48 reductions)
-   * [885]    = jwt_bytes_len
-   * [886+]   = packed JWT bytes (31-byte chunks)
+   * [6-12]   = jwt_sub, jwt_nonce, jwt_exp, jwt_kid, jwt_iss, salt, wallet_name
+   * [13-24]  = claim offsets and lengths:
+   *            sub_offset, sub_len, nonce_offset, nonce_len, kid_offset, kid_len,
+   *            exp_offset, exp_len, iss_offset, iss_len, aud_offset, aud_len
+   * [25]     = garaga_rsa_len (864)
+   * [26-889] = Garaga RSA calldata (sig_24 + expected_msg_24 + 17×48 reductions)
+   * [890]    = jwt_bytes_len
+   * [891+]   = packed JWT bytes (31-byte chunks)
    * [after JWT] = valid_after, allowed_contracts_root, max_calls_per_tx,
    *               spending_policies_count, spending_policies...
    */
@@ -627,10 +648,16 @@ export class OAuthWalletManager {
       num.toHex(offsets.nonce_len),                // nonce_len [16]
       num.toHex(offsets.kid_offset),               // kid_offset [17]
       num.toHex(offsets.kid_len),                  // kid_len [18]
-      num.toHex(864),                              // garaga_rsa_len [19]
-      ...garagaCalldata,                           // Garaga RSA calldata [21-884]
-      num.toHex(signedDataBytes.length),           // jwt_bytes_len [885]
-      ...packedBytes,                              // packed JWT bytes [886+]
+      num.toHex(offsets.exp_offset),               // exp_offset [19]
+      num.toHex(offsets.exp_len),                  // exp_len [20]
+      num.toHex(offsets.iss_offset),               // iss_offset [21]
+      num.toHex(offsets.iss_len),                  // iss_len [22]
+      num.toHex(offsets.aud_offset),               // aud_offset [23]
+      num.toHex(offsets.aud_len),                  // aud_len [24]
+      num.toHex(864),                              // garaga_rsa_len [25]
+      ...garagaCalldata,                           // Garaga RSA calldata [26-889]
+      num.toHex(signedDataBytes.length),           // jwt_bytes_len [890]
+      ...packedBytes,                              // packed JWT bytes [891+]
     ];
 
     // Append policy fields after JWT data
@@ -1035,6 +1062,9 @@ export class OAuthWalletManager {
     const subValue = payloadJson.sub || '';
     const nonceValue = payloadJson.nonce || '';
     const kidValue = headerJson.kid || '';
+    const expValue = String(payloadJson.exp || '');
+    const issValue = payloadJson.iss || '';
+    const audValue = Array.isArray(payloadJson.aud) ? payloadJson.aud[0] : payloadJson.aud || '';
 
     // Get decoded strings to find positions
     const decodedPayload = atob(this.base64UrlToBase64(payload));
@@ -1044,9 +1074,7 @@ export class OAuthWalletManager {
     // The contract will decode the base64 segment and look for claims at these offsets
     // Offsets are relative to each decoded segment, NOT to the full signedData
 
-    // Helper to find claim value start offset in decoded JSON
-    // Searches for the pattern "key":"value" or "key": "value" (with optional space)
-    const findClaimValueOffset = (decoded: string, key: string, value: string): number => {
+    const findStringClaimValueOffset = (decoded: string, key: string, value: string): number => {
       // Try exact pattern first (no space after colon)
       const exactPattern = `"${key}":"${value}"`;
       let idx = decoded.indexOf(exactPattern);
@@ -1081,26 +1109,83 @@ export class OAuthWalletManager {
       return -1;
     };
 
+    const findNumericClaimValueOffset = (decoded: string, key: string, value: string): number => {
+      const exactPattern = `"${key}":${value}`;
+      let idx = decoded.indexOf(exactPattern);
+      if (idx >= 0) {
+        return idx + key.length + 3; // 3 = `":`
+      }
+
+      const spacedPattern = `"${key}": ${value}`;
+      idx = decoded.indexOf(spacedPattern);
+      if (idx >= 0) {
+        return idx + key.length + 4; // 4 = `": `
+      }
+
+      const keyPattern = `"${key}"`;
+      idx = decoded.indexOf(keyPattern);
+      if (idx >= 0) {
+        const colonIdx = decoded.indexOf(':', idx + key.length + 2);
+        if (colonIdx >= 0) {
+          let valueIdx = colonIdx + 1;
+          while (valueIdx < decoded.length && decoded[valueIdx] === ' ') {
+            valueIdx += 1;
+          }
+          return valueIdx;
+        }
+      }
+
+      return -1;
+    };
+
     // Find offsets in the DECODED JSON strings
     // The contract will decode the base64 segment and look for claims at these offsets
     // Offsets are relative to each decoded segment, NOT to the full signedData
 
     // sub is in payload (decoded)
-    const subValueStart = findClaimValueOffset(decodedPayload, 'sub', subValue);
+    const subValueStart = findStringClaimValueOffset(decodedPayload, 'sub', subValue);
     if (subValueStart < 0) {
       throw new Error(`Failed to find sub claim in JWT payload`);
     }
 
     // nonce is in payload (decoded)
-    const nonceValueStart = findClaimValueOffset(decodedPayload, 'nonce', nonceValue);
+    const nonceValueStart = findStringClaimValueOffset(decodedPayload, 'nonce', nonceValue);
     if (nonceValueStart < 0) {
       throw new Error(`Failed to find nonce claim in JWT payload`);
     }
 
     // kid is in header (decoded)
-    const kidValueStart = findClaimValueOffset(decodedHeader, 'kid', kidValue);
+    const kidValueStart = findStringClaimValueOffset(decodedHeader, 'kid', kidValue);
     if (kidValueStart < 0) {
       throw new Error(`Failed to find kid claim in JWT header`);
+    }
+
+    const expValueStart = findNumericClaimValueOffset(decodedPayload, 'exp', expValue);
+    if (expValueStart < 0) {
+      throw new Error(`Failed to find exp claim in JWT payload`);
+    }
+
+    const issValueStart = findStringClaimValueOffset(decodedPayload, 'iss', issValue);
+    if (issValueStart < 0) {
+      throw new Error(`Failed to find iss claim in JWT payload`);
+    }
+
+    let audValueStart = findStringClaimValueOffset(decodedPayload, 'aud', audValue);
+    if (audValueStart < 0 && Array.isArray(payloadJson.aud)) {
+      const exactArrayPattern = `"aud":["${audValue}"`;
+      let idx = decodedPayload.indexOf(exactArrayPattern);
+      if (idx >= 0) {
+        audValueStart = idx + exactArrayPattern.indexOf(audValue);
+      } else {
+        const spacedArrayPattern = `"aud": ["${audValue}"`;
+        idx = decodedPayload.indexOf(spacedArrayPattern);
+        if (idx >= 0) {
+          audValueStart = idx + spacedArrayPattern.indexOf(audValue);
+        }
+      }
+    }
+    if (audValueStart < 0) {
+      throw new Error(`Failed to find aud claim in JWT payload`);
     }
 
     return {
@@ -1110,6 +1195,12 @@ export class OAuthWalletManager {
       nonce_len: nonceValue.length,
       kid_offset: kidValueStart,
       kid_len: kidValue.length,
+      exp_offset: expValueStart,
+      exp_len: expValue.length,
+      iss_offset: issValueStart,
+      iss_len: issValue.length,
+      aud_offset: audValueStart,
+      aud_len: audValue.length,
     };
   }
 
@@ -1258,9 +1349,13 @@ export class OAuthWalletManager {
     }
 
     // Compute address seed and wallet address
-    const addressSeed = this.addressSeedManager.computeAddressSeed(jwtClaims.sub);
+    const addressSeed = this.addressSeedManager.computeAddressSeed(
+      jwtClaims.iss,
+      jwtClaims.sub,
+    );
 
     const walletAddress = this.addressSeedManager.computeContractAddress(
+      jwtClaims.iss,
       jwtClaims.sub,
       this.config.cavosAccountClassHash,
       this.config.jwksRegistryAddress,

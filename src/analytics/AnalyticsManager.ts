@@ -16,7 +16,7 @@ export class AnalyticsManager {
     /**
      * Track wallet deployment
      */
-    async trackWalletDeployment(address: string, email?: string): Promise<void> {
+    async trackWalletDeployment(address: string): Promise<void> {
         if (!this.enabled) return;
 
         try {
@@ -29,7 +29,6 @@ export class AnalyticsManager {
                     address,
                     appId: this.appId,
                     network: this.network,
-                    email,
                 }),
             });
         } catch (error) {
@@ -41,7 +40,7 @@ export class AnalyticsManager {
     /**
      * Track transaction execution
      */
-    async trackTransaction(hash: string, walletAddress: string, status: 'pending' | 'confirmed' | 'failed' = 'pending'): Promise<void> {
+    async trackTransaction(walletAddress: string): Promise<void> {
         if (!this.enabled) return;
 
         try {
@@ -51,10 +50,8 @@ export class AnalyticsManager {
                     'Content-Type': 'application/json',
                 },
                 body: JSON.stringify({
-                    hash,
                     walletAddress,
                     appId: this.appId,
-                    status,
                     network: this.network,
                 }),
             });
