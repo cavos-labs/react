@@ -8,6 +8,6 @@ export const DEFAULT_OAUTH_CONFIG_SEPOLIA: OAuthWalletConfig = {
 
 export const DEFAULT_OAUTH_CONFIG_MAINNET: OAuthWalletConfig = {
     jwksRegistryAddress: '0x076ff6853197538b4d4c925b2c775014fae9b5c14f63262b13f2e49f732e21f7',
-    cavosAccountClassHash: '0x5426dc61fb0cbbe0a04ab63d926f321552ece71e2014c6a42faab493385e0a2',
+    cavosAccountClassHash: '0x2ad2157e5a82103e8d7c4f9d8e931534839cf9a2f6339e3bea9fc622b3a2046',
     salt: '0x0',
 };
