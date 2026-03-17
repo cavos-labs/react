@@ -19,10 +19,13 @@ export interface CavosAuthModalProps {
   appLogo?: string;
   providers?: ('google' | 'apple' | 'email')[];
   primaryColor?: string;
+  /** 'light' (default) or 'dark' */
+  theme?: 'light' | 'dark';
 }
 
-type Screen = 'select' | 'email-password' | 'verify' | 'deploying';
-type EmailMode = 'login' | 'register';
+const cavosLogoBase64 = "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";
+
+type Screen = 'select' | 'magic-link' | 'verify' | 'deploying';
 
 
 // ─── Style injection ──────────────────────────────────────────────────────────
@@ -39,6 +42,10 @@ function injectStyles() {
     @keyframes cavos-up {
       from { opacity:0; transform:translateY(12px) scale(0.985); }
       to   { opacity:1; transform:translateY(0)    scale(1);     }
+    }
+    @keyframes cavos-sheet {
+      from { transform:translateY(100%); }
+      to   { transform:translateY(0); }
     }
     @keyframes cavos-spin {
       from { transform:rotate(0deg); } to { transform:rotate(360deg); }
@@ -69,7 +76,7 @@ function injectStyles() {
       box-shadow: 0 0 0 3px rgba(0,0,0,0.06) !important;
     }
     .cavos-input-inner:focus { outline:none; }
-    .cavos-provider:hover { background:#f7f7f7 !important; }
+    .cavos-provider:hover { filter: brightness(1.08) !important; }
     .cavos-provider:active { transform:scale(0.99); }
     .cavos-close:hover { background:rgba(0,0,0,0.05) !important; }
     .cavos-sub-btn:hover { color:rgba(0,0,0,0.6) !important; }
@@ -104,11 +111,8 @@ const EmailIcon = () => (
   </svg>
 );
 
-const CavosLogo = () => (
-  <svg width="12" height="12" viewBox="0 0 32 32" fill="currentColor">
-    <circle cx="16" cy="16" r="16" fillOpacity="0.2"/>
-    <circle cx="16" cy="16" r="8"/>
-  </svg>
+const CavosLogo = ({ invert }: { invert?: boolean }) => (
+  <img src={`data:image/png;base64,${cavosLogoBase64}`} alt="Cavos" style={{ width: 'auto', height: '16px', objectFit: 'contain', opacity: 0.55, flexShrink: 0, filter: invert ? 'invert(1)' : 'none' }} />
 );
 
 function Spinner({ size = 16, color = '#888' }: { size?: number; color?: string }) {
@@ -123,27 +127,59 @@ function Spinner({ size = 16, color = '#888' }: { size?: number; color?: string 
 
 // ─── Shared layout shells ─────────────────────────────────────────────────────
 
-const base: CSSProperties = {
-  position: 'fixed', inset: 0,
-  background: 'rgba(0,0,0,0.5)',
-  backdropFilter: 'blur(10px)',
-  WebkitBackdropFilter: 'blur(10px)',
-  zIndex: 9999,
-  display: 'flex', alignItems: 'center', justifyContent: 'center',
-  padding: '16px',
-  animation: 'cavos-fade 0.18s ease',
-  fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif',
-};
+// ─── Mobile detection hook ────────────────────────────────────────────────────
 
-const whiteCard: CSSProperties = {
-  background: '#ffffff',
-  borderRadius: '22px',
-  width: '100%',
-  maxWidth: '400px',
-  boxShadow: '0 24px 60px rgba(0,0,0,0.22), 0 0 0 1px rgba(0,0,0,0.05)',
-  animation: 'cavos-up 0.25s cubic-bezier(0.22,1,0.36,1)',
-  overflow: 'hidden',
-};
+function useIsMobile() {
+  const [isMobile, setIsMobile] = useState(false);
+  useEffect(() => {
+    const mq = window.matchMedia('(max-width: 640px)');
+    setIsMobile(mq.matches);
+    const handler = (e: MediaQueryListEvent) => setIsMobile(e.matches);
+    mq.addEventListener('change', handler);
+    return () => mq.removeEventListener('change', handler);
+  }, []);
+  return isMobile;
+}
+
+// ─── Style helpers ────────────────────────────────────────────────────────────
+
+const FONT = '-apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif';
+
+function baseOverlay(isMobile: boolean): CSSProperties {
+  return {
+    position: 'fixed', inset: 0,
+    background: 'rgba(0,0,0,0.5)',
+    backdropFilter: 'blur(10px)',
+    WebkitBackdropFilter: 'blur(10px)',
+    zIndex: 9999,
+    display: 'flex',
+    alignItems: isMobile ? 'flex-end' : 'center',
+    justifyContent: 'center',
+    padding: isMobile ? '0' : '16px',
+    animation: 'cavos-fade 0.18s ease',
+    fontFamily: FONT,
+  };
+}
+
+function lightCard(isMobile: boolean, bg: string): CSSProperties {
+  return isMobile ? {
+    background: bg,
+    borderRadius: '20px 20px 0 0',
+    width: '100%',
+    maxWidth: '100%',
+    boxShadow: '0 -8px 40px rgba(0,0,0,0.18)',
+    animation: 'cavos-sheet 0.32s cubic-bezier(0.22,1,0.36,1)',
+    overflow: 'hidden',
+  } : {
+    background: bg,
+    borderRadius: '22px',
+    width: '100%',
+    maxWidth: '400px',
+    boxShadow: '0 24px 60px rgba(0,0,0,0.22), 0 0 0 1px rgba(0,0,0,0.05)',
+    animation: 'cavos-up 0.25s cubic-bezier(0.22,1,0.36,1)',
+    overflow: 'hidden',
+  };
+}
 
 const darkCard: CSSProperties = {
   background: '#0d0d0d',
@@ -155,36 +191,52 @@ const darkCard: CSSProperties = {
   overflow: 'hidden',
 };
 
-const providerBtn: CSSProperties = {
-  width: '100%',
-  display: 'flex', alignItems: 'center', gap: '12px',
-  padding: '13px 16px',
-  background: '#fff',
-  border: '1px solid rgba(0,0,0,0.1)',
-  borderRadius: '12px',
-  cursor: 'pointer',
-  fontSize: '14px',
-  fontWeight: 500,
-  color: '#111',
-  textAlign: 'left',
-  fontFamily: 'inherit',
-  transition: 'background 0.15s, transform 0.1s',
-};
+function providerBtn(bg: string, textColor: string): CSSProperties {
+  return {
+    width: '100%',
+    display: 'flex', alignItems: 'center', gap: '12px',
+    padding: '13px 16px',
+    background: bg,
+    border: `1px solid ${textColor === '#111111' || textColor === '#111' ? 'rgba(0,0,0,0.1)' : 'rgba(255,255,255,0.1)'}`,
+    borderRadius: '12px',
+    cursor: 'pointer',
+    fontSize: '14px',
+    fontWeight: 500,
+    color: textColor,
+    textAlign: 'left',
+    fontFamily: 'inherit',
+    transition: 'background 0.15s, transform 0.1s',
+  };
+}
 
-const footerBar: CSSProperties = {
-  borderTop: '1px solid rgba(0,0,0,0.06)',
-  padding: '12px 20px',
-  display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '5px',
-  fontSize: '11px', color: 'rgba(0,0,0,0.28)',
-};
+function footerBar(textColor: string): CSSProperties {
+  const isLight = textColor === '#111111' || textColor === '#111';
+  return {
+    borderTop: `1px solid ${isLight ? 'rgba(0,0,0,0.06)' : 'rgba(255,255,255,0.06)'}`,
+    padding: '12px 20px',
+    display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '5px',
+    fontSize: '11px',
+    color: isLight ? 'rgba(0,0,0,0.28)' : 'rgba(255,255,255,0.28)',
+  };
+}
 
-const closeBtn: CSSProperties = {
-  position: 'absolute', top: '16px', right: '16px',
-  width: '28px', height: '28px', borderRadius: '50%',
-  border: 'none', background: 'transparent',
-  cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
-  color: 'rgba(0,0,0,0.3)', padding: 0, transition: 'background 0.15s',
-};
+function closeBtn(textColor: string): CSSProperties {
+  return {
+    position: 'absolute', top: '16px', right: '16px',
+    width: '28px', height: '28px', borderRadius: '50%',
+    border: 'none', background: 'transparent',
+    cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
+    color: textColor === '#111111' || textColor === '#111' ? 'rgba(0,0,0,0.3)' : 'rgba(255,255,255,0.4)',
+    padding: 0, transition: 'background 0.15s',
+  };
+}
+
+function mobileHandle(): CSSProperties {
+  return {
+    width: '36px', height: '4px', borderRadius: '2px',
+    background: 'rgba(0,0,0,0.15)', margin: '12px auto 0',
+  };
+}
 
 const CloseX = () => (
   <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
@@ -201,16 +253,34 @@ export function CavosAuthModal({
   appName,
   providers = ['google', 'apple', 'email'],
   primaryColor = '#0A0908',
+  theme = 'light',
 }: CavosAuthModalProps) {
-  const { cavos, login, register, isAuthenticated, address, isLoading } = useCavos();
+  const { cavos, login, sendMagicLink, isAuthenticated, address, isLoading } = useCavos();
+  const isMobile = useIsMobile();
+
+  // Theme-derived values
+  const isLight = theme !== 'dark';
+  const backgroundColor = isLight ? '#ffffff' : '#111111';
+  const textColor = isLight ? '#111111' : '#ffffff';
+  const subTextColor = isLight ? 'rgba(0,0,0,0.4)' : 'rgba(255,255,255,0.4)';
+  const inputBg = isLight ? '#fff' : 'rgba(255,255,255,0.06)';
+  const inputBorder = isLight ? '1px solid rgba(0,0,0,0.12)' : '1px solid rgba(255,255,255,0.12)';
+  const errBg = isLight ? 'rgba(239,68,68,0.06)' : 'rgba(239,68,68,0.08)';
+  const errColor = isLight ? '#dc2626' : '#f87171';
+  const errBorder = isLight ? 'rgba(239,68,68,0.18)' : 'rgba(239,68,68,0.2)';
+  const card = lightCard(isMobile, backgroundColor);
+  const overlay = baseOverlay(isMobile);
+  const handle = mobileHandle();
+  const footer = footerBar(textColor);
+  const close = closeBtn(textColor);
+  const pBtn = providerBtn(inputBg, textColor);
 
   const [screen, setScreen] = useState<Screen>('select');
-  const [emailMode, setEmailMode] = useState<EmailMode>('login');
   const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const [deployState, setDeployState] = useState<'loading' | 'done'>('loading');
+  const [resendCountdown, setResendCountdown] = useState(0);
 
   const doneHandledRef = useRef(false);
   const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -237,7 +307,7 @@ export function CavosAuthModal({
       onCloseRef.current();
       setScreen('select');
       setDeployState('loading');
-      setEmail(''); setPassword(''); setError('');
+      setEmail(''); setError('');
       doneHandledRef.current = false;
     }, 1600);
   }, []);
@@ -265,25 +335,14 @@ export function CavosAuthModal({
       if (status.isReady && address) triggerDone(address);
     });
 
-    // 3. Poll isAccountDeployed every 3s as fallback
-    //    (handles case where SDK emits isReady:true but React misses the event)
-    pollIntervalRef.current = setInterval(async () => {
+    // 3. Poll getWalletStatus every 2s as fallback
+    //    (handles case where SDK emits isReady:true before the listener was registered)
+    pollIntervalRef.current = setInterval(() => {
       const status = cavos.getWalletStatus();
       if (status.isReady && address) {
         triggerDone(address);
-        return;
       }
-      // Hard fallback: if deployed + not deploying/registering for >0 checks, close anyway
-      // so the user isn't stuck forever (wallet is usable via JWT path)
-      try {
-        const deployed = await cavos.isAccountDeployed();
-        const fresh = cavos.getWalletStatus();
-        if (deployed && !fresh.isDeploying && !fresh.isRegistering && address) {
-          // Wallet deployed and no active operation — usable even without session registration
-          triggerDone(address);
-        }
-      } catch { /* ignore poll errors */ }
-    }, 3000);
+    }, 2000);
 
     return () => {
       unsub();
@@ -299,7 +358,7 @@ export function CavosAuthModal({
 
   const handleClose = () => {
     if (screen === 'deploying') return;
-    setScreen('select'); setError('');
+    setScreen('select'); setEmail(''); setError('');
     doneHandledRef.current = false;
     onCloseRef.current();
   };
@@ -314,344 +373,169 @@ export function CavosAuthModal({
     }
   };
 
-  const handleEmailSubmit = async (e: React.FormEvent) => {
+  const handleMagicLinkSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!email || !password) return;
+    if (!email) return;
     setError(''); setBusy(true);
     try {
-      if (emailMode === 'login') {
-        await login('firebase', { email, password });
-      } else {
-        await register('firebase', { email, password });
-        setScreen('verify'); setBusy(false); return;
-      }
+      await sendMagicLink(email);
+      setScreen('verify');
+      setResendCountdown(60);
     } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : '';
-      if (msg.toLowerCase().includes('verif')) {
-        setScreen('verify');
-      } else {
-        setError(msg || 'Authentication failed.');
-      }
+      setError(e instanceof Error ? e.message : 'Failed to send magic link.');
+    } finally {
       setBusy(false);
     }
   };
 
+  const handleResend = async () => {
+    if (resendCountdown > 0) return;
+    setError('');
+    try {
+      await sendMagicLink(email);
+      setResendCountdown(60);
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : 'Failed to resend.');
+    }
+  };
+
+  // Countdown timer for resend button
+  useEffect(() => {
+    if (resendCountdown <= 0) return;
+    const t = setTimeout(() => setResendCountdown(c => c - 1), 1000);
+    return () => clearTimeout(t);
+  }, [resendCountdown]);
+
   if (!open) return null;
 
-  // ── Deploying ──────────────────────────────────────────────────────────────
+  // ── Deploying ─────────────────────────────────────────────────────────────
 
   if (screen === 'deploying') {
     const isDone = deployState === 'done';
     return (
-      <div style={base} role="dialog" aria-modal>
-        <div style={darkCard}>
-          <div style={{
-            padding: '52px 28px 44px',
-            display: 'flex', flexDirection: 'column', alignItems: 'center',
-            textAlign: 'center', gap: '16px',
-          }}>
-            {/* Icon: spinner or checkmark */}
+      <div style={overlay} role="dialog" aria-modal>
+        <div style={card}>
+          {isMobile && <div style={handle} />}
+          <div style={{ padding: '52px 28px 44px', display: 'flex', flexDirection: 'column', alignItems: 'center', textAlign: 'center', gap: '16px' }}>
             {isDone ? (
-              <div
-                className="cavos-check-circle"
-                style={{
-                  width: 64, height: 64, borderRadius: '50%',
-                  background: 'rgba(34,197,94,0.12)',
-                  border: '1.5px solid rgba(34,197,94,0.35)',
-                  display: 'flex', alignItems: 'center', justifyContent: 'center',
-                  animation: 'cavos-ring-glow 1.5s ease-out',
-                }}
-              >
+              <div className="cavos-check-circle" style={{ width: 64, height: 64, borderRadius: '50%', background: 'rgba(34,197,94,0.12)', border: '1.5px solid rgba(34,197,94,0.35)', display: 'flex', alignItems: 'center', justifyContent: 'center', animation: 'cavos-ring-glow 1.5s ease-out' }}>
                 <svg width="28" height="28" viewBox="0 0 24 24" fill="none">
-                  <polyline
-                    className="cavos-check-path"
-                    points="20 6 9 17 4 12"
-                    stroke="#22c55e"
-                    strokeWidth="2.2"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                  />
+                  <polyline className="cavos-check-path" points="20 6 9 17 4 12" stroke="#22c55e" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" />
                 </svg>
               </div>
             ) : (
-              <div style={{
-                width: 64, height: 64, borderRadius: '50%',
-                background: 'rgba(255,255,255,0.04)',
-                border: '1.5px solid rgba(255,255,255,0.08)',
-                display: 'flex', alignItems: 'center', justifyContent: 'center',
-              }}>
-                <Spinner size={26} color="rgba(255,255,255,0.6)" />
+              <div style={{ width: 64, height: 64, borderRadius: '50%', background: isLight ? 'rgba(0,0,0,0.04)' : 'rgba(255,255,255,0.04)', border: `1.5px solid ${isLight ? 'rgba(0,0,0,0.08)' : 'rgba(255,255,255,0.08)'}`, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                <Spinner size={26} color={isLight ? 'rgba(0,0,0,0.4)' : 'rgba(255,255,255,0.6)'} />
               </div>
             )}
-
-            {/* Text */}
             <div>
-              <h2 style={{
-                margin: 0, fontSize: '17px', fontWeight: 600,
-                color: '#fff', letterSpacing: '-0.02em',
-                transition: 'opacity 0.3s',
-              }}>
+              <h2 style={{ margin: 0, fontSize: '17px', fontWeight: 600, color: textColor, letterSpacing: '-0.02em' }}>
                 {isDone ? "You're all set" : 'Setting up your account'}
               </h2>
-              <p style={{
-                margin: '6px 0 0', fontSize: '13px',
-                color: 'rgba(255,255,255,0.35)',
-              }}>
+              <p style={{ margin: '6px 0 0', fontSize: '13px', color: subTextColor }}>
                 {isDone ? 'Your wallet is ready' : 'This only takes a moment…'}
               </p>
             </div>
           </div>
-
-          <div style={{ ...footerBar, borderTop: '1px solid rgba(255,255,255,0.05)', color: 'rgba(255,255,255,0.18)' }}>
-            <CavosLogo /><span>Secured by Cavos</span>
-          </div>
+          <div style={footer}><CavosLogo invert={!isLight} /><span>Secured by Cavos</span></div>
         </div>
       </div>
     );
   }
 
-  // ── Verify email ───────────────────────────────────────────────────────────
+  // ── Check your inbox ───────────────────────────────────────────────────────
 
   if (screen === 'verify') {
     return (
-      <div style={base} role="dialog" aria-modal onClick={e => { if (e.target === e.currentTarget) handleClose(); }}>
-        <div style={{ ...whiteCard, position: 'relative' }}>
-          <button className="cavos-close" style={closeBtn} onClick={handleClose} aria-label="Close">
-            <CloseX />
-          </button>
-          <div style={{ padding: '40px 24px 24px', textAlign: 'center' }}>
-            <div style={{
-              width: 48, height: 48, borderRadius: '50%', margin: '0 auto 16px',
-              background: 'rgba(34,197,94,0.08)', border: '1px solid rgba(34,197,94,0.18)',
-              display: 'flex', alignItems: 'center', justifyContent: 'center',
-            }}>
+      <div style={overlay} role="dialog" aria-modal onClick={e => { if (e.target === e.currentTarget) handleClose(); }}>
+        <div style={{ ...card, position: 'relative' }}>
+          {isMobile && <div style={handle} />}
+          <button className="cavos-close" style={close} onClick={handleClose} aria-label="Close"><CloseX /></button>
+          <div style={{ padding: isMobile ? '28px 24px 32px' : '40px 24px 24px', textAlign: 'center' }}>
+            <div style={{ width: 48, height: 48, borderRadius: '50%', margin: '0 auto 16px', background: 'rgba(34,197,94,0.08)', border: '1px solid rgba(34,197,94,0.18)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
               <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#22c55e" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                 <path d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"/>
               </svg>
             </div>
-            <h2 style={{ margin: '0 0 8px', fontSize: '17px', fontWeight: 600, color: '#111', letterSpacing: '-0.02em' }}>
-              Check your inbox
-            </h2>
-            <p style={{ margin: '0 0 22px', fontSize: '13px', color: 'rgba(0,0,0,0.45)', lineHeight: 1.55 }}>
-              We sent a link to <strong style={{ color: '#111', fontWeight: 500 }}>{email}</strong>.<br/>Click it to verify your account.
+            <h2 style={{ margin: '0 0 8px', fontSize: '17px', fontWeight: 600, color: textColor, letterSpacing: '-0.02em' }}>Check your inbox</h2>
+            <p style={{ margin: '0 0 22px', fontSize: '13px', color: subTextColor, lineHeight: 1.55 }}>
+              We sent a sign-in link to <strong style={{ color: textColor, fontWeight: 500 }}>{email}</strong>.<br />Open it on this device to continue.
             </p>
-            <button
-              className="cavos-primary-btn"
-              style={{
-                width: '100%', padding: '12px', borderRadius: '12px', border: 'none',
-                background: primaryColor, color: '#fff', fontSize: '14px', fontWeight: 500,
-                cursor: 'pointer', fontFamily: 'inherit', transition: 'opacity 0.15s, transform 0.1s',
-                marginBottom: '8px',
-              }}
-              onClick={() => { setScreen('email-password'); setError(''); }}
-            >
-              Back to sign in
+            {error && <div style={{ background: errBg, border: `1px solid ${errBorder}`, borderRadius: '10px', padding: '9px 13px', fontSize: '13px', color: errColor, marginBottom: '14px' }}>{error}</div>}
+            <button className="cavos-primary-btn" style={{ width: '100%', padding: '12px', borderRadius: '12px', border: 'none', background: resendCountdown > 0 ? (isLight ? 'rgba(0,0,0,0.06)' : 'rgba(255,255,255,0.08)') : primaryColor, color: resendCountdown > 0 ? subTextColor : '#fff', fontSize: '14px', fontWeight: 500, cursor: resendCountdown > 0 ? 'default' : 'pointer', fontFamily: 'inherit', transition: 'opacity 0.15s', marginBottom: '8px' }} onClick={handleResend} disabled={resendCountdown > 0}>
+              {resendCountdown > 0 ? `Resend in ${resendCountdown}s` : 'Resend link'}
+            </button>
+            <button className="cavos-sub-btn" style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: '13px', color: subTextColor, width: '100%', textAlign: 'center', padding: '8px 0 0', fontFamily: 'inherit', transition: 'color 0.15s' }} onClick={() => { setScreen('magic-link'); setError(''); }}>
+              Use a different email
             </button>
           </div>
-          <div style={footerBar}><CavosLogo /><span>Secured by Cavos</span></div>
+          <div style={footer}><CavosLogo invert={!isLight} /><span>Secured by Cavos</span></div>
         </div>
       </div>
     );
   }
 
-  // ── Email + password form ──────────────────────────────────────────────────
+  // ── Magic link email form ──────────────────────────────────────────────────
 
-  if (screen === 'email-password') {
+  if (screen === 'magic-link') {
     return (
-      <div style={base} role="dialog" aria-modal onClick={e => { if (e.target === e.currentTarget) handleClose(); }}>
-        <div style={{ ...whiteCard, position: 'relative' }}>
-          {/* Back button */}
-          <button
-            className="cavos-close"
-            style={{ ...closeBtn, left: '16px', right: 'auto' }}
-            onClick={() => { setScreen('select'); setError(''); }}
-            aria-label="Back"
-          >
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M19 12H5M12 5l-7 7 7 7"/>
-            </svg>
+      <div style={overlay} role="dialog" aria-modal onClick={e => { if (e.target === e.currentTarget) handleClose(); }}>
+        <div style={{ ...card, position: 'relative' }}>
+          {isMobile && <div style={handle} />}
+          <button className="cavos-close" style={{ ...close, left: '16px', right: 'auto' }} onClick={() => { setScreen('select'); setError(''); }} aria-label="Back">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M19 12H5M12 5l-7 7 7 7"/></svg>
           </button>
-          <button className="cavos-close" style={closeBtn} onClick={handleClose} aria-label="Close">
-            <CloseX />
-          </button>
-
-          <div style={{ padding: '52px 22px 22px' }}>
-            <h2 style={{
-              margin: '0 0 20px', fontSize: '17px', fontWeight: 600,
-              color: '#111', letterSpacing: '-0.02em', textAlign: 'center',
-            }}>
-              {emailMode === 'login' ? 'Sign in with email' : 'Create your account'}
-            </h2>
-
-            {error && (
-              <div style={{
-                background: 'rgba(239,68,68,0.06)', border: '1px solid rgba(239,68,68,0.18)',
-                borderRadius: '10px', padding: '10px 14px',
-                fontSize: '13px', color: '#dc2626', marginBottom: '14px',
-              }}>
-                {error}
-              </div>
-            )}
-
-            <form onSubmit={handleEmailSubmit} style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
-              <input
-                className="cavos-input-inner"
-                style={{
-                  width: '100%', padding: '12px 14px',
-                  border: '1px solid rgba(0,0,0,0.12)', borderRadius: '12px',
-                  fontSize: '14px', color: '#111', background: '#fff',
-                  fontFamily: 'inherit', boxSizing: 'border-box',
-                  transition: 'border-color 0.15s',
-                }}
-                type="email"
-                placeholder="your@email.com"
-                value={email}
-                onChange={e => setEmail(e.target.value)}
-                required
-                disabled={busy}
-                autoFocus
-              />
-              <input
-                className="cavos-input-inner"
-                style={{
-                  width: '100%', padding: '12px 14px',
-                  border: '1px solid rgba(0,0,0,0.12)', borderRadius: '12px',
-                  fontSize: '14px', color: '#111', background: '#fff',
-                  fontFamily: 'inherit', boxSizing: 'border-box',
-                  transition: 'border-color 0.15s',
-                }}
-                type="password"
-                placeholder="Password"
-                value={password}
-                onChange={e => setPassword(e.target.value)}
-                required
-                disabled={busy}
-                minLength={emailMode === 'register' ? 8 : undefined}
-              />
-
-              <button
-                type="submit"
-                className="cavos-primary-btn"
-                style={{
-                  width: '100%', padding: '12px', marginTop: '4px',
-                  borderRadius: '12px', border: 'none',
-                  background: primaryColor, color: '#fff',
-                  fontSize: '14px', fontWeight: 500,
-                  cursor: 'pointer', fontFamily: 'inherit',
-                  display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px',
-                  transition: 'opacity 0.15s, transform 0.1s',
-                  opacity: busy ? 0.65 : 1,
-                }}
-                disabled={busy || isLoading}
-              >
+          <button className="cavos-close" style={close} onClick={handleClose} aria-label="Close"><CloseX /></button>
+          <div style={{ padding: isMobile ? '28px 22px 32px' : '52px 22px 22px' }}>
+            <h2 style={{ margin: '0 0 6px', fontSize: '17px', fontWeight: 600, color: textColor, letterSpacing: '-0.02em', textAlign: 'center' }}>Sign in with email</h2>
+            <p style={{ margin: '0 0 20px', fontSize: '13px', color: subTextColor, textAlign: 'center', lineHeight: 1.5 }}>We'll send a secure sign-in link to your inbox.</p>
+            {error && <div style={{ background: errBg, border: `1px solid ${errBorder}`, borderRadius: '10px', padding: '10px 14px', fontSize: '13px', color: errColor, marginBottom: '14px' }}>{error}</div>}
+            <form onSubmit={handleMagicLinkSubmit} style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+              <input className="cavos-input-inner" style={{ width: '100%', padding: '12px 14px', border: inputBorder, borderRadius: '12px', fontSize: '14px', color: textColor, background: inputBg, fontFamily: 'inherit', boxSizing: 'border-box', transition: 'border-color 0.15s' }} type="email" placeholder="your@email.com" value={email} onChange={e => setEmail(e.target.value)} required disabled={busy} autoFocus />
+              <button type="submit" className="cavos-primary-btn" style={{ width: '100%', padding: '12px', marginTop: '4px', borderRadius: '12px', border: 'none', background: primaryColor, color: '#fff', fontSize: '14px', fontWeight: 500, cursor: 'pointer', fontFamily: 'inherit', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px', transition: 'opacity 0.15s, transform 0.1s', opacity: busy ? 0.65 : 1 }} disabled={busy || isLoading}>
                 {busy && <Spinner size={15} color="#fff" />}
-                {busy ? 'Continuing…' : emailMode === 'login' ? 'Sign in' : 'Create account'}
+                {busy ? 'Sending…' : 'Send magic link'}
               </button>
             </form>
-
-            <button
-              className="cavos-sub-btn"
-              style={{
-                background: 'none', border: 'none', cursor: 'pointer',
-                fontSize: '13px', color: 'rgba(0,0,0,0.38)',
-                width: '100%', textAlign: 'center', padding: '12px 0 0',
-                fontFamily: 'inherit', transition: 'color 0.15s',
-              }}
-              onClick={() => { setEmailMode(m => m === 'login' ? 'register' : 'login'); setError(''); }}
-            >
-              {emailMode === 'login'
-                ? <>No account? <strong style={{ color: '#111', fontWeight: 500 }}>Sign up</strong></>
-                : <>Have an account? <strong style={{ color: '#111', fontWeight: 500 }}>Sign in</strong></>
-              }
-            </button>
           </div>
-
-          <div style={footerBar}><CavosLogo /><span>Secured by Cavos</span></div>
+          <div style={footer}><CavosLogo invert={!isLight} /><span>Secured by Cavos</span></div>
         </div>
       </div>
     );
   }
 
-  // ── Provider selection (main screen) ───────────────────────────────────────
+  // ── Provider selection ─────────────────────────────────────────────────────
 
   const showEmail = providers.includes('email');
   const showGoogle = providers.includes('google');
   const showApple = providers.includes('apple');
 
   return (
-    <div style={base} role="dialog" aria-modal onClick={e => { if (e.target === e.currentTarget) handleClose(); }}>
-      <div style={{ ...whiteCard, position: 'relative' }}>
-        <button className="cavos-close" style={closeBtn} onClick={handleClose} aria-label="Close">
-          <CloseX />
-        </button>
+    <div style={overlay} role="dialog" aria-modal onClick={e => { if (e.target === e.currentTarget) handleClose(); }}>
+      <div style={{ ...card, position: 'relative' }}>
+        {isMobile && <div style={handle} />}
+        <button className="cavos-close" style={close} onClick={handleClose} aria-label="Close"><CloseX /></button>
 
-        <div style={{ padding: '40px 22px 22px' }}>
-          {/* Title */}
-          <h2 style={{
-            margin: '0 0 22px', fontSize: '17px', fontWeight: 600,
-            color: '#111', letterSpacing: '-0.02em', textAlign: 'center',
-          }}>
+        <div style={{ padding: isMobile ? '20px 20px 32px' : '40px 22px 22px' }}>
+          <h2 style={{ margin: '0 0 22px', fontSize: '17px', fontWeight: 600, color: textColor, letterSpacing: '-0.02em', textAlign: 'center' }}>
             {appName ? `Sign in to ${appName}` : 'Log in or sign up'}
           </h2>
 
           <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
-
-            {/* Email inline input row — shown first like Privy */}
             {showEmail && (
-              <div
-                className="cavos-input-row"
-                style={{
-                  display: 'flex', alignItems: 'center',
-                  border: '1px solid rgba(0,0,0,0.1)', borderRadius: '12px',
-                  overflow: 'hidden', background: '#fff',
-                  transition: 'border-color 0.15s, box-shadow 0.15s',
-                }}
-              >
-                <div style={{ padding: '0 12px', color: 'rgba(0,0,0,0.3)', display: 'flex', alignItems: 'center', flexShrink: 0 }}>
-                  <EmailIcon />
-                </div>
-                <input
-                  className="cavos-input-inner"
-                  style={{
-                    flex: 1, padding: '13px 0', border: 'none', background: 'transparent',
-                    fontSize: '14px', color: '#111', fontFamily: 'inherit',
-                  }}
-                  type="email"
-                  placeholder="your@email.com"
-                  value={email}
-                  onChange={e => setEmail(e.target.value)}
-                  onKeyDown={e => {
-                    if (e.key === 'Enter' && email) {
-                      setScreen('email-password');
-                    }
-                  }}
-                  disabled={busy || isLoading}
-                />
+              <div className="cavos-input-row" style={{ display: 'flex', alignItems: 'center', border: isLight ? '1px solid rgba(0,0,0,0.1)' : '1px solid rgba(255,255,255,0.1)', borderRadius: '12px', overflow: 'hidden', background: inputBg, transition: 'border-color 0.15s, box-shadow 0.15s' }}>
+                <div style={{ padding: '0 12px', color: subTextColor, display: 'flex', alignItems: 'center', flexShrink: 0 }}><EmailIcon /></div>
+                <input className="cavos-input-inner" style={{ flex: 1, padding: '13px 0', border: 'none', background: 'transparent', fontSize: '14px', color: textColor, fontFamily: 'inherit' }} type="email" placeholder="your@email.com" value={email} onChange={e => setEmail(e.target.value)} onKeyDown={e => { if (e.key === 'Enter' && email) setScreen('magic-link'); }} disabled={busy || isLoading} />
                 {email && (
-                  <button
-                    className="cavos-submit-btn"
-                    style={{
-                      padding: '0 16px', height: '100%', border: 'none', background: 'transparent',
-                      fontSize: '13px', fontWeight: 500, color: 'rgba(0,0,0,0.4)',
-                      cursor: 'pointer', fontFamily: 'inherit', transition: 'color 0.15s',
-                      flexShrink: 0,
-                    }}
-                    onClick={() => setScreen('email-password')}
-                  >
+                  <button className="cavos-submit-btn" style={{ padding: '0 16px', height: '100%', border: 'none', background: 'transparent', fontSize: '13px', fontWeight: 500, color: subTextColor, cursor: 'pointer', fontFamily: 'inherit', transition: 'color 0.15s', flexShrink: 0 }} onClick={() => setScreen('magic-link')}>
                     Submit
                   </button>
                 )}
               </div>
             )}
 
-            {/* Google */}
             {showGoogle && (
-              <button
-                className="cavos-provider"
-                style={{ ...providerBtn, ...(busy || isLoading ? { opacity: 0.5, cursor: 'not-allowed' } : {}) }}
-                onClick={() => handleOAuth('google')}
-                disabled={busy || isLoading}
-              >
+              <button className="cavos-provider" style={{ ...pBtn, ...(busy || isLoading ? { opacity: 0.5, cursor: 'not-allowed' } : {}) }} onClick={() => handleOAuth('google')} disabled={busy || isLoading}>
                 <div style={{ width: 32, height: 32, borderRadius: '8px', background: '#fff', border: '1px solid rgba(0,0,0,0.08)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
                   {busy ? <Spinner size={16} color="#888" /> : <GoogleIcon />}
                 </div>
@@ -659,14 +543,8 @@ export function CavosAuthModal({
               </button>
             )}
 
-            {/* Apple */}
             {showApple && (
-              <button
-                className="cavos-provider"
-                style={{ ...providerBtn, ...(busy || isLoading ? { opacity: 0.5, cursor: 'not-allowed' } : {}) }}
-                onClick={() => handleOAuth('apple')}
-                disabled={busy || isLoading}
-              >
+              <button className="cavos-provider" style={{ ...pBtn, ...(busy || isLoading ? { opacity: 0.5, cursor: 'not-allowed' } : {}) }} onClick={() => handleOAuth('apple')} disabled={busy || isLoading}>
                 <div style={{ width: 32, height: 32, borderRadius: '8px', background: '#0A0908', border: '1px solid #0A0908', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, color: '#fff' }}>
                   {busy ? <Spinner size={16} color="#fff" /> : <AppleIcon />}
                 </div>
@@ -675,35 +553,17 @@ export function CavosAuthModal({
             )}
           </div>
 
-          {error && (
-            <div style={{
-              marginTop: '14px', background: 'rgba(239,68,68,0.06)',
-              border: '1px solid rgba(239,68,68,0.18)', borderRadius: '10px',
-              padding: '9px 13px', fontSize: '13px', color: '#dc2626',
-            }}>
-              {error}
-            </div>
-          )}
+          {error && <div style={{ marginTop: '14px', background: errBg, border: `1px solid ${errBorder}`, borderRadius: '10px', padding: '9px 13px', fontSize: '13px', color: errColor }}>{error}</div>}
 
-          {/* Legal */}
-          <p style={{
-            margin: '16px 0 0', fontSize: '11px',
-            color: 'rgba(0,0,0,0.28)', textAlign: 'center', lineHeight: 1.55,
-          }}>
+          <p style={{ margin: '16px 0 0', fontSize: '11px', color: subTextColor, textAlign: 'center', lineHeight: 1.55 }}>
             By continuing you agree to the{' '}
-            <a href="https://cavos.xyz/privacy" target="_blank" rel="noopener noreferrer"
-              style={{ color: 'rgba(0,0,0,0.45)', textDecoration: 'underline' }}>
-              Privacy Policy
-            </a>
-            {' & '}
-            <a href="https://cavos.xyz/dpa" target="_blank" rel="noopener noreferrer"
-              style={{ color: 'rgba(0,0,0,0.45)', textDecoration: 'underline' }}>
-              Terms
-            </a>.
+            <a href="https://cavos.xyz/user-privacy" target="_blank" rel="noopener noreferrer" style={{ color: isLight ? 'rgba(0,0,0,0.45)' : 'rgba(255,255,255,0.45)', textDecoration: 'underline' }}>Privacy Policy</a>
+{' & '}
+            <a href="https://cavos.xyz/user-terms" target="_blank" rel="noopener noreferrer" style={{ color: isLight ? 'rgba(0,0,0,0.45)' : 'rgba(255,255,255,0.45)', textDecoration: 'underline' }}>Terms</a>.
           </p>
         </div>
 
-        <div style={footerBar}><CavosLogo /><span>Secured by Cavos</span></div>
+        <div style={footer}><CavosLogo invert={!isLight} /><span>Secured by Cavos</span></div>
       </div>
     </div>
   );

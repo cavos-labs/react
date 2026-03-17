@@ -54,6 +54,7 @@ export class CavosSDK {
     isReady: false,
   };
   private walletStatusListeners: Set<WalletStatusListener> = new Set();
+  private _authChangeListeners: Set<() => void> = new Set();
 
   private static readonly DEFAULT_RPC_MAINNET = 'https://starknet-mainnet.g.alchemy.com/starknet/version/rpc/v0_10/dql5pMT88iueZWl7L0yzT56uVk0EBU4L';
   private static readonly DEFAULT_RPC_SEPOLIA = 'https://starknet-sepolia.g.alchemy.com/starknet/version/rpc/v0_10/dql5pMT88iueZWl7L0yzT56uVk0EBU4L';
@@ -274,12 +275,15 @@ export class CavosSDK {
 
     // Check if this was a redirect fallback we explicitly triggered
     if (sessionStorage.getItem('cavos_fallback_redirect') === 'true') {
-      // Redirect fallback — let handleCallback take over
       sessionStorage.removeItem('cavos_fallback_redirect');
-      return false; // Let handleCallback take over
+      return false;
     }
 
-    // Auth callback detected — write to localStorage for the original tab
+    // Only treat as a popup child if this window was opened via window.open().
+    // Magic link redirects land in a normal browser tab (opener === null) — never close those.
+    if (!window.opener) return false;
+
+    // Auth callback detected — write to localStorage for the original tab and close
     try {
       localStorage.setItem('cavos_auth_result', authData);
       setTimeout(() => {
@@ -288,7 +292,6 @@ export class CavosSDK {
 
       return true;
     } catch (e) {
-      // Error writing auth data — fall through to handleCallback
       return false;
     }
   }
@@ -494,17 +497,14 @@ export class CavosSDK {
       this.logger.log('Auto-registering session on-chain...');
       const txHash = await this.transactionManager.registerCurrentSession();
       this.logger.log('Session registered on-chain. TxHash:', txHash);
-      const status = await this.transactionManager.getSessionStatus();
-      this.updateWalletStatus({
-        isRegistering: false,
-        isSessionActive: status.active && !status.expired,
-        isReady: status.active && !status.expired,
-      });
+      // Trust the tx submission — on-chain state won't reflect immediately.
+      // Mark ready now; the session key is valid from this point.
+      this.updateWalletStatus({ isRegistering: false, isSessionActive: true, isReady: true });
     } catch (err) {
       this.logger.alwaysError('Auto session registration failed:', err);
-      // Do NOT mark isReady: true — the session is not registered.
-      // execute() will fallback to JWT path; if JWT is expired execute() will throw clearly.
-      this.updateWalletStatus({ isRegistering: false, isReady: false });
+      // Mark isReady: true anyway — the wallet is usable via JWT path in execute().
+      // If the JWT is expired, execute() will throw JwtExpiredError clearly to the user.
+      this.updateWalletStatus({ isRegistering: false, isSessionActive: false, isReady: true });
     }
   }
 
@@ -887,6 +887,70 @@ export class CavosSDK {
   }
 
   /**
+   * Subscribe to auth state changes (e.g. when magic link polling completes)
+   */
+  onAuthChange(cb: () => void): () => void {
+    this._authChangeListeners.add(cb);
+    return () => this._authChangeListeners.delete(cb);
+  }
+
+  /**
+   * Send a magic link email and start polling localStorage for the verify result.
+   * Returns immediately after the email is sent. Auth completes in the background
+   * when the user clicks the link — onAuthChange listeners are notified.
+   */
+  async sendMagicLink(email: string): Promise<void> {
+    if (!this.appSalt) {
+      await this.validateAccess();
+    }
+    await this.oauthWalletManager.sendMagicLink(email);
+    // Fire-and-forget poll — resolves when user clicks the magic link
+    this._pollMagicLinkResult();
+  }
+
+  private _pollMagicLinkResult(): void {
+    if (typeof window === 'undefined') return;
+    localStorage.removeItem('cavos_auth_result');
+
+    let done = false;
+    const cleanup = () => {
+      done = true;
+      clearTimeout(timeout);
+      clearInterval(interval);
+      window.removeEventListener('storage', onStorage);
+    };
+
+    const complete = (raw: string) => {
+      if (done) return;
+      cleanup();
+      this._completeMagicLinkAuth(raw);
+    };
+
+    const timeout = setTimeout(() => cleanup(), 600_000); // 10 min
+
+    const interval = setInterval(() => {
+      const r = localStorage.getItem('cavos_auth_result');
+      if (r) complete(r);
+    }, 500);
+
+    const onStorage = (e: StorageEvent) => {
+      if (e.key === 'cavos_auth_result' && e.newValue) complete(e.newValue);
+    };
+    window.addEventListener('storage', onStorage);
+  }
+
+  private async _completeMagicLinkAuth(authData: string): Promise<void> {
+    try {
+      localStorage.removeItem('cavos_auth_result');
+      if (!this.appSalt) await this.validateAccess();
+      await this.handleCallback(authData);
+      this._authChangeListeners.forEach(cb => cb());
+    } catch (e) {
+      this.logger.alwaysError('[MagicLink] Failed to complete auth:', e);
+    }
+  }
+
+  /**
    * Update wallet status and notify listeners
    */
   private updateWalletStatus(updates: Partial<WalletStatus>): void {
@@ -1051,13 +1115,9 @@ export class CavosSDK {
    * @param typedDataInput - The typed data to sign (SNIP-12 format)
    * @returns Signature object with r and s components
    */
-  async signMessage(typedDataInput: TypedData): Promise<Signature> {
-    const sig = this.oauthWalletManager.signMessage(typedDataInput);
-    // sig is an array [r, s] from starknet.js
-    return {
-      r: (sig as string[])[0],
-      s: (sig as string[])[1],
-    };
+  async signMessage(typedDataInput: TypedData): Promise<string[]> {
+    // Returns [SESSION_V1_magic, r, s, session_key] — ready for on-chain is_valid_signature
+    return this.oauthWalletManager.signMessage(typedDataInput);
   }
 
   /**

@@ -471,9 +471,10 @@ export class OAuthWalletManager {
     // Persist full session
     this.persistSession();
 
-    // Clear pre-auth session
+    // Clear pre-auth sessions (both storage locations)
     if (typeof window !== 'undefined') {
       sessionStorage.removeItem(PRE_AUTH_STORAGE_KEY);
+      localStorage.removeItem('cavos_magic_link_pre_auth');
     }
 
     return this.session;
@@ -525,18 +526,15 @@ export class OAuthWalletManager {
    * @param typedDataInput - The typed data to sign (SNIP-12 format)
    * @returns Signature array [r, s]
    */
-  signMessage(typedDataInput: TypedData): Signature {
+  signMessage(typedDataInput: TypedData): string[] {
     if (!this.session?.sessionPrivateKey || !this.session.walletAddress) {
       throw new Error('No active session. Please login first.');
     }
 
-    // Compute the message hash from typed data
+    // Compute the SNIP-12 message hash and build the full session signature
+    // that is_valid_signature on the contract expects: [SESSION_V1, r, s, session_key]
     const messageHash = typedData.getMessageHash(typedDataInput, this.session.walletAddress);
-
-    // Sign with session key
-    const signature = ec.starkCurve.sign(messageHash, this.session.sessionPrivateKey);
-
-    return [num.toHex(signature.r), num.toHex(signature.s)];
+    return this.buildSessionSignature(messageHash);
   }
 
   /**
@@ -892,7 +890,10 @@ export class OAuthWalletManager {
   private restorePreAuthSession(): void {
     if (typeof window === 'undefined') return;
     try {
-      const stored = sessionStorage.getItem(PRE_AUTH_STORAGE_KEY);
+      // Try sessionStorage first (same-tab popup flow), then localStorage fallback (magic link redirect)
+      const stored =
+        sessionStorage.getItem(PRE_AUTH_STORAGE_KEY) ||
+        localStorage.getItem('cavos_magic_link_pre_auth');
       if (stored) {
         const parsed = JSON.parse(stored);
         this.session = {
@@ -906,6 +907,8 @@ export class OAuthWalletManager {
           },
           sessionPolicy: this.deserializePolicy(parsed.sessionPolicy) ?? this.defaultPolicy,
         };
+        // Clean up magic link pre-auth after restoring
+        localStorage.removeItem('cavos_magic_link_pre_auth');
       }
     } catch {
       // Ignore
@@ -1330,6 +1333,47 @@ export class OAuthWalletManager {
       throw new Error(error.error || 'Failed to resend verification email');
     }
 
+  }
+
+  /**
+   * Send a magic link email (passwordless sign-in)
+   * Initializes a fresh session key+nonce, persists pre-auth session to
+   * sessionStorage, then asks the backend to send the branded email.
+   */
+  async sendMagicLink(email: string): Promise<void> {
+    if (!this.session) {
+      await this.initializeSession();
+    }
+
+    // Persist pre-auth to localStorage so it survives a mobile redirect (cross-tab)
+    if (typeof window !== 'undefined' && this.session) {
+      try {
+        const toStore = {
+          ...this.session,
+          nonceParams: {
+            ...this.session.nonceParams,
+            validAfter: this.session.nonceParams.validAfter.toString(),
+            validUntil: this.session.nonceParams.validUntil.toString(),
+            renewalDeadline: this.session.nonceParams.renewalDeadline.toString(),
+            randomness: this.session.nonceParams.randomness.toString(),
+          },
+          sessionPolicy: this.serializePolicy(this.session.sessionPolicy),
+        };
+        localStorage.setItem('cavos_magic_link_pre_auth', JSON.stringify(toStore));
+      } catch { /* ignore */ }
+    }
+
+    const redirect_uri = typeof window !== 'undefined' ? window.location.href : undefined;
+    const response = await fetch(`${this.backendUrl}/api/oauth/firebase/magic-link`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, nonce: this.session!.nonce, app_id: this.appId, redirect_uri }),
+    });
+
+    if (!response.ok) {
+      const error = await response.json();
+      throw new Error(error.error || 'Failed to send magic link');
+    }
   }
 
   /**

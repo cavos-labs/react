@@ -1,7 +1,7 @@
 'use client';
 import React, { createContext, useContext, useEffect, useState, useCallback, ReactNode } from 'react';
 import { CavosSDK, WalletStatus } from '../CavosSDK';
-import { CavosConfig, UserInfo, OnrampProvider, LoginProvider, Signature, FirebaseCredentials } from '../types';
+import { CavosConfig, UserInfo, OnrampProvider, LoginProvider, FirebaseCredentials } from '../types';
 import { SessionKeyPolicy } from '../types/session';
 import { Call, type TypedData } from 'starknet';
 import { CavosAuthModal } from './components/CavosAuthModal';
@@ -11,6 +11,8 @@ export interface CavosModalConfig {
   appLogo?: string;
   providers?: ('google' | 'apple' | 'email')[];
   primaryColor?: string;
+  /** 'light' (default) or 'dark' */
+  theme?: 'light' | 'dark';
   onSuccess?: (address: string) => void;
 }
 
@@ -24,11 +26,13 @@ export interface CavosContextValue {
   hasActiveSession: boolean;
   login: (provider: LoginProvider, credentials?: FirebaseCredentials) => Promise<void>;
   register: (provider: LoginProvider, credentials: FirebaseCredentials) => Promise<void>;
+  /** Send a magic link email. Resolves when email is sent; auth completes in background. */
+  sendMagicLink: (email: string) => Promise<void>;
   execute: (calls: Call | Call[], options?: { gasless?: boolean }) => Promise<string>;
   renewSession: () => Promise<string>;
   revokeSession: (sessionKey: string) => Promise<string>;
   emergencyRevokeAllSessions: () => Promise<string>;
-  signMessage: (typedData: TypedData) => Promise<Signature>;
+  signMessage: (typedData: TypedData) => Promise<string[]>;
   getOnramp: (provider: OnrampProvider) => string;
   logout: () => Promise<void>;
   isLoading: boolean;
@@ -97,6 +101,12 @@ export function CavosProvider({ config, modal, children }: CavosProviderProps) {
     const unsubscribe = cavos.onWalletStatusChange(setWalletStatus);
     return unsubscribe;
   }, [cavos]);
+
+  // Subscribe to auth state changes (e.g. magic link verification completing in background)
+  useEffect(() => {
+    const unsubscribe = cavos.onAuthChange(updateState);
+    return unsubscribe;
+  }, [cavos, updateState]);
 
   // Auto-open modal if wallet setup is still in progress on page load (e.g. after OAuth redirect)
   useEffect(() => {
@@ -217,6 +227,10 @@ export function CavosProvider({ config, modal, children }: CavosProviderProps) {
     return cavos.resendVerificationEmail(email);
   }, [cavos]);
 
+  const sendMagicLink = useCallback(async (email: string) => {
+    return cavos.sendMagicLink(email);
+  }, [cavos]);
+
   const value: CavosContextValue = {
     cavos,
     openModal,
@@ -239,6 +253,7 @@ export function CavosProvider({ config, modal, children }: CavosProviderProps) {
     deployAccount,
     getBalance,
     resendVerificationEmail,
+    sendMagicLink,
     walletStatus,
     getAssociatedWallets: async () => cavos.getAssociatedWallets(),
     switchWallet: async (name?: string) => {
@@ -263,6 +278,7 @@ export function CavosProvider({ config, modal, children }: CavosProviderProps) {
           appLogo={modal.appLogo}
           providers={modal.providers}
           primaryColor={modal.primaryColor}
+          theme={modal.theme}
         />
       )}
     </CavosContext.Provider>
