@@ -12,8 +12,8 @@ import { hash, num } from 'starknet';
 export class AddressSeedManager {
   private salt: string;
 
-  constructor(salt: string = '0') {
-    this.salt = salt;
+  constructor(salt: string) {
+    this.salt = salt || '0x0';
   }
 
   /**
@@ -24,6 +24,12 @@ export class AddressSeedManager {
    * @param name Optional wallet name suffix for deterministic derivation
    */
   computeAddressSeed(issuer: string, sub: string, name?: string): string {
+    if (!this.salt || this.salt === '0' || this.salt === '0x0') {
+      throw new Error(
+        'AddressSeedManager: salt must be a non-zero value. ' +
+        'A zero salt makes address seeds predictable and enables account takeover.'
+      );
+    }
     const issuerFelt = this.stringToFelt(issuer);
     // Convert sub to felt252 (hash if too long)
     const subFelt = this.subToFelt(sub);

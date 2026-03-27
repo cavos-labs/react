@@ -173,7 +173,8 @@ export class OAuthWalletManager {
     this.backendUrl = backendUrl;
     this.appId = appId;
     this.provider = new RpcProvider({ nodeUrl: rpcUrl });
-    this.addressSeedManager = new AddressSeedManager(config.salt || '0');
+    // Salt starts as '0x0' and is updated via setAppSalt() after the backend returns app_salt.
+    this.addressSeedManager = new AddressSeedManager(config.salt || '0x0');
     this.sessionDuration = sessionConfig?.sessionDuration || 86400; // 24 hours in seconds
     this.renewalGracePeriod = sessionConfig?.renewalGracePeriod || 172800; // 48 hours in seconds
     this.defaultPolicy = sessionConfig?.defaultPolicy;
@@ -1077,67 +1078,29 @@ export class OAuthWalletManager {
     // The contract will decode the base64 segment and look for claims at these offsets
     // Offsets are relative to each decoded segment, NOT to the full signedData
 
+    // Finds the offset of the value inside a string claim: `"key":"<value>"`.
+    // Returns the position of the first byte of value (after the opening quote).
+    // Only compact JSON is supported — the on-chain prefix check requires `"key":"` with no spaces.
     const findStringClaimValueOffset = (decoded: string, key: string, value: string): number => {
-      // Try exact pattern first (no space after colon)
-      const exactPattern = `"${key}":"${value}"`;
-      let idx = decoded.indexOf(exactPattern);
+      const pattern = `"${key}":"${value}"`;
+      const idx = decoded.indexOf(pattern);
       if (idx >= 0) {
-        // Offset is after "key":"
-        return idx + key.length + 4; // 4 = `":"` + opening quote of value
+        // offset = start of key name quote + key length + `":"` (3 chars) + 1 (opening value quote)
+        return idx + key.length + 4;
       }
-
-      // Try pattern with space after colon
-      const spacedPattern = `"${key}": "${value}"`;
-      idx = decoded.indexOf(spacedPattern);
-      if (idx >= 0) {
-        // Offset is after "key": "
-        return idx + key.length + 5; // 5 = `": "` + opening quote of value
-      }
-
-      // Fallback: search for just the key and find the value
-      const keyPattern = `"${key}"`;
-      idx = decoded.indexOf(keyPattern);
-      if (idx >= 0) {
-        // Find the colon after the key
-        const colonIdx = decoded.indexOf(':', idx + key.length + 2);
-        if (colonIdx >= 0) {
-          // Find the opening quote of the value
-          const valueQuoteIdx = decoded.indexOf('"', colonIdx + 1);
-          if (valueQuoteIdx >= 0) {
-            return valueQuoteIdx + 1; // After the opening quote
-          }
-        }
-      }
-
       return -1;
     };
 
+    // Finds the offset of the value inside a numeric claim: `"key":<value>`.
+    // Returns the position of the first digit.
+    // Only compact JSON is supported — the on-chain prefix check requires `"key":` with no spaces.
     const findNumericClaimValueOffset = (decoded: string, key: string, value: string): number => {
-      const exactPattern = `"${key}":${value}`;
-      let idx = decoded.indexOf(exactPattern);
+      const pattern = `"${key}":${value}`;
+      const idx = decoded.indexOf(pattern);
       if (idx >= 0) {
-        return idx + key.length + 3; // 3 = `":`
+        // offset = start of key name quote + key length + `":` (2 chars) + 1 (closing key quote already counted)
+        return idx + key.length + 3;
       }
-
-      const spacedPattern = `"${key}": ${value}`;
-      idx = decoded.indexOf(spacedPattern);
-      if (idx >= 0) {
-        return idx + key.length + 4; // 4 = `": `
-      }
-
-      const keyPattern = `"${key}"`;
-      idx = decoded.indexOf(keyPattern);
-      if (idx >= 0) {
-        const colonIdx = decoded.indexOf(':', idx + key.length + 2);
-        if (colonIdx >= 0) {
-          let valueIdx = colonIdx + 1;
-          while (valueIdx < decoded.length && decoded[valueIdx] === ' ') {
-            valueIdx += 1;
-          }
-          return valueIdx;
-        }
-      }
-
       return -1;
     };
 
