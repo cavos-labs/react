@@ -180,6 +180,11 @@ export class OAuthWalletManager {
     this.defaultPolicy = sessionConfig?.defaultPolicy;
   }
 
+  private async getCurrentChainTimestamp(): Promise<bigint> {
+    const block = await this.provider.getBlock('latest');
+    return BigInt(block.timestamp);
+  }
+
   /**
    * Set the per-app salt for wallet address derivation.
    * Called by CavosSDK after fetching app_salt from backend.
@@ -239,12 +244,24 @@ export class OAuthWalletManager {
 
     privateKeyBigInt = (privateKeyBigInt % (STARK_CURVE_ORDER - 1n)) + 1n;
 
+    // Normalize so public key uses Cairo's y convention:
+    // check_ecdsa_signature reconstructs the public key using the SMALLER y (y < p/2).
+    // If the private key's public key has y > p/2, negate the key to flip to the smaller root.
+    const STARK_FIELD_PRIME = BigInt('0x800000000000011000000000000000000000000000000000000000000000001');
+    {
+      const tmpHex = '0x' + privateKeyBigInt.toString(16);
+      const pubFull = ec.starkCurve.getPublicKey(tmpHex, false); // uncompressed: 04 | x(32) | y(32)
+      const yBig = BigInt('0x' + Array.from(pubFull.slice(33)).map(b => b.toString(16).padStart(2, '0')).join(''));
+      if (yBig * 2n > STARK_FIELD_PRIME) {
+        privateKeyBigInt = STARK_CURVE_ORDER - privateKeyBigInt;
+      }
+    }
     const sessionPrivateKey = '0x' + privateKeyBigInt.toString(16);
     const sessionPubKey = ec.starkCurve.getStarkKey(sessionPrivateKey);
 
-    // Get current block timestamp
-    const block = await this.provider.getBlock('latest');
-    const currentTimestamp = BigInt(block.timestamp);
+    // Session validity is enforced on-chain against block.timestamp, so the
+    // nonce params must be derived from chain time rather than local wall time.
+    const currentTimestamp = await this.getCurrentChainTimestamp();
 
     // Generate nonce params (timestamp-based)
     const nonceParams = NonceManager.generateNonceParams(
@@ -315,12 +332,24 @@ export class OAuthWalletManager {
 
     privateKeyBigInt = (privateKeyBigInt % (STARK_CURVE_ORDER - 1n)) + 1n;
 
+    // Normalize so public key uses Cairo's y convention:
+    // check_ecdsa_signature reconstructs the public key using the SMALLER y (y < p/2).
+    // If the private key's public key has y > p/2, negate the key to flip to the smaller root.
+    const STARK_FIELD_PRIME = BigInt('0x800000000000011000000000000000000000000000000000000000000000001');
+    {
+      const tmpHex = '0x' + privateKeyBigInt.toString(16);
+      const pubFull = ec.starkCurve.getPublicKey(tmpHex, false);
+      const yBig = BigInt('0x' + Array.from(pubFull.slice(33)).map(b => b.toString(16).padStart(2, '0')).join(''));
+      if (yBig * 2n > STARK_FIELD_PRIME) {
+        privateKeyBigInt = STARK_CURVE_ORDER - privateKeyBigInt;
+      }
+    }
     const sessionPrivateKey = '0x' + privateKeyBigInt.toString(16);
     const sessionPubKey = ec.starkCurve.getStarkKey(sessionPrivateKey);
 
-    // Get current block timestamp
-    const block = await this.provider.getBlock('latest');
-    const currentTimestamp = BigInt(block.timestamp);
+    // Session validity is enforced on-chain against block.timestamp, so the
+    // nonce params must be derived from chain time rather than local wall time.
+    const currentTimestamp = await this.getCurrentChainTimestamp();
 
     // Generate nonce params with configured duration (timestamp-based)
     const nonceParams = NonceManager.generateNonceParams(
@@ -858,12 +887,24 @@ export class OAuthWalletManager {
     let privateKeyBigInt = BigInt('0x' + Array.from(randomBytes).map(b => b.toString(16).padStart(2, '0')).join(''));
     privateKeyBigInt = (privateKeyBigInt % (STARK_CURVE_ORDER - 1n)) + 1n;
 
+    // Normalize so public key uses Cairo's y convention:
+    // check_ecdsa_signature reconstructs the public key using the SMALLER y (y < p/2).
+    // If the private key's public key has y > p/2, negate the key to flip to the smaller root.
+    const STARK_FIELD_PRIME = BigInt('0x800000000000011000000000000000000000000000000000000000000000001');
+    {
+      const tmpHex = '0x' + privateKeyBigInt.toString(16);
+      const pubFull = ec.starkCurve.getPublicKey(tmpHex, false);
+      const yBig = BigInt('0x' + Array.from(pubFull.slice(33)).map(b => b.toString(16).padStart(2, '0')).join(''));
+      if (yBig * 2n > STARK_FIELD_PRIME) {
+        privateKeyBigInt = STARK_CURVE_ORDER - privateKeyBigInt;
+      }
+    }
     const sessionPrivateKey = '0x' + privateKeyBigInt.toString(16);
     const sessionPubKey = ec.starkCurve.getStarkKey(sessionPrivateKey);
 
-    // Get current block timestamp
-    const block = await this.provider.getBlock('latest');
-    const currentTimestamp = BigInt(block.timestamp);
+    // Session validity is enforced on-chain against block.timestamp, so the
+    // nonce params must be derived from chain time rather than local wall time.
+    const currentTimestamp = await this.getCurrentChainTimestamp();
     // New nonce params with configured duration (timestamp-based)
     const nonceParams = NonceManager.generateNonceParams(
       sessionPubKey,

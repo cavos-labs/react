@@ -1,10 +1,10 @@
-import { Account, Call, RpcProvider, type TypedData } from 'starknet';
+import { Account, Call, RpcProvider, num, type TypedData } from 'starknet';
 import { SessionManager } from './session/SessionManager';
 import { PaymasterIntegration } from './paymaster/PaymasterIntegration';
 import { AnalyticsManager } from './analytics/AnalyticsManager';
 import { OAuthWalletManager, OAuthTransactionManager } from './oauth';
 import { CavosConfig, UserInfo, OnrampProvider, LoginProvider, Signature, OAuthWalletConfig, FirebaseCredentials } from './types';
-import { DEFAULT_OAUTH_CONFIG_SEPOLIA, DEFAULT_OAUTH_CONFIG_MAINNET } from './config/defaults';
+import { DEFAULT_OAUTH_CONFIG_SEPOLIA, DEFAULT_OAUTH_CONFIG_MAINNET, DEFAULT_SLOT_RELAYER_ADDRESS, DEFAULT_SLOT_RELAYER_PRIVATE_KEY } from './config/defaults';
 import { Logger } from './utils/logger';
 import axios from 'axios';
 
@@ -16,6 +16,12 @@ export interface WalletStatus {
   isReady: boolean;
   /** Tx hash of a pending deploy whose confirmation timed out. Useful to show an explorer link. */
   pendingDeployTxHash?: string;
+  /** True while the wallet is being deployed to the Slot chain. */
+  isSlotDeploying: boolean;
+  /** True once the wallet is confirmed deployed on the Slot chain. */
+  isSlotDeployed: boolean;
+  /** Tx hash of a pending Slot deploy whose confirmation timed out. */
+  pendingSlotDeployTxHash?: string;
 }
 
 /** Thrown when the JWT has expired and the user must re-login to continue. */
@@ -40,10 +46,19 @@ export class CavosSDK {
   private appSalt: string | null = null;
   /** Prevents concurrent deployAccountInBackground() runs */
   private _deployingInBackground = false;
+  /** Prevents concurrent _deploySlotInBackground() runs */
+  private _deployingSlotInBackground = false;
   /** Shared RpcProvider instance to avoid creating one per call */
   private provider: RpcProvider;
+  /** RpcProvider for the Slot chain (null if slot not configured) */
+  private slotProvider: RpcProvider | null = null;
+  /** OAuthTransactionManager pointing at the Slot RPC (null if slot not configured) */
+  private slotTransactionManager: OAuthTransactionManager | null = null;
+  /** Relayer used for first-time Slot session registration via execute_from_outside_v2. */
+  private slotRelayerAccount: Account | null = null;
 
   private static readonly PENDING_DEPLOY_TX_KEY = 'cavos_pending_deploy_tx';
+  private static readonly PENDING_SLOT_DEPLOY_TX_KEY = 'cavos_pending_slot_deploy_tx';
 
   // Wallet status state
   private _walletStatus: WalletStatus = {
@@ -52,6 +67,8 @@ export class CavosSDK {
     isRegistering: false,
     isSessionActive: false,
     isReady: false,
+    isSlotDeploying: false,
+    isSlotDeployed: false,
   };
   private walletStatusListeners: Set<WalletStatusListener> = new Set();
   private _authChangeListeners: Set<() => void> = new Set();
@@ -97,6 +114,17 @@ export class CavosSDK {
 
     this.provider = new RpcProvider({ nodeUrl: this.config.starknetRpcUrl! });
 
+    if (config.slot?.rpcUrl) {
+      this.slotProvider = new RpcProvider({ nodeUrl: config.slot.rpcUrl });
+      const relayerAddress = DEFAULT_SLOT_RELAYER_ADDRESS;
+      const relayerPrivateKey = DEFAULT_SLOT_RELAYER_PRIVATE_KEY;
+      this.slotRelayerAccount = new Account({
+        provider: this.slotProvider,
+        address: relayerAddress,
+        signer: relayerPrivateKey,
+      });
+    }
+
     this.analyticsManager = new AnalyticsManager(this.config);
 
     this.sessionManager = new SessionManager(
@@ -123,6 +151,7 @@ export class CavosSDK {
 
     if (sessionRestored) {
       this.initializeTransactionManager();
+      this.initializeSlotTransactionManager();
       // Check deployment status and update walletStatus
       this.deployAccountInBackground();
     }
@@ -308,6 +337,7 @@ export class CavosSDK {
 
     await this.oauthWalletManager.registerWithFirebase(credentials.email, credentials.password);
     this.initializeTransactionManager();
+    this.initializeSlotTransactionManager();
 
     // Do NOT deploy on registration
     this.logger.log('User registered. Account will be deployed on first login.');
@@ -324,6 +354,7 @@ export class CavosSDK {
 
     await this.oauthWalletManager.loginWithFirebase(email, password);
     this.initializeTransactionManager();
+    this.initializeSlotTransactionManager();
 
     // Store in seen wallets for discovery
     this.addWalletToSeen(
@@ -424,6 +455,7 @@ export class CavosSDK {
           }
 
           await this.autoRegisterSession();
+          this._deploySlotInBackground();
         } catch (err: any) {
           const msg: string = err?.message || String(err);
           if (msg.includes('timeout')) {
@@ -448,6 +480,7 @@ export class CavosSDK {
           this.updateWalletStatus({ isDeployed: true, isSessionActive: false, isReady: false });
           await this.autoRegisterSession();
         }
+        this._deploySlotInBackground();
       }
     } catch (err) {
       this.logger.alwaysError('Background deployment check failed:', err);
@@ -455,11 +488,12 @@ export class CavosSDK {
   }
 
   /** Poll a known tx hash until confirmed. Used for deploy tx recovery. */
-  private async _waitForDeployTx(txHash: string, timeout: number): Promise<void> {
+  private async _waitForDeployTx(txHash: string, timeout: number, provider?: RpcProvider): Promise<void> {
+    const rpc = provider ?? this.provider;
     const start = Date.now();
     while (Date.now() - start < timeout) {
       try {
-        const receipt = await this.provider.getTransactionReceipt(txHash);
+        const receipt = await rpc.getTransactionReceipt(txHash);
         if (receipt) {
           const ok = (receipt as any).execution_status === 'SUCCEEDED' ||
             (receipt as any).finality_status === 'ACCEPTED_ON_L2' ||
@@ -482,6 +516,47 @@ export class CavosSDK {
    * Skips gracefully if JWT is expired — execute() will surface the error to the user
    * clearly via JwtExpiredError instead of failing silently here.
    */
+  private async autoRegisterSessionOnSlot(): Promise<void> {
+    if (!this.slotTransactionManager) return;
+
+    if (this.isJwtExpired()) {
+      this.logger.log('[Slot] Auto-registration skipped: JWT is expired.');
+      return;
+    }
+
+    const session = this.oauthWalletManager.getSession();
+    const allowedContracts = session?.sessionPolicy?.allowedContracts ?? [];
+    const walletAddress = session?.walletAddress
+      ? num.toHex(session.walletAddress).toLowerCase()
+      : null;
+    const walletAllowed = walletAddress
+      ? allowedContracts.some(contract => num.toHex(contract).toLowerCase() === walletAddress)
+      : false;
+    if (allowedContracts.length > 0 && !walletAllowed) {
+      this.logger.log(
+        '[Slot] Auto-registration skipped for restricted policy. ' +
+        'The first executeOnSlot() call must register the session using an allowed target contract.'
+      );
+      return;
+    }
+
+    try {
+      if (!this.slotRelayerAccount) {
+        this.logger.log('[Slot] Auto-registration skipped: no relayer account available.');
+        return;
+      }
+
+      this.logger.log('[Slot] Auto-registering session on Slot via outside execution...');
+      const txHash = await this.slotTransactionManager.registerCurrentSessionViaOutside(
+        this.slotRelayerAccount,
+      );
+      this.logger.log('[Slot] Session registered on Slot. TxHash:', txHash);
+    } catch (err) {
+      this.logger.alwaysError('[Slot] Auto session registration on Slot failed:', err);
+      // Non-blocking — executeOnSlot() will surface a clear error to the user.
+    }
+  }
+
   private async autoRegisterSession(): Promise<void> {
     if (!this.transactionManager) return;
 
@@ -520,6 +595,7 @@ export class CavosSDK {
 
     await this.oauthWalletManager.handleOAuthCallback(authDataString);
     this.initializeTransactionManager();
+    this.initializeSlotTransactionManager();
 
     // Store in seen wallets for discovery
     this.addWalletToSeen(
@@ -548,6 +624,127 @@ export class CavosSDK {
       this.config.network || 'sepolia',
       this.config.paymasterUrl
     );
+  }
+
+  private initializeSlotTransactionManager(): void {
+    if (!this.config.slot?.rpcUrl) return;
+    const session = this.oauthWalletManager.getSession();
+    if (!session || !session.walletAddress) return;
+
+    this.slotTransactionManager = new OAuthTransactionManager(
+      this.config.oauthWallet as OAuthWalletConfig,
+      this.oauthWalletManager,
+      this.config.slot.rpcUrl,
+      '', // no paymaster on Slot (no_fee = true)
+      this.config.network || 'sepolia',
+      undefined, // no custom paymaster URL
+      this.config.slot.chainId, // optional chain ID override
+    );
+  }
+
+  private _deploySlotInBackground(): void {
+    if (!this.config.slot?.rpcUrl || this._deployingSlotInBackground) return;
+    this._deployingSlotInBackground = true;
+    this._runSlotDeployBackground().finally(() => {
+      this._deployingSlotInBackground = false;
+    });
+  }
+
+  private async _runSlotDeployBackground(): Promise<void> {
+    try {
+      const address = this.getAddress();
+      if (!address) return;
+
+      // Re-poll a previous Slot deploy tx that timed out
+      const pendingTxHash = typeof localStorage !== 'undefined'
+        ? localStorage.getItem(CavosSDK.PENDING_SLOT_DEPLOY_TX_KEY)
+        : null;
+
+      if (pendingTxHash) {
+        this.logger.log('[Slot] Found pending deploy tx, re-polling:', pendingTxHash);
+        this.updateWalletStatus({ isSlotDeploying: true, pendingSlotDeployTxHash: pendingTxHash });
+        try {
+          await this._waitForDeployTx(pendingTxHash, 180_000, this.slotProvider!);
+          localStorage.removeItem(CavosSDK.PENDING_SLOT_DEPLOY_TX_KEY);
+          this.updateWalletStatus({ isSlotDeploying: false, isSlotDeployed: true, pendingSlotDeployTxHash: undefined });
+          const slotSessionActiveAfterPoll = this.slotTransactionManager
+            ? await this.slotTransactionManager.isSessionRegistered()
+            : false;
+          if (!slotSessionActiveAfterPoll) {
+            await this.autoRegisterSessionOnSlot();
+          }
+          return;
+        } catch {
+          this.updateWalletStatus({ isSlotDeploying: false });
+          return;
+        }
+      }
+
+      // Check if already deployed on Slot
+      let isDeployedOnSlot = false;
+      try {
+        const classHash = await this.slotProvider!.getClassHashAt(address);
+        isDeployedOnSlot = !!classHash;
+      } catch {
+        isDeployedOnSlot = false;
+      }
+
+      if (isDeployedOnSlot) {
+        this.logger.log('[Slot] Wallet already deployed on Slot.');
+        this.updateWalletStatus({ isSlotDeployed: true });
+        // Mirror normal wallet: check session status before registering.
+        const slotSessionActive = this.slotTransactionManager
+          ? await this.slotTransactionManager.isSessionRegistered()
+          : false;
+        if (!slotSessionActive) {
+          await this.autoRegisterSessionOnSlot();
+        } else {
+          this.logger.log('[Slot] Session already registered on Slot.');
+        }
+        return;
+      }
+
+      this.logger.log('[Slot] Wallet not deployed on Slot. Deploying...');
+      this.updateWalletStatus({ isSlotDeploying: true });
+
+      if (!this.slotTransactionManager) {
+        this.initializeSlotTransactionManager();
+      }
+      if (!this.slotTransactionManager) return;
+
+      try {
+        const deployHash = await this.slotTransactionManager.deployAccountDirect();
+
+        if (deployHash === 'already-deployed') {
+          this.updateWalletStatus({ isSlotDeploying: false, isSlotDeployed: true });
+          await this.autoRegisterSessionOnSlot();
+          return;
+        }
+
+        this.logger.log('[Slot] Deploy tx submitted:', deployHash);
+        if (typeof localStorage !== 'undefined') {
+          localStorage.setItem(CavosSDK.PENDING_SLOT_DEPLOY_TX_KEY, deployHash);
+        }
+        this.updateWalletStatus({ pendingSlotDeployTxHash: deployHash });
+
+        localStorage.removeItem(CavosSDK.PENDING_SLOT_DEPLOY_TX_KEY);
+        this.updateWalletStatus({ isSlotDeploying: false, isSlotDeployed: true, pendingSlotDeployTxHash: undefined });
+        this.logger.log('[Slot] Wallet deployed on Slot.');
+        await this.autoRegisterSessionOnSlot();
+      } catch (err: any) {
+        const msg: string = err?.message || String(err);
+        if (msg.includes('timeout')) {
+          this.logger.alwaysError('[Slot] Deploy confirmation timed out. Hash persisted for recovery.', err);
+        } else {
+          typeof localStorage !== 'undefined' && localStorage.removeItem(CavosSDK.PENDING_SLOT_DEPLOY_TX_KEY);
+          this.logger.alwaysError('[Slot] Background deployment failed:', err);
+        }
+        this.updateWalletStatus({ isSlotDeploying: false });
+      }
+    } catch (err) {
+      this.logger.alwaysError('[Slot] Background deployment check failed:', err);
+      this.updateWalletStatus({ isSlotDeploying: false });
+    }
   }
 
   /**
@@ -674,6 +871,7 @@ export class CavosSDK {
     }
 
     // Check deployment in background for the newly selected wallet
+    this.initializeSlotTransactionManager();
     this.deployAccountInBackground();
     this.notifyWalletStatusListeners();
   }
@@ -855,6 +1053,7 @@ export class CavosSDK {
   async logout(): Promise<void> {
     this.oauthWalletManager.clearSession();
     this.transactionManager = null;
+    this.slotTransactionManager = null;
     // Reset wallet status
     this._walletStatus = {
       isDeploying: false,
@@ -862,6 +1061,8 @@ export class CavosSDK {
       isRegistering: false,
       isSessionActive: false,
       isReady: false,
+      isSlotDeploying: false,
+      isSlotDeployed: false,
     };
     this.notifyWalletStatusListeners();
   }
@@ -1143,5 +1344,43 @@ export class CavosSDK {
   ): string | null {
     if (!issuer || !sub) return null;
     return `cavos_seen_wallets_${this.config.appId}_${issuer}:${sub}`;
+  }
+
+  /**
+   * Execute calls on the Slot chain.
+   * Uses execute_from_outside_v2 for first-time session registration, then
+   * switches to direct no-fee account execution once the session is active.
+   */
+  async executeOnSlot(calls: Call | Call[]): Promise<string> {
+    if (!this.slotTransactionManager) {
+      throw new Error('Slot not configured. Pass slot.rpcUrl in CavosConfig.');
+    }
+    if (!this._walletStatus.isSlotDeployed) {
+      throw new Error('Wallet not deployed on Slot yet. Wait for walletStatus.isSlotDeployed.');
+    }
+
+    const callsArray = Array.isArray(calls) ? calls : [calls];
+    const status = await this.slotTransactionManager.getSessionStatus();
+
+    if (!status.registered) {
+      if (!this.slotRelayerAccount) {
+        throw new Error('Slot session is not registered yet and no relayer is available.');
+      }
+      return this.slotTransactionManager.executeViaOutsideExecution(
+        callsArray,
+        this.slotRelayerAccount,
+      );
+    }
+
+    return this.slotTransactionManager.executeOnNoFeeChain(callsArray);
+  }
+
+  /**
+   * Returns the RpcProvider for the Slot chain.
+   * Use for read-only queries (callContract, getEvents) or Dojo SDK integration.
+   * Returns null if slot.rpcUrl was not configured.
+   */
+  getSlotProvider(): RpcProvider | null {
+    return this.slotProvider;
   }
 }

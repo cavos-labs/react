@@ -3,7 +3,7 @@ import React, { createContext, useContext, useEffect, useState, useCallback, Rea
 import { CavosSDK, WalletStatus } from '../CavosSDK';
 import { CavosConfig, UserInfo, OnrampProvider, LoginProvider, FirebaseCredentials } from '../types';
 import { SessionKeyPolicy } from '../types/session';
-import { Call, type TypedData } from 'starknet';
+import { Call, RpcProvider, type TypedData } from 'starknet';
 import { CavosAuthModal } from './components/CavosAuthModal';
 
 export interface CavosModalConfig {
@@ -56,6 +56,10 @@ export interface CavosContextValue {
   updateSessionPolicy: (policy: SessionKeyPolicy) => void;
   /** Public key of the current session key (safe to display) */
   sessionPublicKey: string | null;
+  /** Execute calls on the Slot chain (no paymaster, uses session key) */
+  executeOnSlot: (calls: Call | Call[]) => Promise<string>;
+  /** RpcProvider for the Slot chain — use for read queries or Dojo SDK integration */
+  getSlotProvider: () => RpcProvider | null;
 }
 
 const CavosContext = createContext<CavosContextValue | null>(null);
@@ -72,6 +76,8 @@ const DEFAULT_WALLET_STATUS: WalletStatus = {
   isRegistering: false,
   isSessionActive: false,
   isReady: false,
+  isSlotDeploying: false,
+  isSlotDeployed: false,
 };
 
 export function CavosProvider({ config, modal, children }: CavosProviderProps) {
@@ -264,6 +270,8 @@ export function CavosProvider({ config, modal, children }: CavosProviderProps) {
     exportSession: () => cavos.exportSession(),
     updateSessionPolicy: (policy: SessionKeyPolicy) => cavos.updateSessionPolicy(policy),
     sessionPublicKey,
+    executeOnSlot: (calls: Call | Call[]) => cavos.executeOnSlot(calls),
+    getSlotProvider: () => cavos.getSlotProvider(),
   };
 
   return (

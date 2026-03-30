@@ -1,3 +1,15 @@
+export interface SlotConfig {
+  /** RPC URL of the Cartridge-managed Katana Slot instance (forked from mainnet) */
+  rpcUrl: string;
+  /**
+   * Chain ID for the Slot chain (e.g. '0x534e5f4d41494e' for SN_MAIN).
+   * If omitted, the SDK fetches it dynamically from the RPC on each call.
+   * Provide this to skip the extra RPC round-trip or when using a local
+   * Katana with a custom chain ID.
+   */
+  chainId?: string;
+}
+
 export interface CavosConfig {
   /** Your app ID from Cavos dashboard (https://cavos.xyz/dashboard) */
   appId: string;
@@ -17,6 +29,12 @@ export interface CavosConfig {
   oauthWallet?: Partial<OAuthWalletConfig>;
   /** Session configuration for session keys */
   session?: SessionConfig;
+  /**
+   * Cartridge Slot configuration. When provided, wallets are automatically
+   * deployed to the Slot chain after deploying on the primary network.
+   * No paymaster needed — Slot runs with no_fee = true.
+   */
+  slot?: SlotConfig;
 }
 
 /** Configuration for session key duration and default policy */

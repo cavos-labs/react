@@ -17,6 +17,7 @@ import {
   num,
   typedData,
   hash,
+  transaction,
   ec,
   Signer,
   EDAMode,
@@ -59,7 +60,29 @@ class OAuthSigner extends Signer {
     transactions: Call[],
     details: any
   ): Promise<Signature> {
-    const txHash = details.transactionHash || '0x0';
+    // starknet.js v9 does not include transactionHash in InvocationsSignerDetails —
+    // compute it the same way the base Signer does.
+    let txHash: string = details.transactionHash;
+    if (!txHash) {
+      const walletAddress = details.walletAddress || this.oauthManager.getWalletAddress();
+      if (!walletAddress) {
+        throw new Error('No wallet address available for transaction signing');
+      }
+      const compiledCalldata = transaction.getExecuteCalldata(
+        transactions,
+        details.cairoVersion ?? '1',
+      );
+      // Convert data availability mode string → integer (L1=0, L2=1)
+      const intDAM = (mode: any) => (mode === 'L1' || mode === 0 ? 0 : 1);
+      txHash = hash.calculateInvokeTransactionHash({
+        ...details,
+        senderAddress: walletAddress,
+        compiledCalldata,
+        version: details.version,
+        nonceDataAvailabilityMode: intDAM(details.nonceDataAvailabilityMode),
+        feeDataAvailabilityMode: intDAM(details.feeDataAvailabilityMode),
+      });
+    }
 
     if (this.forDeploy) {
       return await this.oauthManager.buildJWTSignatureData(txHash);
@@ -81,6 +104,7 @@ export class OAuthTransactionManager {
   private paymasterApiKey: string;
   private paymasterApiBaseUrl: string;
   private network: 'mainnet' | 'sepolia';
+  private chainIdOverride: string | undefined;
   private account: Account | null = null;
   private paymasterRpc: PaymasterRpc;
 
@@ -90,13 +114,15 @@ export class OAuthTransactionManager {
     rpcUrl: string,
     paymasterApiKey: string,
     network: 'mainnet' | 'sepolia',
-    paymasterUrl?: string
+    paymasterUrl?: string,
+    chainIdOverride?: string
   ) {
     this.config = config;
     this.provider = new RpcProvider({ nodeUrl: rpcUrl });
     this.oauthManager = oauthManager;
     this.paymasterApiKey = paymasterApiKey;
     this.network = network;
+    this.chainIdOverride = chainIdOverride;
 
     const defaultPaymasterUrl = network === 'mainnet'
       ? 'https://paymaster.cavos.xyz'
@@ -111,6 +137,11 @@ export class OAuthTransactionManager {
       nodeUrl: resolvedPaymasterUrl,
       headers: { 'x-paymaster-api-key': paymasterApiKey },
     });
+  }
+
+  private async getCurrentChainTimestamp(): Promise<bigint> {
+    const block = await this.provider.getBlock('latest');
+    return BigInt(block.timestamp);
   }
 
   /**
@@ -147,14 +178,11 @@ export class OAuthTransactionManager {
     }
 
     try {
-      const [result, block] = await Promise.all([
-        this.provider.callContract({
-          contractAddress: session.walletAddress,
-          entrypoint: 'get_session',
-          calldata: [session.sessionPubKey],
-        }),
-        this.provider.getBlock('latest'),
-      ]);
+      const result = await this.provider.callContract({
+        contractAddress: session.walletAddress,
+        entrypoint: 'get_session',
+        calldata: [session.sessionPubKey],
+      });
 
       // get_session returns (nonce, valid_after, valid_until, renewal_deadline, registered_at, allowed_contracts_root, max_calls_per_tx)
       const nonce = BigInt(result[0]);
@@ -168,7 +196,9 @@ export class OAuthTransactionManager {
         return { registered: false, active: false, expired: false, canRenew: false };
       }
 
-      const now = BigInt(block.timestamp);
+      // Session state is enforced on-chain against block.timestamp, so status
+      // checks need to use chain time to avoid false positives on Slot/Katana.
+      const now = await this.getCurrentChainTimestamp();
       const active = now >= validAfter;
       const expired = now >= validUntil;
       const canRenew = expired && now < renewalDeadline;
@@ -270,6 +300,129 @@ export class OAuthTransactionManager {
 
       throw e;
     }
+  }
+
+  /**
+   * Deploy the account using a direct DEPLOY_ACCOUNT transaction (no paymaster).
+   * Use this for Slot/Katana chains where no_fee = true.
+   */
+  async deployAccountDirect(): Promise<string> {
+    const session = this.oauthManager.getSession();
+    if (!session?.walletAddress || !session.addressSeed) {
+      throw new Error('No valid session for deployment');
+    }
+
+    if (await this.isDeployed()) {
+      return 'already-deployed';
+    }
+
+    const constructorCalldata = [
+      session.addressSeed,
+      this.config.jwksRegistryAddress,
+    ].map(c => num.toHex(c));
+
+    const deploySigner = new OAuthSigner(this.oauthManager, true);
+    const account = new Account({
+      provider: this.provider,
+      address: session.walletAddress,
+      signer: deploySigner,
+    });
+
+    const result = await account.deployAccount({
+      classHash: this.config.cavosAccountClassHash,
+      constructorCalldata,
+      addressSalt: session.addressSeed,
+      contractAddress: session.walletAddress,
+    });
+
+    await this.waitForTransaction(result.transaction_hash);
+    return result.transaction_hash;
+  }
+
+  private getNoFeeResourceBounds() {
+    return {
+      l1_gas: { max_amount: 0n, max_price_per_unit: 0n },
+      l2_gas: { max_amount: 0n, max_price_per_unit: 0n },
+      l1_data_gas: { max_amount: 0n, max_price_per_unit: 0n },
+    };
+  }
+
+  private createDirectAccount(useJWTSignature: boolean): Account {
+    const session = this.oauthManager.getSession();
+    if (!session?.walletAddress) {
+      throw new Error('No valid session');
+    }
+
+    return new Account({
+      provider: this.provider,
+      address: session.walletAddress,
+      signer: new OAuthSigner(this.oauthManager, useJWTSignature),
+    });
+  }
+
+  private async executeDirectNoFee(calls: Call[], useJWTSignature: boolean): Promise<string> {
+    const account = this.createDirectAccount(useJWTSignature);
+    const result = await account.execute(calls, {
+      resourceBounds: this.getNoFeeResourceBounds(),
+    });
+
+    await this.waitForTransaction(result.transaction_hash);
+    return result.transaction_hash;
+  }
+
+  /**
+   * Direct JWT registration on Slot is not supported.
+   *
+   * The account must look up the JWKS key via call_contract, which Slot rejects
+   * in __validate__. Use registerCurrentSessionViaOutside() instead so the JWT
+   * verification runs inside execute_from_outside_v2 execution mode.
+   */
+  async registerCurrentSessionDirect(): Promise<string> {
+    throw new Error(
+      'Direct Slot session registration is not supported. ' +
+      'Use registerCurrentSessionViaOutside() so JWT verification runs in execute_from_outside_v2.'
+    );
+  }
+
+  /**
+   * Execute on a no_fee chain such as Slot using the standard account path.
+   *
+   * This path only works once the session is already registered on-chain.
+   * First-time Slot registration must go through execute_from_outside_v2.
+   */
+  async executeOnNoFeeChain(calls: Call | Call[]): Promise<string> {
+    const session = this.oauthManager.getSession();
+    if (!session?.walletAddress) {
+      throw new Error('No valid session');
+    }
+
+    const callsArray = Array.isArray(calls) ? calls : [calls];
+    const status = await this.getSessionStatus();
+
+    if (!status.registered) {
+      throw new Error(
+        'Session is not registered on Slot yet. ' +
+        'Use executeViaOutsideExecution() or CavosSDK.executeOnSlot() for the first transaction.'
+      );
+    }
+
+    if (status.expired && status.canRenew) {
+      throw new Error(
+        'SESSION_EXPIRED: Session has expired on Slot and must be renewed from a fresh login before executing again.'
+      );
+    }
+
+    if (status.expired && !status.canRenew) {
+      throw new Error('SESSION_EXPIRED: Session has expired outside grace period. Please login again.');
+    }
+
+    if (!status.active) {
+      throw new Error(
+        `SESSION_NOT_ACTIVE: Session activates at ${status.validAfter?.toString() || 'unknown'}.`
+      );
+    }
+
+    return this.executeDirectNoFee(callsArray, false);
   }
 
   /**
@@ -543,6 +696,232 @@ export class OAuthTransactionManager {
    * Register the current session key on-chain using the current JWT.
    * Call this explicitly before executing transactions to pre-register the session.
    */
+  /**
+   * Register the current session on Slot via execute_from_outside_v2 (SNIP-9).
+   *
+   * __validate__ blocks call_contract syscalls (needed for JWKS lookup), so JWT
+   * validation cannot run there.  execute_from_outside_v2 runs in execution mode
+   * where call_contract is allowed — same mechanism the paymaster uses on mainnet.
+   *
+   * @param relayerAccount Pre-funded Account on the Slot that submits the outer tx.
+   */
+  async registerCurrentSessionViaOutside(relayerAccount: Account): Promise<string> {
+    const session = this.oauthManager.getSession();
+    if (!session?.jwt || !session.walletAddress) {
+      throw new Error('Must be logged in to register session');
+    }
+
+    const allowedContracts = session.sessionPolicy?.allowedContracts ?? [];
+    const walletAddress = num.toHex(session.walletAddress).toLowerCase();
+    const walletAllowed = allowedContracts.some(
+      contract => num.toHex(contract).toLowerCase() === walletAddress
+    );
+    if (allowedContracts.length > 0 && !walletAllowed) {
+      throw new Error(
+        'Cannot pre-register a restricted Slot session with a wallet self-call. ' +
+        'Use executeOnSlot() with your first allowed call so the same tx can register the session and execute it.'
+      );
+    }
+
+    const noOpCall: Call = {
+      contractAddress: session.walletAddress,
+      entrypoint: 'get_version',
+      calldata: [],
+    };
+
+    return this.executeViaOutsideExecution([noOpCall], relayerAccount);
+  }
+
+  /**
+   * Execute calls on Slot via execute_from_outside_v2 (SNIP-9).
+   *
+   * Mirrors the normal wallet flow:
+   * - Session NOT registered: JWT signature (OAUTH_JWT_V1) — validates on-chain and registers
+   *   the session key in the same tx. One-time cost (RSA).
+   * - Session registered: lightweight session key signature (SESSION_V1) — only ECDSA, cheap.
+   *
+   * Hashes the outside-execution payload manually using the account contract's
+   * SNIP-12 type hashes. starknet.js does not currently support the u64 fields
+   * used by the on-chain OutsideExecution struct.
+   */
+  async executeViaOutsideExecution(calls: Call[], relayerAccount: Account): Promise<string> {
+    const session = this.oauthManager.getSession();
+    if (!session?.jwt || !session.walletAddress) throw new Error('Not logged in');
+
+    const walletAddress = session.walletAddress;
+    const chainId = this.chainIdOverride ?? await this.provider.getChainId();
+
+    // ANY_CALLER felt252 = shortString('ANY_CALLER') — allows any account to submit.
+    const ANY_CALLER = '0x414e595f43414c4c4552';
+
+    // Outside-execution timestamps are checked by the account contract when the
+    // relayed tx is finally included. On Slot, inclusion can lag far behind the
+    // moment we build the payload, so a 1-hour window is too narrow and leads
+    // to "Invalid timestamp" reverts. Tie the outside-execution window to the
+    // session lifetime instead.
+    const executeAfter = session.nonceParams.validAfter > 60n
+      ? session.nonceParams.validAfter - 60n
+      : 0n;
+    const executeBefore = session.nonceParams.validUntil;
+
+    // Random nonce — randomPrivateKey() returns Uint8Array; convert to hex string.
+    const rawKey = ec.starkCurve.utils.randomPrivateKey();
+    const nonce = '0x' + Array.from(rawKey).map(b => b.toString(16).padStart(2, '0')).join('');
+
+    // starknet.js typedData helpers do not support u64 fields here, but the
+    // account's OutsideExecution struct uses u64 for execute_after/before.
+    // Hash the payload manually with the contract's hard-coded SNIP-12 type
+    // hashes so the session-key signature matches on-chain verification.
+    const messageHash = this.computeOutsideExecutionMessageHash(
+      walletAddress,
+      ANY_CALLER,
+      nonce,
+      executeAfter,
+      executeBefore,
+      calls,
+      chainId,
+    );
+
+    // Choose signature: JWT for unregistered sessions (registers + executes), session key otherwise.
+    const sessionStatus = await this.getSessionStatus();
+    let sigArray: string[];
+    if (!sessionStatus.registered) {
+      const signature = await this.oauthManager.buildJWTSignatureData(messageHash);
+      sigArray = Array.isArray(signature) ? signature.map(String) : [String(signature)];
+    } else {
+      sigArray = this.oauthManager.buildSessionSignature(messageHash, calls);
+    }
+
+    // Build calldata for execute_from_outside_v2(outside_execution, signature)
+    const calldata = this.buildOutsideExecutionCalldata(
+      ANY_CALLER,
+      nonce,
+      executeAfter,
+      executeBefore,
+      calls,
+      sigArray,
+    );
+
+    // Relayer submits the outer transaction
+    const { transaction_hash } = await relayerAccount.execute(
+      {
+        contractAddress: walletAddress,
+        entrypoint: 'execute_from_outside_v2',
+        calldata,
+      },
+      {
+        resourceBounds: {
+          l1_gas:      { max_amount: 0n, max_price_per_unit: 0n },
+          l2_gas:      { max_amount: 0n, max_price_per_unit: 0n },
+          l1_data_gas: { max_amount: 0n, max_price_per_unit: 0n },
+        },
+      },
+    );
+
+    await this.waitForTransaction(transaction_hash);
+    return transaction_hash;
+  }
+
+  // ── SNIP-12 Rev 1 hash for OutsideExecution (mirrors get_outside_execution_message_hash_v2) ──
+
+  private static readonly OUTSIDE_EXECUTION_TYPE_HASH =
+    '0x312b56c05a7965066ddbda31c016d8d05afc305071c0ca3cdc2192c3c2f1f0f';
+  private static readonly CALL_TYPE_HASH =
+    '0x3635c7f2a7ba93844c0d064e18e487f35ab90f7c39d00f186a781fc3f0c2ca9';
+  private static readonly DOMAIN_TYPE_HASH =
+    '0x1ff2f602e42168014d405a94f75e8a93d640751d71d16311266e140d8b0a210';
+  // shortString: 'Account.execute_from_outside'
+  private static readonly DOMAIN_NAME =
+    '0x4163636f756e742e657865637574655f66726f6d5f6f757473696465';
+  // shortString: 'StarkNet Message'
+  private static readonly STARKNET_MESSAGE =
+    '0x537461726b4e6574204d657373616765';
+
+  private computeOutsideExecutionMessageHash(
+    walletAddress: string,
+    caller: string,
+    nonce: string,
+    executeAfter: bigint,
+    executeBefore: bigint,
+    calls: Call[],
+    chainId: string,
+  ): string {
+    // poseidonMany: takes bigint[], returns hex string
+    const poseidonMany = (arr: bigint[]) => hash.computePoseidonHashOnElements(arr);
+    // Helper to nest: converts hex string result back to bigint for nesting
+    const pm = (arr: bigint[]) => BigInt(poseidonMany(arr));
+
+    // Hash each call
+    const callHashes = calls.map(call => {
+      const selector = call.entrypoint.startsWith('0x')
+        ? call.entrypoint
+        : hash.getSelectorFromName(call.entrypoint);
+      const cd = (call.calldata as string[] | undefined) ?? [];
+      const calldataHash = pm(cd.map(v => BigInt(v)));
+      return pm([
+        BigInt(OAuthTransactionManager.CALL_TYPE_HASH),
+        BigInt(call.contractAddress),
+        BigInt(selector),
+        calldataHash,
+      ]);
+    });
+
+    const callsHash = pm(callHashes);
+
+    const structHash = pm([
+      BigInt(OAuthTransactionManager.OUTSIDE_EXECUTION_TYPE_HASH),
+      BigInt(caller),
+      BigInt(nonce),
+      executeAfter,
+      executeBefore,
+      callsHash,
+    ]);
+
+    const domainHash = pm([
+      BigInt(OAuthTransactionManager.DOMAIN_TYPE_HASH),
+      BigInt(OAuthTransactionManager.DOMAIN_NAME),
+      2n,
+      BigInt(chainId),
+      1n,
+    ]);
+
+    return poseidonMany([
+      BigInt(OAuthTransactionManager.STARKNET_MESSAGE),
+      domainHash,
+      BigInt(walletAddress),
+      structHash,
+    ]);
+  }
+
+  private buildOutsideExecutionCalldata(
+    caller: string,
+    nonce: string,
+    executeAfter: bigint,
+    executeBefore: bigint,
+    calls: Call[],
+    signature: string[],
+  ): string[] {
+    const h = (v: string | bigint) => num.toHex(v);
+    const calldata: string[] = [
+      h(caller),
+      h(nonce),
+      h(executeAfter),
+      h(executeBefore),
+      h(BigInt(calls.length)),
+    ];
+
+    for (const call of calls) {
+      const selector = call.entrypoint.startsWith('0x')
+        ? call.entrypoint
+        : hash.getSelectorFromName(call.entrypoint);
+      const cd = (call.calldata as string[] | undefined) ?? [];
+      calldata.push(h(call.contractAddress), h(selector), h(BigInt(cd.length)), ...cd.map(h));
+    }
+
+    calldata.push(h(BigInt(signature.length)), ...signature);
+    return calldata;
+  }
+
   async registerCurrentSession(): Promise<string> {
     const session = this.oauthManager.getSession();
     if (!session?.jwt || !session.walletAddress) {
