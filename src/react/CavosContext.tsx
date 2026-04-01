@@ -50,6 +50,10 @@ export interface CavosContextValue {
   switchWallet: (name?: string) => Promise<void>;
   /** Register the current session key on-chain using the current JWT */
   registerCurrentSession: () => Promise<string>;
+  /** Register the current session key on Slot using execute_from_outside_v2 */
+  registerCurrentSessionOnSlot: () => Promise<string>;
+  /** Experimental direct Slot registration path that mirrors mainnet/sepolia */
+  registerCurrentSessionOnSlotDirect: () => Promise<string>;
   /** Export current session as base64 token for use with Cavos CLI */
   exportSession: () => string;
   /** Update session policy before registration */
@@ -124,11 +128,9 @@ export function CavosProvider({ config, modal, children }: CavosProviderProps) {
   useEffect(() => {
     const initialize = async () => {
       if (typeof window === 'undefined') return;
-      console.log('[CavosContext] initialize() starting');
 
       const urlParams = new URLSearchParams(window.location.search);
       const authData = urlParams.get('auth_data') || urlParams.get('zk_auth_data');
-      console.log('[CavosContext] authData:', authData ? 'present' : 'null');
 
       try {
         if (authData) {
@@ -138,16 +140,13 @@ export function CavosProvider({ config, modal, children }: CavosProviderProps) {
           CavosSDK.handlePopupCallback();
           // Process auth in this tab regardless — handles the redirect-fallback case,
           // and provides a usable state if window.close() is blocked by the browser.
-          console.log('[CavosContext] calling handleCallback()');
           await cavos.handleCallback(authData);
           // Clean up URL
           window.history.replaceState({}, document.title, window.location.pathname);
         } else {
           // Initialize and restore session
-          console.log('[CavosContext] calling init()');
           await cavos.init();
         }
-        console.log('[CavosContext] after init/callback, address:', cavos.getAddress());
         updateState();
       } catch (error) {
         console.error('[CavosProvider] Initialization error:', error);
@@ -267,6 +266,8 @@ export function CavosProvider({ config, modal, children }: CavosProviderProps) {
       updateState();
     },
     registerCurrentSession: async () => cavos.registerCurrentSession(),
+    registerCurrentSessionOnSlot: async () => cavos.registerCurrentSessionOnSlot(),
+    registerCurrentSessionOnSlotDirect: async () => cavos.registerCurrentSessionOnSlotDirect(),
     exportSession: () => cavos.exportSession(),
     updateSessionPolicy: (policy: SessionKeyPolicy) => cavos.updateSessionPolicy(policy),
     sessionPublicKey,

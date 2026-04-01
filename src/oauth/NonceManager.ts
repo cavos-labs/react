@@ -48,7 +48,7 @@ export class NonceManager {
     crypto.getRandomValues(randomBytes);
     const randomness = BigInt('0x' + Array.from(randomBytes).map(b => b.toString(16).padStart(2, '0')).join('')) % (2n ** 251n);
 
-    const validAfter = currentTimestamp;
+    const validAfter = currentTimestamp > 3600n ? currentTimestamp - 3600n : 0n;
     const validUntil = currentTimestamp + sessionDurationSeconds;
     const renewalDeadline = currentTimestamp + renewalGraceSeconds;
 

@@ -16,6 +16,7 @@ import {
   PaymasterRpc,
   num,
   typedData,
+  outsideExecution,
   hash,
   transaction,
   ec,
@@ -339,6 +340,66 @@ export class OAuthTransactionManager {
     return result.transaction_hash;
   }
 
+  /**
+   * Deploy the account via UDC (Universal Deployer Contract) using an external relayer.
+   *
+   * On Slot/Katana, __validate_deploy__ blocks call_contract (same restriction as
+   * __validate__), so the standard DEPLOY_ACCOUNT tx fails when the contract needs
+   * to verify the JWT via the JWKS registry.
+   *
+   * This method side-steps the issue: the relayer submits a regular INVOKE to the
+   * UDC, which calls the deploy syscall internally. The deployed account's
+   * constructor runs in execution context (no call_contract restriction) and the
+   * address matches DEPLOY_ACCOUNT when unique=false (deployer_address=0).
+   *
+   * Session registration must happen separately via execute_from_outside_v2.
+   */
+  async deployAccountViaRelayer(relayerAccount: Account): Promise<string> {
+    const session = this.oauthManager.getSession();
+    if (!session?.walletAddress || !session.addressSeed) {
+      throw new Error('No valid session for deployment');
+    }
+
+    if (await this.isDeployed()) {
+      return 'already-deployed';
+    }
+
+    // Starknet mainnet UDC — available on Slot via fork.
+    const UDC_ADDRESS = '0x041a78e741e5af2fec34b695679bc6891742439f7afb8484ecd7766661ad02bf';
+
+    const constructorCalldata = [
+      session.addressSeed,
+      this.config.jwksRegistryAddress,
+    ].map(c => num.toHex(c));
+
+    // UDC.deployContract(class_hash, salt, unique, calldata)
+    // unique = 0 (false) → deployer_address = 0 → same address as DEPLOY_ACCOUNT.
+    // Cairo 0 array serialization: calldata_len followed by elements.
+    const { transaction_hash } = await relayerAccount.execute(
+      {
+        contractAddress: UDC_ADDRESS,
+        entrypoint: 'deployContract',
+        calldata: [
+          this.config.cavosAccountClassHash,
+          num.toHex(session.addressSeed),
+          '0x0',                                     // unique = false
+          num.toHex(constructorCalldata.length),     // calldata_len
+          ...constructorCalldata,
+        ],
+      },
+      {
+        resourceBounds: {
+          l1_gas:      { max_amount: 0n, max_price_per_unit: 0n },
+          l2_gas:      { max_amount: 0n, max_price_per_unit: 0n },
+          l1_data_gas: { max_amount: 0n, max_price_per_unit: 0n },
+        },
+      },
+    );
+
+    await this.waitForTransaction(transaction_hash);
+    return transaction_hash;
+  }
+
   private getNoFeeResourceBounds() {
     return {
       l1_gas: { max_amount: 0n, max_price_per_unit: 0n },
@@ -371,17 +432,28 @@ export class OAuthTransactionManager {
   }
 
   /**
-   * Direct JWT registration on Slot is not supported.
+   * Experimental direct JWT registration on Slot.
    *
-   * The account must look up the JWKS key via call_contract, which Slot rejects
-   * in __validate__. Use registerCurrentSessionViaOutside() instead so the JWT
-   * verification runs inside execute_from_outside_v2 execution mode.
+   * This mirrors the mainnet/sepolia path as closely as possible by sending a
+   * regular invoke signed with OAUTH_JWT_V1. On some Katana/Slot deployments
+   * this is expected to revert because JWT verification needs call_contract in
+   * __validate__. We still expose it as a diagnostic path so apps can compare
+   * the direct and outside-execution behaviors.
    */
   async registerCurrentSessionDirect(): Promise<string> {
-    throw new Error(
-      'Direct Slot session registration is not supported. ' +
-      'Use registerCurrentSessionViaOutside() so JWT verification runs in execute_from_outside_v2.'
-    );
+    const session = this.oauthManager.getSession();
+    if (!session?.jwt || !session.walletAddress) {
+      throw new Error('Must be logged in to register session');
+    }
+
+    const registrationCall: Call = {
+      contractAddress: session.walletAddress,
+      entrypoint: 'get_version',
+      calldata: [],
+    };
+    const chainId = this.chainIdOverride ?? await this.provider.getChainId();
+    const txHash = await this.executeDirectNoFee([registrationCall], true);
+    return txHash;
   }
 
   /**
@@ -539,9 +611,6 @@ export class OAuthTransactionManager {
       tip: 0n,
       paymasterData: [],
     });
-
-    console.log('[executeWithUserFees] txHash:', txHash);
-    console.log('[executeWithUserFees] resourceBounds:', resourceBounds);
 
     // 5. Sign with session key (SESSION_V1 + Merkle proof per call)
     const signature = this.oauthManager.buildSessionSignature(txHash, calls);
@@ -703,6 +772,10 @@ export class OAuthTransactionManager {
    * validation cannot run there.  execute_from_outside_v2 runs in execution mode
    * where call_contract is allowed — same mechanism the paymaster uses on mainnet.
    *
+   * The no-op wallet self-call only exists to carry the JWT signature through the
+   * outside-execution path. The account stores the session policy during this step;
+   * allowed-contract enforcement starts on subsequent SESSION_V1 transactions.
+   *
    * @param relayerAccount Pre-funded Account on the Slot that submits the outer tx.
    */
   async registerCurrentSessionViaOutside(relayerAccount: Account): Promise<string> {
@@ -710,25 +783,11 @@ export class OAuthTransactionManager {
     if (!session?.jwt || !session.walletAddress) {
       throw new Error('Must be logged in to register session');
     }
-
-    const allowedContracts = session.sessionPolicy?.allowedContracts ?? [];
-    const walletAddress = num.toHex(session.walletAddress).toLowerCase();
-    const walletAllowed = allowedContracts.some(
-      contract => num.toHex(contract).toLowerCase() === walletAddress
-    );
-    if (allowedContracts.length > 0 && !walletAllowed) {
-      throw new Error(
-        'Cannot pre-register a restricted Slot session with a wallet self-call. ' +
-        'Use executeOnSlot() with your first allowed call so the same tx can register the session and execute it.'
-      );
-    }
-
     const noOpCall: Call = {
       contractAddress: session.walletAddress,
       entrypoint: 'get_version',
       calldata: [],
     };
-
     return this.executeViaOutsideExecution([noOpCall], relayerAccount);
   }
 
@@ -751,30 +810,26 @@ export class OAuthTransactionManager {
     const walletAddress = session.walletAddress;
     const chainId = this.chainIdOverride ?? await this.provider.getChainId();
 
-    // ANY_CALLER felt252 = shortString('ANY_CALLER') — allows any account to submit.
-    const ANY_CALLER = '0x414e595f43414c4c4552';
+    // Match the paymaster/SNIP-9 flow used on mainnet and sepolia as closely as
+    // possible: bind the outside execution to the submitter account instead of
+    // ANY_CALLER, use a short execution window.
+    //
+    // IMPORTANT: We use our manual SNIP-12 hash computation instead of starknet.js's
+    // outsideExecution.getTypedData / typedData.getMessageHash helpers because
+    // starknet.js v9 encodes Execute After/Before as u128, while our Cairo contract
+    // uses u64 — this type mismatch produces a different SNIP-12 type hash and
+    // message hash, causing "Invalid session key signature" on-chain.
+    const caller = relayerAccount.address;
+    const currentTimestamp = BigInt((await this.provider.getBlock('latest')).timestamp);
+    const executeAfter = 1n;
+    const executeBefore = currentTimestamp + 3600n;
+    const nonce = this.generateOutsideExecutionNonce();
 
-    // Outside-execution timestamps are checked by the account contract when the
-    // relayed tx is finally included. On Slot, inclusion can lag far behind the
-    // moment we build the payload, so a 1-hour window is too narrow and leads
-    // to "Invalid timestamp" reverts. Tie the outside-execution window to the
-    // session lifetime instead.
-    const executeAfter = session.nonceParams.validAfter > 60n
-      ? session.nonceParams.validAfter - 60n
-      : 0n;
-    const executeBefore = session.nonceParams.validUntil;
-
-    // Random nonce — randomPrivateKey() returns Uint8Array; convert to hex string.
-    const rawKey = ec.starkCurve.utils.randomPrivateKey();
-    const nonce = '0x' + Array.from(rawKey).map(b => b.toString(16).padStart(2, '0')).join('');
-
-    // starknet.js typedData helpers do not support u64 fields here, but the
-    // account's OutsideExecution struct uses u64 for execute_after/before.
-    // Hash the payload manually with the contract's hard-coded SNIP-12 type
-    // hashes so the session-key signature matches on-chain verification.
+    // Compute the SNIP-12 rev1 message hash using our manual implementation
+    // that matches the contract's u64-based type hashes exactly.
     const messageHash = this.computeOutsideExecutionMessageHash(
       walletAddress,
-      ANY_CALLER,
+      caller,
       nonce,
       executeAfter,
       executeBefore,
@@ -792,9 +847,10 @@ export class OAuthTransactionManager {
       sigArray = this.oauthManager.buildSessionSignature(messageHash, calls);
     }
 
-    // Build calldata for execute_from_outside_v2(outside_execution, signature)
+    // Build the execute_from_outside_v2 calldata manually (matches the contract's
+    // expected encoding: caller, nonce, execute_after, execute_before, calls[], signature[]).
     const calldata = this.buildOutsideExecutionCalldata(
-      ANY_CALLER,
+      caller,
       nonce,
       executeAfter,
       executeBefore,
@@ -817,9 +873,17 @@ export class OAuthTransactionManager {
         },
       },
     );
-
     await this.waitForTransaction(transaction_hash);
     return transaction_hash;
+  }
+
+  private generateOutsideExecutionNonce(): string {
+    const bytes =
+      typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function'
+        ? crypto.getRandomValues(new Uint8Array(16))
+        : ec.starkCurve.utils.randomPrivateKey().slice(0, 16);
+
+    return '0x' + Array.from(bytes).map((b) => b.toString(16).padStart(2, '0')).join('');
   }
 
   // ── SNIP-12 Rev 1 hash for OutsideExecution (mirrors get_outside_execution_message_hash_v2) ──
@@ -1030,7 +1094,6 @@ export class OAuthTransactionManager {
       },
       parameters: buildResult.parameters,
     }]);
-
     return result.transaction_hash;
   }
 
@@ -1047,19 +1110,25 @@ export class OAuthTransactionManager {
       try {
         const receipt = await this.provider.getTransactionReceipt(txHash);
         if (receipt) {
-          const isSuccessful = (receipt as any).execution_status === 'SUCCEEDED' ||
-            (receipt as any).status === 'ACCEPTED_ON_L2' ||
-            (receipt as any).finality_status === 'ACCEPTED_ON_L2' ||
-            (receipt as any).finality_status === 'ACCEPTED_ON_L1';
+          const executionStatus = (receipt as any).execution_status;
+          const finalityStatus = (receipt as any).finality_status || (receipt as any).status;
 
-          if (isSuccessful) {
+          if (executionStatus === 'REVERTED') {
+            const revertReason = (receipt as any).revert_error || (receipt as any).revert_reason || 'Unknown revert reason';
+            throw new Error(`Transaction ${txHash} was reverted: ${revertReason}`);
+          }
+
+          if (executionStatus === 'SUCCEEDED') {
             return;
           }
 
-          const isFailed = (receipt as any).execution_status === 'REVERTED';
-          if (isFailed) {
-            const revertReason = (receipt as any).revert_error || (receipt as any).revert_reason || 'Unknown revert reason';
-            throw new Error(`Transaction ${txHash} was reverted: ${revertReason}`);
+          // Some RPCs omit execution_status for older receipts. In that case, fall
+          // back to finality only after ruling out explicit reverts above.
+          if (!executionStatus && (
+            finalityStatus === 'ACCEPTED_ON_L2' ||
+            finalityStatus === 'ACCEPTED_ON_L1'
+          )) {
+            return;
           }
         }
       } catch (error: any) {

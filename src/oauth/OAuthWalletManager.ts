@@ -690,13 +690,13 @@ export class OAuthWalletManager {
 
     // Append policy fields after JWT data
     const policy = session.sessionPolicy;
+    const allowedContractsRoot = policy && policy.allowedContracts.length > 0
+      ? OAuthWalletManager.computeMerkleRoot(policy.allowedContracts)
+      : '0x0';
     sig.push(num.toHex(nonceParams.validAfter)); // valid_after
 
     if (policy) {
-      const merkleRoot = policy.allowedContracts.length > 0
-        ? OAuthWalletManager.computeMerkleRoot(policy.allowedContracts)
-        : '0x0';
-      sig.push(merkleRoot); // allowed_contracts_root
+      sig.push(allowedContractsRoot); // allowed_contracts_root
       sig.push(num.toHex(policy.maxCallsPerTx)); // max_calls_per_tx
       sig.push(num.toHex(policy.spendingLimits.length)); // spending_policies_count
       for (const limit of policy.spendingLimits) {

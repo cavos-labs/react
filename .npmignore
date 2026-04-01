@@ -8,6 +8,7 @@ tsup.config.ts
 .gitignore
 *.test.ts
 *.test.tsx
+*.tgz
 
 # Documentation (keep README.md)
 docs/

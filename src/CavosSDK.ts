@@ -495,12 +495,22 @@ export class CavosSDK {
       try {
         const receipt = await rpc.getTransactionReceipt(txHash);
         if (receipt) {
-          const ok = (receipt as any).execution_status === 'SUCCEEDED' ||
-            (receipt as any).finality_status === 'ACCEPTED_ON_L2' ||
-            (receipt as any).finality_status === 'ACCEPTED_ON_L1';
-          if (ok) return;
-          if ((receipt as any).execution_status === 'REVERTED') {
-            throw new Error(`Deploy tx reverted: ${(receipt as any).revert_error || 'unknown'}`);
+          const executionStatus = (receipt as any).execution_status;
+          const finalityStatus = (receipt as any).finality_status || (receipt as any).status;
+
+          if (executionStatus === 'REVERTED') {
+            throw new Error(
+              `Deploy tx reverted: ${(receipt as any).revert_error || (receipt as any).revert_reason || 'unknown'}`
+            );
+          }
+
+          if (executionStatus === 'SUCCEEDED') return;
+
+          if (!executionStatus && (
+            finalityStatus === 'ACCEPTED_ON_L2' ||
+            finalityStatus === 'ACCEPTED_ON_L1'
+          )) {
+            return;
           }
         }
       } catch (e: any) {
@@ -521,22 +531,6 @@ export class CavosSDK {
 
     if (this.isJwtExpired()) {
       this.logger.log('[Slot] Auto-registration skipped: JWT is expired.');
-      return;
-    }
-
-    const session = this.oauthWalletManager.getSession();
-    const allowedContracts = session?.sessionPolicy?.allowedContracts ?? [];
-    const walletAddress = session?.walletAddress
-      ? num.toHex(session.walletAddress).toLowerCase()
-      : null;
-    const walletAllowed = walletAddress
-      ? allowedContracts.some(contract => num.toHex(contract).toLowerCase() === walletAddress)
-      : false;
-    if (allowedContracts.length > 0 && !walletAllowed) {
-      this.logger.log(
-        '[Slot] Auto-registration skipped for restricted policy. ' +
-        'The first executeOnSlot() call must register the session using an allowed target contract.'
-      );
       return;
     }
 
@@ -704,7 +698,7 @@ export class CavosSDK {
         return;
       }
 
-      this.logger.log('[Slot] Wallet not deployed on Slot. Deploying...');
+      this.logger.log('[Slot] Wallet not deployed on Slot. Deploying via UDC...');
       this.updateWalletStatus({ isSlotDeploying: true });
 
       if (!this.slotTransactionManager) {
@@ -712,8 +706,16 @@ export class CavosSDK {
       }
       if (!this.slotTransactionManager) return;
 
+      if (!this.slotRelayerAccount) {
+        this.logger.alwaysError('[Slot] Cannot deploy: no relayer account available.');
+        this.updateWalletStatus({ isSlotDeploying: false });
+        return;
+      }
+
       try {
-        const deployHash = await this.slotTransactionManager.deployAccountDirect();
+        const deployHash = await this.slotTransactionManager.deployAccountViaRelayer(
+          this.slotRelayerAccount,
+        );
 
         if (deployHash === 'already-deployed') {
           this.updateWalletStatus({ isSlotDeploying: false, isSlotDeployed: true });
@@ -925,6 +927,94 @@ export class CavosSDK {
     }
     const txHash = await this.transactionManager.registerCurrentSession();
     this.updateWalletStatus({ isSessionActive: true });
+    return txHash;
+  }
+
+  /**
+   * Register the current session key on Slot using execute_from_outside_v2.
+   * Useful when you want an explicit manual registration step before the first Slot tx.
+   */
+  async registerCurrentSessionOnSlot(): Promise<string> {
+    if (!this.slotTransactionManager) {
+      throw new Error('Slot not configured. Pass slot.rpcUrl in CavosConfig.');
+    }
+    if (!this.slotRelayerAccount) {
+      throw new Error('Slot relayer is not available.');
+    }
+
+    const address = this.getAddress();
+    if (!address) {
+      throw new Error('Wallet not initialized');
+    }
+
+    if (!this._walletStatus.isSlotDeployed) {
+      let isDeployedOnSlot = false;
+      try {
+        const classHash = await this.slotProvider?.getClassHashAt(address);
+        isDeployedOnSlot = !!classHash;
+      } catch {
+        isDeployedOnSlot = false;
+      }
+
+      if (!isDeployedOnSlot) {
+        throw new Error('Wallet not deployed on Slot yet. Wait for walletStatus.isSlotDeployed.');
+      }
+
+      this.updateWalletStatus({ isSlotDeployed: true });
+    }
+
+    if (this.isJwtExpired()) {
+      throw new JwtExpiredError();
+    }
+
+    const status = await this.slotTransactionManager.getSessionStatus();
+    if (status.registered && status.active && !status.expired) {
+      return 'already-registered';
+    }
+
+    const txHash = await this.slotTransactionManager.registerCurrentSessionViaOutside(
+      this.slotRelayerAccount,
+    );
+    this.updateWalletStatus({ isSessionActive: true, isReady: true });
+    return txHash;
+  }
+
+  /**
+   * Experimental direct Slot registration path that mirrors mainnet/sepolia.
+   * Useful for debugging whether Katana accepts JWT verification in __validate__.
+   */
+  async registerCurrentSessionOnSlotDirect(): Promise<string> {
+    if (!this.slotTransactionManager) {
+      throw new Error('Slot not configured. Pass slot.rpcUrl in CavosConfig.');
+    }
+
+    const address = this.getAddress();
+    if (!address) {
+      throw new Error('Wallet not initialized');
+    }
+
+    if (!this._walletStatus.isSlotDeployed) {
+      let isDeployedOnSlot = false;
+      try {
+        const classHash = await this.slotProvider?.getClassHashAt(address);
+        isDeployedOnSlot = !!classHash;
+      } catch {
+        isDeployedOnSlot = false;
+      }
+
+      if (!isDeployedOnSlot) {
+        throw new Error('Wallet not deployed on Slot yet. Wait for walletStatus.isSlotDeployed.');
+      }
+
+      this.updateWalletStatus({ isSlotDeployed: true });
+    }
+
+    if (this.isJwtExpired()) {
+      throw new JwtExpiredError();
+    }
+
+    const txHash = await this.slotTransactionManager.registerCurrentSessionDirect();
+    this.updateWalletStatus({ isSessionActive: true, isReady: true });
     return txHash;
   }
 
