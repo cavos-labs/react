@@ -2,12 +2,28 @@ export interface SlotConfig {
   /** RPC URL of the Cartridge-managed Katana Slot instance (forked from mainnet) */
   rpcUrl: string;
   /**
-   * Chain ID for the Slot chain (e.g. '0x534e5f4d41494e' for SN_MAIN).
-   * If omitted, the SDK fetches it dynamically from the RPC on each call.
-   * Provide this to skip the extra RPC round-trip or when using a local
-   * Katana with a custom chain ID.
+   * Chain ID for the Slot chain.
+   * Katana nodes report SN_MAIN via RPC but internally use a custom chain ID.
+   * You MUST provide the exact internal VM chain ID to avoid signature mismatches.
+   * Find it by calling get_tx_info().chain_id from a deployed Cairo contract.
    */
   chainId?: string;
+  /**
+   * Cavos Account class hash on this Slot chain.
+   * Required for blank (non-forked) Katana instances where the class was declared
+   * separately via deploy_to_katana.js. If omitted, uses the same class hash as
+   * the primary network (mainnet/sepolia).
+   */
+  /**
+   * Address of the account that will act as the relayer for sending `execute_from_outside_v2`
+   * on the Katana slot. Defaults to the primary network's relayer, but MUST be overridden
+   * with a funded account address on a blank Katana instance.
+   */
+  relayerAddress?: string;
+  /**
+   * Private key for the relayer account on the Katana slot.
+   */
+  relayerPrivateKey?: string;
 }
 
 export interface CavosConfig {

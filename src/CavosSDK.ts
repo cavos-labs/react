@@ -116,8 +116,8 @@ export class CavosSDK {
 
     if (config.slot?.rpcUrl) {
       this.slotProvider = new RpcProvider({ nodeUrl: config.slot.rpcUrl });
-      const relayerAddress = DEFAULT_SLOT_RELAYER_ADDRESS;
-      const relayerPrivateKey = DEFAULT_SLOT_RELAYER_PRIVATE_KEY;
+      const relayerAddress = config.slot.relayerAddress || DEFAULT_SLOT_RELAYER_ADDRESS;
+      const relayerPrivateKey = config.slot.relayerPrivateKey || DEFAULT_SLOT_RELAYER_PRIVATE_KEY;
       this.slotRelayerAccount = new Account({
         provider: this.slotProvider,
         address: relayerAddress,
