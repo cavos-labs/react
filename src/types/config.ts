@@ -67,7 +67,12 @@ export interface SessionConfig {
 export interface OAuthWalletConfig {
   /** Address of the deployed JWKS Registry contract */
   jwksRegistryAddress: string;
-  /** Address of the OAuth Account class hash (for deployment) */
+  /**
+   * Stable OAuth Account class hash used for deterministic address derivation.
+   * Keep this fixed once accounts exist on-chain, otherwise the derived address changes.
+   * It is also the default deployment class hash.
+   * The upgrade target is not configurable — see `LATEST_CAVOS_ACCOUNT_CLASS_HASH_*` in config/defaults.ts.
+   */
   cavosAccountClassHash: string;
   /** Salt for address derivation (default: '0') */
   salt?: string;

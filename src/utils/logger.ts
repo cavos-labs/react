@@ -38,6 +38,10 @@ function sanitize(data: any): any {
     return data.map(sanitize);
   }
 
+  if (data instanceof Error) {
+    return data;
+  }
+
   if (typeof data === 'object') {
     const sanitized: any = {};
     for (const [key, value] of Object.entries(data)) {

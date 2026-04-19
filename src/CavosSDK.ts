@@ -448,6 +448,8 @@ export class CavosSDK {
             pendingDeployTxHash: undefined,
           });
 
+          await this.ensureAccountClassHashIsCurrent();
+
           // Track wallet deployment for MAU
           const address = this.getAddress();
           if (address) {
@@ -469,7 +471,8 @@ export class CavosSDK {
           }
         }
       } else {
-      this.logger.log('Account already deployed. Checking session status...');
+        await this.ensureAccountClassHashIsCurrent();
+        this.logger.log('Account already deployed. Checking session status...');
         const sessionActive = this.transactionManager
           ? await this.transactionManager.isSessionRegistered()
           : false;
@@ -575,6 +578,22 @@ export class CavosSDK {
       // If the JWT is expired, execute() will throw JwtExpiredError clearly to the user.
       this.updateWalletStatus({ isRegistering: false, isSessionActive: false, isReady: true });
     }
+  }
+
+  private async ensureAccountClassHashIsCurrent(): Promise<void> {
+    if (!this.transactionManager) return;
+
+    const needsUpgrade = await this.transactionManager.needsClassHashUpgrade();
+    if (!needsUpgrade) return;
+
+    if (this.isJwtExpired()) {
+      this.logger.log('Account class hash mismatch detected, but JWT is expired. Skipping automatic upgrade.');
+      return;
+    }
+
+    this.logger.log('Account class hash mismatch detected. Upgrading to configured class hash...');
+    const txHash = await this.transactionManager.upgradeAccountClassHash();
+    this.logger.log('Account class hash upgraded. TxHash:', txHash);
   }
 
   /**

@@ -27,6 +27,7 @@ import {
 } from 'starknet';
 import { OAuthWalletManager, OAuthSession } from './OAuthWalletManager';
 import { OAuthWalletConfig } from '../types/config';
+import { getLatestCavosAccountClassHash } from '../config/defaults';
 
 /**
  * Custom signer for OAuth accounts.
@@ -145,6 +146,14 @@ export class OAuthTransactionManager {
     return BigInt(block.timestamp);
   }
 
+  private getDerivationClassHash(): string {
+    return num.toHex(this.config.cavosAccountClassHash);
+  }
+
+  private getUpgradeTargetClassHash(): string {
+    return num.toHex(getLatestCavosAccountClassHash(this.network));
+  }
+
   /**
    * Check if the OAuth account is deployed
    */
@@ -158,6 +167,64 @@ export class OAuthTransactionManager {
     } catch {
       return false;
     }
+  }
+
+  async getDeployedClassHash(): Promise<string | null> {
+    const address = this.oauthManager.getWalletAddress();
+    if (!address) return null;
+
+    try {
+      return num.toHex(await this.provider.getClassHashAt(address));
+    } catch {
+      return null;
+    }
+  }
+
+  async needsClassHashUpgrade(): Promise<boolean> {
+    const deployedClassHash = await this.getDeployedClassHash();
+    if (!deployedClassHash) {
+      return false;
+    }
+
+    const target = this.getUpgradeTargetClassHash();
+    const needsUpgrade = num.toHex(deployedClassHash) !== target;
+    console.log(
+      `[CavosSDK] needsClassHashUpgrade: deployed=${num.toHex(deployedClassHash)} latest=${target} needsUpgrade=${needsUpgrade}`
+    );
+    return needsUpgrade;
+  }
+
+  async upgradeAccountClassHash(targetClassHash?: string): Promise<string> {
+    const session = this.oauthManager.getSession();
+    if (!session?.walletAddress) {
+      throw new Error('No valid session');
+    }
+
+    const deployedClassHash = await this.getDeployedClassHash();
+    if (!deployedClassHash) {
+      throw new Error('Account is not deployed');
+    }
+
+    const nextClassHash = num.toHex(targetClassHash || this.getUpgradeTargetClassHash());
+    if (num.toHex(deployedClassHash) === nextClassHash) {
+      console.log(`[CavosSDK] upgradeAccountClassHash: already up-to-date (${nextClassHash})`);
+      return 'already-up-to-date';
+    }
+
+    console.log(
+      `[CavosSDK] upgradeAccountClassHash: upgrading ${session.walletAddress} from ${num.toHex(deployedClassHash)} to ${nextClassHash}`
+    );
+
+    const upgradeCall: Call = {
+      contractAddress: session.walletAddress,
+      entrypoint: 'upgrade',
+      calldata: [nextClassHash],
+    };
+
+    const txHash = await this.executeWithAVNUAPI([upgradeCall], session, true);
+    await this.waitForTransaction(txHash);
+    console.log(`[CavosSDK] upgradeAccountClassHash: upgrade tx confirmed ${txHash}`);
+    return txHash;
   }
 
   /**
@@ -264,7 +331,7 @@ export class OAuthTransactionManager {
     // Build AccountDeploymentData
     const deploymentData = {
       address: session.walletAddress,
-      class_hash: this.config.cavosAccountClassHash,
+      class_hash: this.getDerivationClassHash(),
       salt: session.addressSeed,
       calldata: constructorCalldata,
       version: 1 as const,
@@ -330,7 +397,7 @@ export class OAuthTransactionManager {
     });
 
     const result = await account.deployAccount({
-      classHash: this.config.cavosAccountClassHash,
+      classHash: this.getDerivationClassHash(),
       constructorCalldata,
       addressSalt: session.addressSeed,
       contractAddress: session.walletAddress,
@@ -380,7 +447,7 @@ export class OAuthTransactionManager {
         contractAddress: UDC_ADDRESS,
         entrypoint: 'deployContract',
         calldata: [
-          this.config.cavosAccountClassHash,
+          this.getDerivationClassHash(),
           num.toHex(session.addressSeed),
           '0x0',                                     // unique = false
           num.toHex(constructorCalldata.length),     // calldata_len

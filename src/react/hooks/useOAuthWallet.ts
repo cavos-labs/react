@@ -71,6 +71,16 @@ export function useOAuthWallet(hookConfig: UseOAuthWalletConfig): UseOAuthWallet
   const [error, setError] = useState<string | null>(null);
   const [session, setSession] = useState<OAuthSession | null>(null);
 
+  const ensureExpectedClassHash = useCallback(
+    async (transactionManager: OAuthTransactionManager): Promise<void> => {
+      const needsUpgrade = await transactionManager.needsClassHashUpgrade();
+      if (!needsUpgrade) return;
+
+      await transactionManager.upgradeAccountClassHash();
+    },
+    []
+  );
+
   // Initialize managers on mount
   useEffect(() => {
     const walletManager = new OAuthWalletManager(
@@ -101,12 +111,17 @@ export function useOAuthWallet(hookConfig: UseOAuthWalletConfig): UseOAuthWallet
         setStage('ready');
 
         // Check if deployed
-        transactionManager.isDeployed().then(deployed => {
+        transactionManager.isDeployed().then(async deployed => {
           setIsDeployed(deployed);
+          if (deployed) {
+            await ensureExpectedClassHash(transactionManager);
+          }
+        }).catch(() => {
+          // Ignore restore-time upgrade failures here; normal execution paths will surface them.
         });
       }
     }
-  }, [hookConfig.config, hookConfig.backendUrl, hookConfig.appId, hookConfig.rpcUrl]);
+  }, [hookConfig.config, hookConfig.backendUrl, hookConfig.appId, hookConfig.rpcUrl, ensureExpectedClassHash]);
 
   const initializeAndGetOAuthUrl = useCallback(
     async (provider: 'google' | 'apple', redirectUri?: string): Promise<string> => {
@@ -181,8 +196,10 @@ export function useOAuthWallet(hookConfig: UseOAuthWalletConfig): UseOAuthWallet
               'The transaction may have reverted.'
             );
           }
+          await ensureExpectedClassHash(txManager);
           setIsDeployed(true);
         } else {
+          await ensureExpectedClassHash(txManager);
           setIsDeployed(true);
         }
         setStage('ready');
@@ -194,7 +211,7 @@ export function useOAuthWallet(hookConfig: UseOAuthWalletConfig): UseOAuthWallet
         setIsLoading(false);
       }
     },
-    [manager, txManager]
+    [manager, txManager, ensureExpectedClassHash]
   );
 
   const execute = useCallback(
