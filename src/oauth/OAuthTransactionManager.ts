@@ -28,6 +28,7 @@ import {
 import { OAuthWalletManager, OAuthSession } from './OAuthWalletManager';
 import { OAuthWalletConfig } from '../types/config';
 import { getLatestCavosAccountClassHash } from '../config/defaults';
+import { Logger } from '../utils/logger';
 
 /**
  * Custom signer for OAuth accounts.
@@ -109,6 +110,9 @@ export class OAuthTransactionManager {
   private chainIdOverride: string | undefined;
   private account: Account | null = null;
   private paymasterRpc: PaymasterRpc;
+  private logger: Logger;
+  private chainTimestampCache: { value: bigint; fetchedAt: number } | null = null;
+  private static readonly CHAIN_TIMESTAMP_CACHE_MS = 3_000;
 
   constructor(
     config: OAuthWalletConfig,
@@ -125,6 +129,7 @@ export class OAuthTransactionManager {
     this.paymasterApiKey = paymasterApiKey;
     this.network = network;
     this.chainIdOverride = chainIdOverride;
+    this.logger = new Logger(this.isTimingDebugEnabled(), '[CavosTx]');
 
     const defaultPaymasterUrl = network === 'mainnet'
       ? 'https://paymaster.cavos.xyz'
@@ -142,8 +147,18 @@ export class OAuthTransactionManager {
   }
 
   private async getCurrentChainTimestamp(): Promise<bigint> {
+    const now = Date.now();
+    if (
+      this.chainTimestampCache &&
+      now - this.chainTimestampCache.fetchedAt < OAuthTransactionManager.CHAIN_TIMESTAMP_CACHE_MS
+    ) {
+      return this.chainTimestampCache.value;
+    }
+
     const block = await this.provider.getBlock('latest');
-    return BigInt(block.timestamp);
+    const timestamp = BigInt(block.timestamp);
+    this.chainTimestampCache = { value: timestamp, fetchedAt: now };
+    return timestamp;
   }
 
   private getDerivationClassHash(): string {
@@ -239,6 +254,7 @@ export class OAuthTransactionManager {
     validAfter?: bigint;
     validUntil?: bigint;
     renewalDeadline?: bigint;
+    rpcError?: string;
   }> {
     const session = this.oauthManager.getSession();
     if (!session?.walletAddress || !session.sessionPubKey) {
@@ -246,6 +262,7 @@ export class OAuthTransactionManager {
     }
 
     try {
+      const statusStart = this.startTiming('getSessionStatus');
       const result = await this.provider.callContract({
         contractAddress: session.walletAddress,
         entrypoint: 'get_session',
@@ -270,11 +287,18 @@ export class OAuthTransactionManager {
       const active = now >= validAfter;
       const expired = now >= validUntil;
       const canRenew = expired && now < renewalDeadline;
+      this.endTiming(statusStart, 'getSessionStatus', {
+        registered,
+        active,
+        expired,
+        canRenew,
+      });
 
       return { registered, active, expired, canRenew, validAfter, validUntil, renewalDeadline };
     } catch (err) {
-      console.error('[getSessionStatus] Error calling get_session:', err);
-      return { registered: false, active: false, expired: false, canRenew: false };
+      const message = err instanceof Error ? err.message : String(err);
+      this.logger.warn('getSessionStatus RPC error:', message);
+      return { registered: false, active: false, expired: false, canRenew: false, rpcError: message };
     }
   }
 
@@ -570,12 +594,9 @@ export class OAuthTransactionManager {
    * @param options.gasless - When true (default), gas is sponsored via AVNU Paymaster.
    *   When false, the wallet pays gas itself (requires STRK balance and a registered session).
    *
-   * Session handling:
-   * - Session NOT registered: Uses JWT signature (registers + executes in one tx). Requires gasless.
-   * - Session expired but renewable: Auto-renews then executes.
-   * - Session active + gasless: Uses AVNU Paymaster (sponsored).
-   * - Session active + non-gasless: Uses standard Account.execute() (user pays gas).
-   * - Session expired outside grace: Throws — user must re-login.
+   * This path is intentionally optimistic: it does not preflight session state on-chain.
+   * The SDK submits directly with the current session key and lets the RPC / account
+   * contract decide whether the session is registered, active, or expired.
    */
   async execute(calls: Call | Call[], options?: { gasless?: boolean }): Promise<string> {
     const session = this.oauthManager.getSession();
@@ -586,41 +607,6 @@ export class OAuthTransactionManager {
     const gasless = options?.gasless !== false; // default true
     const callsArray = Array.isArray(calls) ? calls : [calls];
 
-    // Check session status on-chain
-    const status = await this.getSessionStatus();
-
-    // Case 1: Session not registered — use JWT to auto-register + execute in one tx (always sponsored)
-    if (!status.registered) {
-      if (!gasless) {
-        throw new Error(
-          'Cannot execute a non-sponsored transaction without a registered session. ' +
-          'Execute one sponsored transaction first to register the session on-chain.'
-        );
-      }
-      return this.executeWithAVNUAPI(callsArray, session, true);
-    }
-
-    // Case 2: Session expired but can be renewed — auto-renew then execute
-    if (status.expired && status.canRenew) {
-      const newSession = await this.oauthManager.generateNewSession();
-      await this.renewSession(newSession);
-      return gasless
-        ? this.executeWithAVNUAPI(callsArray, newSession)
-        : this.executeWithUserFees(callsArray, newSession);
-    }
-
-    // Case 3: Session expired and outside grace period — cannot proceed
-    if (status.expired && !status.canRenew) {
-      throw new Error('SESSION_EXPIRED: Session has expired outside grace period. Please login again.');
-    }
-
-    if (!status.active) {
-      throw new Error(
-        `SESSION_NOT_ACTIVE: Session activates at ${status.validAfter?.toString() || 'unknown'}.`
-      );
-    }
-
-    // Case 4: Session is active
     return gasless
       ? this.executeWithAVNUAPI(callsArray, session)
       : this.executeWithUserFees(callsArray, session);
@@ -637,6 +623,7 @@ export class OAuthTransactionManager {
     if (!session.walletAddress) {
       throw new Error('No wallet address in session');
     }
+    const timing = this.startTiming('executeWithUserFees');
 
     const rpcUrl = (this.provider as any).channel?.nodeUrl
       || (this.provider as any).nodeUrl
@@ -650,6 +637,7 @@ export class OAuthTransactionManager {
       this.provider.getNonceForAddress(session.walletAddress),
       this.provider.getChainId(),
     ]);
+    this.stepTiming(timing, 'nonce+chainId');
 
     // 2. Build multicall calldata: [n_calls, to, selector, len, ...data, ...]
     const calldata: string[] = [num.toHex(calls.length)];
@@ -663,6 +651,7 @@ export class OAuthTransactionManager {
 
     // 3. Estimate resource bounds via raw RPC with dummy SESSION_V1 sig
     const resourceBounds = await this.estimateUserFeeBounds(calls, session, nonce, rpcUrl);
+    this.stepTiming(timing, 'estimateUserFeeBounds');
 
     // 4. Compute the transaction hash — must match EXACTLY what we submit
     const txHash = hash.calculateInvokeTransactionHash({
@@ -681,6 +670,7 @@ export class OAuthTransactionManager {
 
     // 5. Sign with session key (SESSION_V1 + Merkle proof per call)
     const signature = this.oauthManager.buildSessionSignature(txHash, calls);
+    this.stepTiming(timing, 'buildSessionSignature');
 
     // 6. Submit directly — no starknet.js Account wrapper involved
     const resp = await fetch(rpcUrl, {
@@ -726,6 +716,11 @@ export class OAuthTransactionManager {
     if (json.error) {
       throw new Error(`starknet_addInvokeTransaction failed: ${JSON.stringify(json.error)}`);
     }
+
+    this.endTiming(timing, 'executeWithUserFees', {
+      txHash: json.result.transaction_hash,
+      callCount: calls.length,
+    });
 
     return json.result.transaction_hash;
   }
@@ -1076,6 +1071,7 @@ export class OAuthTransactionManager {
    * Send a JSON-RPC request to the Cavos paymaster.
    */
   private async callPaymasterRpc(method: string, params: any[]): Promise<any> {
+    const timing = this.startTiming(method);
     const response = await fetch(this.paymasterApiBaseUrl, {
       method: 'POST',
       headers: {
@@ -1098,6 +1094,8 @@ export class OAuthTransactionManager {
       throw new Error(`Paymaster RPC error [${data.error.code}]: ${data.error.message}${detail}`);
     }
 
+    this.endTiming(timing, method);
+
     return data.result;
   }
 
@@ -1109,6 +1107,7 @@ export class OAuthTransactionManager {
     if (!session.walletAddress) {
       throw new Error('No wallet address in session');
     }
+    const timing = this.startTiming('executeWithAVNUAPI');
 
     // Format calls for Cavos JSON-RPC: { to, selector, calldata }
     const formattedCalls = calls.map(call => ({
@@ -1139,15 +1138,18 @@ export class OAuthTransactionManager {
     if (!paymasterTypedData) {
       throw new Error(`paymaster_buildTransaction returned unexpected format: ${JSON.stringify(buildResult)}`);
     }
+    this.stepTiming(timing, 'paymaster_buildTransaction');
 
     // Compute message hash
     const messageHash = this.computeTypedDataHash(paymasterTypedData, session.walletAddress);
+    this.stepTiming(timing, 'computeTypedDataHash');
 
     // Build signature (JWT for first tx, session for subsequent)
     // Pass calls for Merkle proof inclusion in session signatures
     const signature = forceJWT
       ? await this.oauthManager.buildJWTSignatureData(messageHash, session)
       : this.oauthManager.buildSessionSignature(messageHash, calls);
+    this.stepTiming(timing, forceJWT ? 'buildJWTSignatureData' : 'buildSessionSignature');
 
     // Execute via paymaster_executeTransaction
     const result = await this.callPaymasterRpc('paymaster_executeTransaction', [{
@@ -1161,7 +1163,52 @@ export class OAuthTransactionManager {
       },
       parameters: buildResult.parameters,
     }]);
+    this.endTiming(timing, 'executeWithAVNUAPI', {
+      txHash: result.transaction_hash,
+      callCount: calls.length,
+      signatureMode: forceJWT ? 'jwt' : 'session',
+    });
     return result.transaction_hash;
+  }
+
+  private isTimingDebugEnabled(): boolean {
+    if (typeof globalThis === 'undefined') return false;
+    const debugFlag = (globalThis as any).__CAVOS_DEBUG_TIMINGS__;
+    if (debugFlag === true) return true;
+    if (typeof window !== 'undefined') {
+      try {
+        return window.localStorage.getItem('cavos_debug_timings') === '1';
+      } catch {
+        return false;
+      }
+    }
+    return false;
+  }
+
+  private startTiming(label: string): { label: string; startedAt: number; lastAt: number } | null {
+    if (!this.isTimingDebugEnabled()) return null;
+    const now = performance.now();
+    return { label, startedAt: now, lastAt: now };
+  }
+
+  private stepTiming(
+    timing: { label: string; startedAt: number; lastAt: number } | null,
+    step: string,
+  ): void {
+    if (!timing) return;
+    const now = performance.now();
+    this.logger.log(`${timing.label}:${step}`, `${Math.round(now - timing.lastAt)}ms`);
+    timing.lastAt = now;
+  }
+
+  private endTiming(
+    timing: { label: string; startedAt: number; lastAt: number } | null,
+    label: string,
+    extra?: Record<string, unknown>,
+  ): void {
+    if (!timing) return;
+    const totalMs = Math.round(performance.now() - timing.startedAt);
+    this.logger.log(`${label}:total`, `${totalMs}ms`, extra || {});
   }
 
   /**
