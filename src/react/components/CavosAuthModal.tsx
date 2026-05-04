@@ -18,6 +18,7 @@ export interface CavosAuthModalProps {
   appName?: string;
   appLogo?: string;
   providers?: ('google' | 'apple' | 'email')[];
+  emailMode?: 'magic-link' | 'otp';
   primaryColor?: string;
   /** 'light' (default) or 'dark' */
   theme?: 'light' | 'dark';
@@ -25,7 +26,7 @@ export interface CavosAuthModalProps {
 
 const cavosLogoBase64 = "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";
 
-type Screen = 'select' | 'magic-link' | 'verify' | 'deploying';
+type Screen = 'select' | 'magic-link' | 'verify' | 'otp-code' | 'deploying';
 
 
 // ─── Style injection ──────────────────────────────────────────────────────────
@@ -252,10 +253,11 @@ export function CavosAuthModal({
   onSuccess,
   appName,
   providers = ['google', 'apple', 'email'],
+  emailMode = 'magic-link',
   primaryColor = '#0A0908',
   theme = 'light',
 }: CavosAuthModalProps) {
-  const { cavos, login, sendMagicLink, isAuthenticated, address, isLoading } = useCavos();
+  const { cavos, login, sendMagicLink, sendOtp, verifyOtp, isAuthenticated, address, isLoading } = useCavos();
   const isMobile = useIsMobile();
 
   // Theme-derived values
@@ -277,6 +279,7 @@ export function CavosAuthModal({
 
   const [screen, setScreen] = useState<Screen>('select');
   const [email, setEmail] = useState('');
+  const [otpCode, setOtpCode] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const [deployState, setDeployState] = useState<'loading' | 'done'>('loading');
@@ -307,7 +310,7 @@ export function CavosAuthModal({
       onCloseRef.current();
       setScreen('select');
       setDeployState('loading');
-      setEmail(''); setError('');
+      setEmail(''); setOtpCode(''); setError('');
       doneHandledRef.current = false;
     }, 1600);
   }, []);
@@ -358,7 +361,7 @@ export function CavosAuthModal({
 
   const handleClose = () => {
     if (screen === 'deploying') return;
-    setScreen('select'); setEmail(''); setError('');
+    setScreen('select'); setEmail(''); setOtpCode(''); setError('');
     doneHandledRef.current = false;
     onCloseRef.current();
   };
@@ -388,11 +391,46 @@ export function CavosAuthModal({
     }
   };
 
+  const handleOtpRequestSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!email) return;
+    setError(''); setBusy(true);
+    try {
+      await sendOtp(email);
+      setOtpCode('');
+      setScreen('otp-code');
+      setResendCountdown(60);
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : 'Failed to send code.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleOtpVerifySubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!email || otpCode.length !== 6) return;
+    setError(''); setBusy(true);
+    try {
+      await verifyOtp(email, otpCode);
+      setScreen('deploying');
+      setDeployState('loading');
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : 'Invalid or expired code.');
+      setBusy(false);
+    }
+  };
+
   const handleResend = async () => {
     if (resendCountdown > 0) return;
     setError('');
     try {
-      await sendMagicLink(email);
+      if (emailMode === 'otp') {
+        await sendOtp(email);
+        setOtpCode('');
+      } else {
+        await sendMagicLink(email);
+      }
       setResendCountdown(60);
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : 'Failed to resend.');
@@ -475,9 +513,59 @@ export function CavosAuthModal({
     );
   }
 
-  // ── Magic link email form ──────────────────────────────────────────────────
+  // ── OTP code entry ─────────────────────────────────────────────────────────
+
+  if (screen === 'otp-code') {
+    return (
+      <div style={overlay} role="dialog" aria-modal onClick={e => { if (e.target === e.currentTarget) handleClose(); }}>
+        <div style={{ ...card, position: 'relative' }}>
+          {isMobile && <div style={handle} />}
+          <button className="cavos-close" style={{ ...close, left: '16px', right: 'auto' }} onClick={() => { setScreen('magic-link'); setError(''); setOtpCode(''); }} aria-label="Back">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M19 12H5M12 5l-7 7 7 7"/></svg>
+          </button>
+          <button className="cavos-close" style={close} onClick={handleClose} aria-label="Close"><CloseX /></button>
+          <div style={{ padding: isMobile ? '28px 22px 32px' : '52px 22px 22px', textAlign: 'center' }}>
+            <h2 style={{ margin: '0 0 8px', fontSize: '17px', fontWeight: 600, color: textColor, letterSpacing: '-0.02em' }}>Enter your code</h2>
+            <p style={{ margin: '0 0 20px', fontSize: '13px', color: subTextColor, lineHeight: 1.5 }}>
+              We sent a 6-digit code to <strong style={{ color: textColor, fontWeight: 500 }}>{email}</strong>.
+            </p>
+            {error && <div style={{ background: errBg, border: `1px solid ${errBorder}`, borderRadius: '10px', padding: '10px 14px', fontSize: '13px', color: errColor, marginBottom: '14px', textAlign: 'left' }}>{error}</div>}
+            <form onSubmit={handleOtpVerifySubmit} style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+              <input
+                className="cavos-input-inner"
+                style={{ width: '100%', padding: '14px', border: inputBorder, borderRadius: '12px', fontSize: '22px', color: textColor, background: inputBg, fontFamily: 'inherit', boxSizing: 'border-box', textAlign: 'center', letterSpacing: '8px', fontWeight: 600 }}
+                type="text"
+                inputMode="numeric"
+                autoComplete="one-time-code"
+                placeholder="000000"
+                value={otpCode}
+                onChange={e => setOtpCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                required
+                disabled={busy}
+                autoFocus
+              />
+              <button type="submit" className="cavos-primary-btn" style={{ width: '100%', padding: '12px', marginTop: '4px', borderRadius: '12px', border: 'none', background: primaryColor, color: '#fff', fontSize: '14px', fontWeight: 500, cursor: 'pointer', fontFamily: 'inherit', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px', transition: 'opacity 0.15s, transform 0.1s', opacity: busy || otpCode.length !== 6 ? 0.65 : 1 }} disabled={busy || isLoading || otpCode.length !== 6}>
+                {busy && <Spinner size={15} color="#fff" />}
+                {busy ? 'Verifying…' : 'Continue'}
+              </button>
+            </form>
+            <button className="cavos-primary-btn" style={{ width: '100%', padding: '12px', borderRadius: '12px', border: 'none', background: resendCountdown > 0 ? (isLight ? 'rgba(0,0,0,0.06)' : 'rgba(255,255,255,0.08)') : 'transparent', color: resendCountdown > 0 ? subTextColor : primaryColor, fontSize: '14px', fontWeight: 500, cursor: resendCountdown > 0 ? 'default' : 'pointer', fontFamily: 'inherit', transition: 'opacity 0.15s', marginTop: '8px' }} onClick={handleResend} disabled={resendCountdown > 0 || busy}>
+              {resendCountdown > 0 ? `Resend in ${resendCountdown}s` : 'Resend code'}
+            </button>
+            <button className="cavos-sub-btn" style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: '13px', color: subTextColor, width: '100%', textAlign: 'center', padding: '8px 0 0', fontFamily: 'inherit', transition: 'color 0.15s' }} onClick={() => { setScreen('magic-link'); setError(''); setOtpCode(''); }}>
+              Use a different email
+            </button>
+          </div>
+          <div style={footer}><CavosLogo invert={!isLight} /><span>Secured by Cavos</span></div>
+        </div>
+      </div>
+    );
+  }
+
+  // ── Email form ─────────────────────────────────────────────────────────────
 
   if (screen === 'magic-link') {
+    const isOtp = emailMode === 'otp';
     return (
       <div style={overlay} role="dialog" aria-modal onClick={e => { if (e.target === e.currentTarget) handleClose(); }}>
         <div style={{ ...card, position: 'relative' }}>
@@ -488,13 +576,15 @@ export function CavosAuthModal({
           <button className="cavos-close" style={close} onClick={handleClose} aria-label="Close"><CloseX /></button>
           <div style={{ padding: isMobile ? '28px 22px 32px' : '52px 22px 22px' }}>
             <h2 style={{ margin: '0 0 6px', fontSize: '17px', fontWeight: 600, color: textColor, letterSpacing: '-0.02em', textAlign: 'center' }}>Sign in with email</h2>
-            <p style={{ margin: '0 0 20px', fontSize: '13px', color: subTextColor, textAlign: 'center', lineHeight: 1.5 }}>We'll send a secure sign-in link to your inbox.</p>
+            <p style={{ margin: '0 0 20px', fontSize: '13px', color: subTextColor, textAlign: 'center', lineHeight: 1.5 }}>
+              {isOtp ? "We'll send a secure sign-in code to your inbox." : "We'll send a secure sign-in link to your inbox."}
+            </p>
             {error && <div style={{ background: errBg, border: `1px solid ${errBorder}`, borderRadius: '10px', padding: '10px 14px', fontSize: '13px', color: errColor, marginBottom: '14px' }}>{error}</div>}
-            <form onSubmit={handleMagicLinkSubmit} style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+            <form onSubmit={isOtp ? handleOtpRequestSubmit : handleMagicLinkSubmit} style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
               <input className="cavos-input-inner" style={{ width: '100%', padding: '12px 14px', border: inputBorder, borderRadius: '12px', fontSize: '14px', color: textColor, background: inputBg, fontFamily: 'inherit', boxSizing: 'border-box', transition: 'border-color 0.15s' }} type="email" placeholder="your@email.com" value={email} onChange={e => setEmail(e.target.value)} required disabled={busy} autoFocus />
               <button type="submit" className="cavos-primary-btn" style={{ width: '100%', padding: '12px', marginTop: '4px', borderRadius: '12px', border: 'none', background: primaryColor, color: '#fff', fontSize: '14px', fontWeight: 500, cursor: 'pointer', fontFamily: 'inherit', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px', transition: 'opacity 0.15s, transform 0.1s', opacity: busy ? 0.65 : 1 }} disabled={busy || isLoading}>
                 {busy && <Spinner size={15} color="#fff" />}
-                {busy ? 'Sending…' : 'Send magic link'}
+                {busy ? 'Sending…' : (isOtp ? 'Send code' : 'Send magic link')}
               </button>
             </form>
           </div>

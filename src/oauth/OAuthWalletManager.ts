@@ -1381,6 +1381,76 @@ export class OAuthWalletManager {
   }
 
   /**
+   * Send an email OTP code (passwordless sign-in).
+   * Uses the same pre-auth session and nonce persistence as magic link.
+   */
+  async sendOtp(email: string): Promise<void> {
+    if (!this.session) {
+      await this.initializeSession();
+    }
+
+    if (typeof window !== 'undefined' && this.session) {
+      try {
+        const toStore = {
+          ...this.session,
+          nonceParams: {
+            ...this.session.nonceParams,
+            validAfter: this.session.nonceParams.validAfter.toString(),
+            validUntil: this.session.nonceParams.validUntil.toString(),
+            renewalDeadline: this.session.nonceParams.renewalDeadline.toString(),
+            randomness: this.session.nonceParams.randomness.toString(),
+          },
+          sessionPolicy: this.serializePolicy(this.session.sessionPolicy),
+        };
+        localStorage.setItem('cavos_magic_link_pre_auth', JSON.stringify(toStore));
+      } catch { /* ignore */ }
+    }
+
+    const response = await fetch(`${this.backendUrl}/api/oauth/firebase/otp/request`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, nonce: this.session!.nonce, app_id: this.appId }),
+    });
+
+    if (!response.ok) {
+      const error = await response.json();
+      throw new Error(error.message || error.error || 'Failed to send OTP');
+    }
+  }
+
+  /**
+   * Verify an email OTP code and process the returned Cavos Firebase JWT.
+   */
+  async verifyOtp(email: string, code: string): Promise<OAuthSession> {
+    if (!this.session) {
+      this.restorePreAuthSession();
+    }
+
+    if (!this.session) {
+      throw new Error('No pre-auth session found. OTP flow was not initialized properly.');
+    }
+
+    const response = await fetch(`${this.backendUrl}/api/oauth/firebase/otp/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        email,
+        code,
+        nonce: this.session.nonce,
+        app_id: this.appId,
+      }),
+    });
+
+    if (!response.ok) {
+      const error = await response.json();
+      throw new Error(error.message || error.error || 'OTP verification failed');
+    }
+
+    const { jwt } = await response.json();
+    return this.processFirebaseJWT(jwt);
+  }
+
+  /**
    * Process Firebase JWT (same as Google/Apple)
    */
   private async processFirebaseJWT(jwt: string): Promise<OAuthSession> {
@@ -1400,6 +1470,7 @@ export class OAuthWalletManager {
     const addressSeed = this.addressSeedManager.computeAddressSeed(
       jwtClaims.iss,
       jwtClaims.sub,
+      this.session.walletName,
     );
 
     const walletAddress = this.addressSeedManager.computeContractAddress(
@@ -1407,6 +1478,7 @@ export class OAuthWalletManager {
       jwtClaims.sub,
       this.config.cavosAccountClassHash,
       this.config.jwksRegistryAddress,
+      this.session.walletName,
     );
 
     // Update session with JWT data
@@ -1416,10 +1488,16 @@ export class OAuthWalletManager {
       jwtClaims,
       addressSeed,
       walletAddress,
+      walletName: this.session.walletName,
     };
 
     // Persist full session
     this.persistSession();
+
+    if (typeof window !== 'undefined') {
+      sessionStorage.removeItem(PRE_AUTH_STORAGE_KEY);
+      localStorage.removeItem('cavos_magic_link_pre_auth');
+    }
 
     return this.session;
   }

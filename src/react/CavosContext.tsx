@@ -10,6 +10,8 @@ export interface CavosModalConfig {
   appName?: string;
   appLogo?: string;
   providers?: ('google' | 'apple' | 'email')[];
+  /** Controls how the built-in email provider authenticates. Defaults to magic link. */
+  emailMode?: 'magic-link' | 'otp';
   primaryColor?: string;
   /** 'light' (default) or 'dark' */
   theme?: 'light' | 'dark';
@@ -28,6 +30,14 @@ export interface CavosContextValue {
   register: (provider: LoginProvider, credentials: FirebaseCredentials) => Promise<void>;
   /** Send a magic link email. Resolves when email is sent; auth completes in background. */
   sendMagicLink: (email: string) => Promise<void>;
+  /** Send an email OTP code. */
+  sendOtp: (email: string) => Promise<void>;
+  /** Verify an email OTP code and complete auth. */
+  verifyOtp: (email: string, code: string) => Promise<void>;
+  /** Alias for sendOtp(). */
+  requestOTP: (email: string) => Promise<void>;
+  /** Alias for verifyOtp(). */
+  loginOTP: (email: string, code: string) => Promise<void>;
   execute: (calls: Call | Call[], options?: { gasless?: boolean }) => Promise<string>;
   renewSession: () => Promise<string>;
   revokeSession: (sessionKey: string) => Promise<string>;
@@ -236,6 +246,24 @@ export function CavosProvider({ config, modal, children }: CavosProviderProps) {
     return cavos.sendMagicLink(email);
   }, [cavos]);
 
+  const sendOtp = useCallback(async (email: string) => {
+    return cavos.sendOtp(email);
+  }, [cavos]);
+
+  const verifyOtp = useCallback(async (email: string, code: string) => {
+    await cavos.verifyOtp(email, code);
+    updateState();
+  }, [cavos, updateState]);
+
+  const requestOTP = useCallback(async (email: string) => {
+    return cavos.requestOTP(email);
+  }, [cavos]);
+
+  const loginOTP = useCallback(async (email: string, code: string) => {
+    await cavos.loginOTP(email, code);
+    updateState();
+  }, [cavos, updateState]);
+
   const value: CavosContextValue = {
     cavos,
     openModal,
@@ -259,6 +287,10 @@ export function CavosProvider({ config, modal, children }: CavosProviderProps) {
     getBalance,
     resendVerificationEmail,
     sendMagicLink,
+    sendOtp,
+    verifyOtp,
+    requestOTP,
+    loginOTP,
     walletStatus,
     getAssociatedWallets: async () => cavos.getAssociatedWallets(),
     switchWallet: async (name?: string) => {
@@ -286,6 +318,7 @@ export function CavosProvider({ config, modal, children }: CavosProviderProps) {
           appName={modal.appName}
           appLogo={modal.appLogo}
           providers={modal.providers}
+          emailMode={modal.emailMode}
           primaryColor={modal.primaryColor}
           theme={modal.theme}
         />

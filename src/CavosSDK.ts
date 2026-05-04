@@ -1218,6 +1218,53 @@ export class CavosSDK {
     this._pollMagicLinkResult();
   }
 
+  /**
+   * Send an email OTP code. The app should call verifyOtp() with the code
+   * entered by the user to complete authentication.
+   */
+  async sendOtp(email: string): Promise<void> {
+    if (!this.appSalt) {
+      await this.validateAccess();
+    }
+    await this.oauthWalletManager.sendOtp(email);
+  }
+
+  /**
+   * Alias for sendOtp(). Requests an email one-time code.
+   */
+  async requestOTP(email: string): Promise<void> {
+    return this.sendOtp(email);
+  }
+
+  /**
+   * Verify an email OTP code and complete authentication.
+   */
+  async verifyOtp(email: string, code: string): Promise<void> {
+    if (!this.appSalt) {
+      await this.validateAccess();
+    }
+
+    await this.oauthWalletManager.verifyOtp(email, code);
+    this.initializeTransactionManager();
+    this.initializeSlotTransactionManager();
+
+    this.addWalletToSeen(
+      this.oauthWalletManager.getSession()?.jwtClaims?.iss,
+      this.oauthWalletManager.getSession()?.jwtClaims?.sub,
+      this.oauthWalletManager.getSession()?.walletName,
+    );
+
+    this.deployAccountInBackground();
+    this._authChangeListeners.forEach(cb => cb());
+  }
+
+  /**
+   * Alias for verifyOtp(). Completes login with an email one-time code.
+   */
+  async loginOTP(email: string, code: string): Promise<void> {
+    return this.verifyOtp(email, code);
+  }
+
   private _pollMagicLinkResult(): void {
     if (typeof window === 'undefined') return;
     localStorage.removeItem('cavos_auth_result');
