@@ -7,7 +7,7 @@ export interface UseSlotReturn {
   /** True while the wallet is being deployed to the Slot chain. */
   isSlotDeploying: boolean;
   /** Execute calls on the Slot chain (no paymaster, session key reused). */
-  executeOnSlot: (calls: Call | Call[]) => Promise<string>;
+  executeOnSlot: (calls: Call | Call[], options?: { waitForTransaction?: boolean }) => Promise<string>;
   /** Raw RpcProvider for the Slot — use for read queries or Dojo SDK integration. */
   slotProvider: RpcProvider | null;
 }

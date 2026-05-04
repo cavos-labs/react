@@ -71,7 +71,7 @@ export interface CavosContextValue {
   /** Public key of the current session key (safe to display) */
   sessionPublicKey: string | null;
   /** Execute calls on the Slot chain (no paymaster, uses session key) */
-  executeOnSlot: (calls: Call | Call[]) => Promise<string>;
+  executeOnSlot: (calls: Call | Call[], options?: { waitForTransaction?: boolean }) => Promise<string>;
   /** RpcProvider for the Slot chain — use for read queries or Dojo SDK integration */
   getSlotProvider: () => RpcProvider | null;
 }
@@ -303,7 +303,7 @@ export function CavosProvider({ config, modal, children }: CavosProviderProps) {
     exportSession: () => cavos.exportSession(),
     updateSessionPolicy: (policy: SessionKeyPolicy) => cavos.updateSessionPolicy(policy),
     sessionPublicKey,
-    executeOnSlot: (calls: Call | Call[]) => cavos.executeOnSlot(calls),
+    executeOnSlot: (calls: Call | Call[], options?: { waitForTransaction?: boolean }) => cavos.executeOnSlot(calls, options),
     getSlotProvider: () => cavos.getSlotProvider(),
   };
 

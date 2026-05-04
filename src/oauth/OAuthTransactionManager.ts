@@ -512,13 +512,15 @@ export class OAuthTransactionManager {
     });
   }
 
-  private async executeDirectNoFee(calls: Call[], useJWTSignature: boolean): Promise<string> {
+  private async executeDirectNoFee(calls: Call[], useJWTSignature: boolean, waitForConfirmation = true): Promise<string> {
     const account = this.createDirectAccount(useJWTSignature);
     const result = await account.execute(calls, {
       resourceBounds: this.getNoFeeResourceBounds(),
     });
 
-    await this.waitForTransaction(result.transaction_hash);
+    if (waitForConfirmation) {
+      await this.waitForTransaction(result.transaction_hash);
+    }
     return result.transaction_hash;
   }
 
@@ -553,7 +555,7 @@ export class OAuthTransactionManager {
    * This path only works once the session is already registered on-chain.
    * First-time Slot registration must go through execute_from_outside_v2.
    */
-  async executeOnNoFeeChain(calls: Call | Call[]): Promise<string> {
+  async executeOnNoFeeChain(calls: Call | Call[], options?: { waitForTransaction?: boolean }): Promise<string> {
     const session = this.oauthManager.getSession();
     if (!session?.walletAddress) {
       throw new Error('No valid session');
@@ -585,7 +587,7 @@ export class OAuthTransactionManager {
       );
     }
 
-    return this.executeDirectNoFee(callsArray, false);
+    return this.executeDirectNoFee(callsArray, false, options?.waitForTransaction === true);
   }
 
   /**
@@ -865,7 +867,11 @@ export class OAuthTransactionManager {
    * SNIP-12 type hashes. starknet.js does not currently support the u64 fields
    * used by the on-chain OutsideExecution struct.
    */
-  async executeViaOutsideExecution(calls: Call[], relayerAccount: Account): Promise<string> {
+  async executeViaOutsideExecution(
+    calls: Call[],
+    relayerAccount: Account,
+    options?: { waitForTransaction?: boolean },
+  ): Promise<string> {
     const session = this.oauthManager.getSession();
     if (!session?.jwt || !session.walletAddress) throw new Error('Not logged in');
 
@@ -935,7 +941,9 @@ export class OAuthTransactionManager {
         },
       },
     );
-    await this.waitForTransaction(transaction_hash);
+    if (options?.waitForTransaction === true) {
+      await this.waitForTransaction(transaction_hash);
+    }
     return transaction_hash;
   }
 

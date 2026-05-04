@@ -1507,7 +1507,7 @@ export class CavosSDK {
    * Uses execute_from_outside_v2 for first-time session registration, then
    * switches to direct no-fee account execution once the session is active.
    */
-  async executeOnSlot(calls: Call | Call[]): Promise<string> {
+  async executeOnSlot(calls: Call | Call[], options?: { waitForTransaction?: boolean }): Promise<string> {
     if (!this.slotTransactionManager) {
       throw new Error('Slot not configured. Pass slot.rpcUrl in CavosConfig.');
     }
@@ -1525,10 +1525,13 @@ export class CavosSDK {
       return this.slotTransactionManager.executeViaOutsideExecution(
         callsArray,
         this.slotRelayerAccount,
+        { waitForTransaction: options?.waitForTransaction === true },
       );
     }
 
-    return this.slotTransactionManager.executeOnNoFeeChain(callsArray);
+    return this.slotTransactionManager.executeOnNoFeeChain(callsArray, {
+      waitForTransaction: options?.waitForTransaction === true,
+    });
   }
 
   /**
