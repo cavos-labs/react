@@ -375,7 +375,7 @@ export class OAuthWalletManager {
       walletName, // Ensure walletName is always set
     };
 
-    // Persist pre-auth session to sessionStorage (survives OAuth redirect)
+    // Persist pre-auth session to localStorage (survives OAuth redirect and tab close)
     if (typeof window !== 'undefined') {
       this.persistPreAuthSession();
     }
@@ -503,7 +503,7 @@ export class OAuthWalletManager {
 
     // Clear pre-auth sessions (both storage locations)
     if (typeof window !== 'undefined') {
-      sessionStorage.removeItem(PRE_AUTH_STORAGE_KEY);
+      this.removeWalletStorage(PRE_AUTH_STORAGE_KEY);
       localStorage.removeItem('cavos_magic_link_pre_auth');
     }
 
@@ -743,8 +743,8 @@ export class OAuthWalletManager {
   clearSession(): void {
     this.session = null;
     if (typeof window !== 'undefined') {
-      sessionStorage.removeItem(SESSION_STORAGE_KEY);
-      sessionStorage.removeItem(PRE_AUTH_STORAGE_KEY);
+      this.removeWalletStorage(SESSION_STORAGE_KEY);
+      this.removeWalletStorage(PRE_AUTH_STORAGE_KEY);
     }
   }
 
@@ -800,7 +800,7 @@ export class OAuthWalletManager {
   restoreSession(): boolean {
     if (typeof window === 'undefined') return false;
     try {
-      const stored = sessionStorage.getItem(SESSION_STORAGE_KEY);
+      const stored = this.readWalletStorage(SESSION_STORAGE_KEY);
       if (stored) {
         this.session = JSON.parse(stored);
         // Convert bigints back
@@ -828,6 +828,49 @@ export class OAuthWalletManager {
   }
 
   // ============== Private helpers ==============
+
+  /** Read from localStorage, migrating the same key from legacy sessionStorage when present. */
+  private readWalletStorage(key: string): string | null {
+    if (typeof window === 'undefined') return null;
+    try {
+      let v = localStorage.getItem(key);
+      if (!v) {
+        const legacy = sessionStorage.getItem(key);
+        if (legacy) {
+          try {
+            localStorage.setItem(key, legacy);
+            sessionStorage.removeItem(key);
+          } catch {
+            /* quota / private mode — use legacy for this read */
+          }
+          v = localStorage.getItem(key) ?? legacy;
+        }
+      }
+      return v;
+    } catch {
+      return null;
+    }
+  }
+
+  private writeWalletStorage(key: string, value: string): void {
+    if (typeof window === 'undefined') return;
+    try {
+      localStorage.setItem(key, value);
+      sessionStorage.removeItem(key);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  private removeWalletStorage(key: string): void {
+    if (typeof window === 'undefined') return;
+    try {
+      localStorage.removeItem(key);
+      sessionStorage.removeItem(key);
+    } catch {
+      /* ignore */
+    }
+  }
 
   private serializePolicy(policy?: SessionKeyPolicy): any {
     if (!policy) return undefined;
@@ -865,7 +908,7 @@ export class OAuthWalletManager {
         },
         sessionPolicy: this.serializePolicy(this.session.sessionPolicy),
       };
-      sessionStorage.setItem(PRE_AUTH_STORAGE_KEY, JSON.stringify(toStore));
+      this.writeWalletStorage(PRE_AUTH_STORAGE_KEY, JSON.stringify(toStore));
     }
   }
 
@@ -932,9 +975,9 @@ export class OAuthWalletManager {
   private restorePreAuthSession(): void {
     if (typeof window === 'undefined') return;
     try {
-      // Try sessionStorage first (same-tab popup flow), then localStorage fallback (magic link redirect)
+      // Pre-auth in localStorage (OAuth / OTP); magic link uses a dedicated key for cross-context redirect
       const stored =
-        sessionStorage.getItem(PRE_AUTH_STORAGE_KEY) ||
+        this.readWalletStorage(PRE_AUTH_STORAGE_KEY) ||
         localStorage.getItem('cavos_magic_link_pre_auth');
       if (stored) {
         const parsed = JSON.parse(stored);
@@ -971,7 +1014,7 @@ export class OAuthWalletManager {
         },
         sessionPolicy: this.serializePolicy(this.session.sessionPolicy),
       };
-      sessionStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(toStore));
+      this.writeWalletStorage(SESSION_STORAGE_KEY, JSON.stringify(toStore));
     }
   }
 
@@ -1342,7 +1385,7 @@ export class OAuthWalletManager {
   /**
    * Send a magic link email (passwordless sign-in)
    * Initializes a fresh session key+nonce, persists pre-auth session to
-   * sessionStorage, then asks the backend to send the branded email.
+   * localStorage, then asks the backend to send the branded email.
    */
   async sendMagicLink(email: string): Promise<void> {
     if (!this.session) {
@@ -1495,7 +1538,7 @@ export class OAuthWalletManager {
     this.persistSession();
 
     if (typeof window !== 'undefined') {
-      sessionStorage.removeItem(PRE_AUTH_STORAGE_KEY);
+      this.removeWalletStorage(PRE_AUTH_STORAGE_KEY);
       localStorage.removeItem('cavos_magic_link_pre_auth');
     }
 

@@ -293,7 +293,7 @@ export class SessionManager {
   private network: 'mainnet' | 'sepolia';
   private chainId: string;
 
-  // Storage key for persisting session data
+  // Storage key for persisting session data (localStorage; survives browser restarts)
   private static readonly SESSION_STORAGE_KEY = 'cavos_session_data';
 
   // Current session state
@@ -617,8 +617,8 @@ export class SessionManager {
   // ============================================================================
 
   /**
-   * Save current session to sessionStorage.
-   * This allows session to persist across page reloads without storing the wallet PK.
+   * Save current session to localStorage.
+   * Persists across reloads and new browser sessions without storing the wallet PK.
    */
   saveSessionToStorage(): void {
     if (!this.currentSession || !this.sessionKey || !this.guardianKey || !this.sessionAuthorization) {
@@ -652,7 +652,13 @@ export class SessionManager {
         sessionAuthorization: this.sessionAuthorization,
       };
 
-      sessionStorage.setItem(SessionManager.SESSION_STORAGE_KEY, JSON.stringify(sessionData));
+      const payload = JSON.stringify(sessionData);
+      localStorage.setItem(SessionManager.SESSION_STORAGE_KEY, payload);
+      try {
+        sessionStorage.removeItem(SessionManager.SESSION_STORAGE_KEY);
+      } catch {
+        // ignore
+      }
       //  Session saved to storage');
     } catch (error) {
       console.error('[SessionManager] Failed to save session:', error);
@@ -660,13 +666,25 @@ export class SessionManager {
   }
 
   /**
-   * Load session from sessionStorage.
+   * Load session from localStorage (migrates legacy sessionStorage if present).
    * Reconstructs session state without needing the wallet PK.
    */
   loadSessionFromStorage(): boolean {
     try {
       if (typeof window === 'undefined') return false;
-      const stored = sessionStorage.getItem(SessionManager.SESSION_STORAGE_KEY);
+      let stored = localStorage.getItem(SessionManager.SESSION_STORAGE_KEY);
+      if (!stored) {
+        const legacy = sessionStorage.getItem(SessionManager.SESSION_STORAGE_KEY);
+        if (legacy) {
+          try {
+            localStorage.setItem(SessionManager.SESSION_STORAGE_KEY, legacy);
+            sessionStorage.removeItem(SessionManager.SESSION_STORAGE_KEY);
+          } catch {
+            // quota / private mode — use legacy for this load only
+          }
+          stored = localStorage.getItem(SessionManager.SESSION_STORAGE_KEY) ?? legacy;
+        }
+      }
       if (!stored) {
         return false;
       }
@@ -709,11 +727,12 @@ export class SessionManager {
   }
 
   /**
-   * Clear session from storage.
+   * Clear session from browser storage (local + legacy sessionStorage).
    */
   clearSessionStorage(): void {
     try {
       if (typeof window === 'undefined') return;
+      localStorage.removeItem(SessionManager.SESSION_STORAGE_KEY);
       sessionStorage.removeItem(SessionManager.SESSION_STORAGE_KEY);
       //  Session storage cleared');
     } catch (error) {
@@ -727,7 +746,10 @@ export class SessionManager {
   isSessionSaved(): boolean {
     try {
       if (typeof window === 'undefined') return false;
-      return sessionStorage.getItem(SessionManager.SESSION_STORAGE_KEY) !== null;
+      return (
+        localStorage.getItem(SessionManager.SESSION_STORAGE_KEY) !== null ||
+        sessionStorage.getItem(SessionManager.SESSION_STORAGE_KEY) !== null
+      );
     } catch {
       return false;
     }
