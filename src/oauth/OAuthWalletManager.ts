@@ -923,53 +923,19 @@ export class OAuthWalletManager {
     }
 
     const oldSession = { ...this.session };
+    const newSession = await this.generateNewSession();
 
-    // Generate NEW session key pair
-    const STARK_CURVE_ORDER = BigInt('0x800000000000010ffffffffffffffffb781126dcae7b2321e66a241adc64d2f');
-    const randomBytes = crypto.getRandomValues(new Uint8Array(32));
-    let privateKeyBigInt = BigInt('0x' + Array.from(randomBytes).map(b => b.toString(16).padStart(2, '0')).join(''));
-    privateKeyBigInt = (privateKeyBigInt % (STARK_CURVE_ORDER - 1n)) + 1n;
-
-    // Normalize so public key uses Cairo's y convention:
-    // check_ecdsa_signature reconstructs the public key using the SMALLER y (y < p/2).
-    // If the private key's public key has y > p/2, negate the key to flip to the smaller root.
-    const STARK_FIELD_PRIME = BigInt('0x800000000000011000000000000000000000000000000000000000000000001');
-    {
-      const tmpHex = '0x' + privateKeyBigInt.toString(16);
-      const pubFull = ec.starkCurve.getPublicKey(tmpHex, false);
-      const yBig = BigInt('0x' + Array.from(pubFull.slice(33)).map(b => b.toString(16).padStart(2, '0')).join(''));
-      if (yBig * 2n > STARK_FIELD_PRIME) {
-        privateKeyBigInt = STARK_CURVE_ORDER - privateKeyBigInt;
-      }
-    }
-    const sessionPrivateKey = '0x' + privateKeyBigInt.toString(16);
-    const sessionPubKey = ec.starkCurve.getStarkKey(sessionPrivateKey);
-
-    // Session validity is enforced on-chain against block.timestamp, so the
-    // nonce params must be derived from chain time rather than local wall time.
-    const currentTimestamp = await this.getCurrentChainTimestamp();
-    // New nonce params with configured duration (timestamp-based)
-    const nonceParams = NonceManager.generateNonceParams(
-      sessionPubKey,
-      currentTimestamp,
-      BigInt(this.sessionDuration),
-      BigInt(this.renewalGracePeriod)
-    );
-
-    const nonce = NonceManager.computeNonce(nonceParams);
-    // Update session
-    this.session = {
-      ...this.session,
-      sessionPrivateKey,
-      sessionPubKey,
-      nonceParams,
-      nonce,
-    };
-
-    // Persist freshened session
-    this.persistSession();
+    this.commitRenewedSession(newSession);
 
     return oldSession;
+  }
+
+  /**
+   * Replace the local session after an on-chain renewal transaction succeeds.
+   */
+  commitRenewedSession(newSession: OAuthSession): void {
+    this.session = newSession;
+    this.persistSession();
   }
 
   private restorePreAuthSession(): void {

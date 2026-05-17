@@ -573,7 +573,7 @@ export class OAuthTransactionManager {
 
     if (status.expired && status.canRenew) {
       throw new Error(
-        'SESSION_EXPIRED: Session has expired on Slot and must be renewed from a fresh login before executing again.'
+        'SESSION_RENEWAL_REQUIRED: Session has expired but is still renewable. Use CavosSDK.executeOnSlot() to auto-renew before executing.'
       );
     }
 
@@ -1279,64 +1279,7 @@ export class OAuthTransactionManager {
       throw new Error('No old session to renew from');
     }
 
-    if (!newSession.sessionPubKey || !newSession.nonce || !newSession.nonceParams) {
-      throw new Error('New session data incomplete');
-    }
-
-    // Compute allowed_contracts_root for the new session policy
-    const policy = newSession.sessionPolicy;
-    const allowedContractsRoot = policy?.allowedContracts?.length
-      ? OAuthWalletManager.computeMerkleRoot(policy.allowedContracts)
-      : '0x0';
-    const maxCallsPerTx = policy?.maxCallsPerTx ?? 10;
-
-    // Sign the new session params with the OLD session key
-    // Message = poseidon(new_session_key, new_nonce, new_valid_after, new_valid_until,
-    //                    new_renewal_deadline, new_allowed_contracts_root, new_max_calls_per_tx)
-    const message = hash.computePoseidonHashOnElements([
-      newSession.sessionPubKey,
-      newSession.nonce,
-      num.toHex(newSession.nonceParams.validAfter),
-      num.toHex(newSession.nonceParams.validUntil),
-      num.toHex(newSession.nonceParams.renewalDeadline),
-      allowedContractsRoot,
-      num.toHex(maxCallsPerTx),
-    ]);
-
-    const oldSignature = ec.starkCurve.sign(message, oldSession.sessionPrivateKey);
-
-    // Build spending policies calldata
-    const spendingCalldata: string[] = [];
-    if (policy?.spendingLimits?.length) {
-      spendingCalldata.push(num.toHex(policy.spendingLimits.length));
-      for (const limit of policy.spendingLimits) {
-        spendingCalldata.push(num.toHex(limit.token));
-        const limitBig = BigInt(limit.limit);
-        spendingCalldata.push(num.toHex(limitBig & ((1n << 128n) - 1n))); // low
-        spendingCalldata.push(num.toHex(limitBig >> 128n)); // high
-      }
-    } else {
-      spendingCalldata.push(num.toHex(0));
-    }
-
-    // Build the renew_session call
-    const renewCall: Call = {
-      contractAddress: oldSession.walletAddress,
-      entrypoint: 'renew_session',
-      calldata: [
-        oldSession.sessionPubKey,              // old_session_key
-        num.toHex(oldSignature.r),             // old_signature_r
-        num.toHex(oldSignature.s),             // old_signature_s
-        newSession.sessionPubKey,              // new_session_key
-        newSession.nonce,                      // new_nonce
-        num.toHex(newSession.nonceParams.validAfter),       // new_valid_after
-        num.toHex(newSession.nonceParams.validUntil),       // new_valid_until
-        num.toHex(newSession.nonceParams.renewalDeadline),  // new_renewal_deadline
-        allowedContractsRoot,                  // new_allowed_contracts_root
-        num.toHex(maxCallsPerTx),              // new_max_calls_per_tx
-        ...spendingCalldata,                   // spending policies
-      ]
-    };
+    const renewCall = this.buildRenewSessionCall(oldSession, newSession);
 
     // Execute via Cavos paymaster JSON-RPC using the OLD session signature
     const buildResult = await this.callPaymasterRpc('paymaster_buildTransaction', [{
@@ -1388,6 +1331,83 @@ export class OAuthTransactionManager {
     }
 
     return result.transaction_hash;
+  }
+
+  /**
+   * Renew a session on a no_fee chain such as Slot.
+   * The transaction is signed with the old session key; callers should only
+   * persist the new session after this method resolves.
+   */
+  async renewSessionOnNoFeeChain(
+    newSession: OAuthSession,
+    options?: { waitForTransaction?: boolean },
+  ): Promise<string> {
+    const oldSession = this.oauthManager.getSession();
+    if (!oldSession?.walletAddress || !oldSession.sessionPrivateKey) {
+      throw new Error('No old session to renew from');
+    }
+
+    const renewCall = this.buildRenewSessionCall(oldSession, newSession);
+    return this.executeDirectNoFee([renewCall], false, options?.waitForTransaction !== false);
+  }
+
+  private buildRenewSessionCall(oldSession: OAuthSession, newSession: OAuthSession): Call {
+    if (!oldSession.walletAddress || !oldSession.sessionPubKey || !oldSession.sessionPrivateKey) {
+      throw new Error('Old session data incomplete');
+    }
+
+    if (!newSession.sessionPubKey || !newSession.nonce || !newSession.nonceParams) {
+      throw new Error('New session data incomplete');
+    }
+
+    const policy = newSession.sessionPolicy;
+    const allowedContractsRoot = policy?.allowedContracts?.length
+      ? OAuthWalletManager.computeMerkleRoot(policy.allowedContracts)
+      : '0x0';
+    const maxCallsPerTx = policy?.maxCallsPerTx ?? 10;
+
+    const message = hash.computePoseidonHashOnElements([
+      newSession.sessionPubKey,
+      newSession.nonce,
+      num.toHex(newSession.nonceParams.validAfter),
+      num.toHex(newSession.nonceParams.validUntil),
+      num.toHex(newSession.nonceParams.renewalDeadline),
+      allowedContractsRoot,
+      num.toHex(maxCallsPerTx),
+    ]);
+
+    const oldSignature = ec.starkCurve.sign(message, oldSession.sessionPrivateKey);
+
+    const spendingCalldata: string[] = [];
+    if (policy?.spendingLimits?.length) {
+      spendingCalldata.push(num.toHex(policy.spendingLimits.length));
+      for (const limit of policy.spendingLimits) {
+        spendingCalldata.push(num.toHex(limit.token));
+        const limitBig = BigInt(limit.limit);
+        spendingCalldata.push(num.toHex(limitBig & ((1n << 128n) - 1n)));
+        spendingCalldata.push(num.toHex(limitBig >> 128n));
+      }
+    } else {
+      spendingCalldata.push(num.toHex(0));
+    }
+
+    return {
+      contractAddress: oldSession.walletAddress,
+      entrypoint: 'renew_session',
+      calldata: [
+        oldSession.sessionPubKey,
+        num.toHex(oldSignature.r),
+        num.toHex(oldSignature.s),
+        newSession.sessionPubKey,
+        newSession.nonce,
+        num.toHex(newSession.nonceParams.validAfter),
+        num.toHex(newSession.nonceParams.validUntil),
+        num.toHex(newSession.nonceParams.renewalDeadline),
+        allowedContractsRoot,
+        num.toHex(maxCallsPerTx),
+        ...spendingCalldata,
+      ],
+    };
   }
 
   /**

@@ -1115,15 +1115,10 @@ export class CavosSDK {
       throw new Error('Session expired outside the grace period. Please login again.');
     }
 
-    // Freshen session (generate new session key while keeping old one in memory)
-    await this.oauthWalletManager.freshenSession();
-    const newSession = this.oauthWalletManager.getSession();
-
-    if (!newSession) {
-      throw new Error('Failed to generate new session');
-    }
+    const newSession = await this.oauthWalletManager.generateNewSession();
 
     const txHash = await this.transactionManager.renewSession(newSession);
+    this.oauthWalletManager.commitRenewedSession(newSession);
 
     return txHash;
   }
@@ -1527,6 +1522,15 @@ export class CavosSDK {
         this.slotRelayerAccount,
         { waitForTransaction: options?.waitForTransaction === true },
       );
+    }
+
+    if (status.expired && status.canRenew) {
+      const newSession = await this.oauthWalletManager.generateNewSession();
+      await this.slotTransactionManager.renewSessionOnNoFeeChain(newSession, {
+        waitForTransaction: true,
+      });
+      this.oauthWalletManager.commitRenewedSession(newSession);
+      this.updateWalletStatus({ isSessionActive: true, isReady: true });
     }
 
     return this.slotTransactionManager.executeOnNoFeeChain(callsArray, {
