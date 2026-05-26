@@ -30,6 +30,27 @@ import { OAuthWalletConfig } from '../types/config';
 import { getLatestCavosAccountClassHash } from '../config/defaults';
 import { Logger } from '../utils/logger';
 
+export type SessionStatus = {
+  registered: boolean;
+  active: boolean;
+  expired: boolean;
+  canRenew: boolean;
+  validAfter?: bigint;
+  validUntil?: bigint;
+  renewalDeadline?: bigint;
+  rpcError?: string;
+};
+
+type ExecuteOnNoFeeChainOptions = {
+  waitForTransaction?: boolean;
+  sessionStatus?: SessionStatus;
+};
+
+type ExecuteViaOutsideExecutionOptions = {
+  waitForTransaction?: boolean;
+  sessionStatus?: SessionStatus;
+};
+
 /**
  * Custom signer for OAuth accounts.
  * Produces JWT signatures for deploy and session signatures for execute.
@@ -246,16 +267,7 @@ export class OAuthTransactionManager {
    * Get session status from on-chain.
    * Returns detailed status including whether it's expired and if it can be renewed.
    */
-  async getSessionStatus(): Promise<{
-    registered: boolean;
-    active: boolean;
-    expired: boolean;
-    canRenew: boolean;
-    validAfter?: bigint;
-    validUntil?: bigint;
-    renewalDeadline?: bigint;
-    rpcError?: string;
-  }> {
+  async getSessionStatus(): Promise<SessionStatus> {
     const session = this.oauthManager.getSession();
     if (!session?.walletAddress || !session.sessionPubKey) {
       return { registered: false, active: false, expired: false, canRenew: false };
@@ -555,14 +567,14 @@ export class OAuthTransactionManager {
    * This path only works once the session is already registered on-chain.
    * First-time Slot registration must go through execute_from_outside_v2.
    */
-  async executeOnNoFeeChain(calls: Call | Call[], options?: { waitForTransaction?: boolean }): Promise<string> {
+  async executeOnNoFeeChain(calls: Call | Call[], options?: ExecuteOnNoFeeChainOptions): Promise<string> {
     const session = this.oauthManager.getSession();
     if (!session?.walletAddress) {
       throw new Error('No valid session');
     }
 
     const callsArray = Array.isArray(calls) ? calls : [calls];
-    const status = await this.getSessionStatus();
+    const status = options?.sessionStatus ?? await this.getSessionStatus();
 
     if (!status.registered) {
       throw new Error(
@@ -870,7 +882,7 @@ export class OAuthTransactionManager {
   async executeViaOutsideExecution(
     calls: Call[],
     relayerAccount: Account,
-    options?: { waitForTransaction?: boolean },
+    options?: ExecuteViaOutsideExecutionOptions,
   ): Promise<string> {
     const session = this.oauthManager.getSession();
     if (!session?.jwt || !session.walletAddress) throw new Error('Not logged in');
@@ -906,7 +918,7 @@ export class OAuthTransactionManager {
     );
 
     // Choose signature: JWT for unregistered sessions (registers + executes), session key otherwise.
-    const sessionStatus = await this.getSessionStatus();
+    const sessionStatus = options?.sessionStatus ?? await this.getSessionStatus();
     let sigArray: string[];
     if (!sessionStatus.registered) {
       const signature = await this.oauthManager.buildJWTSignatureData(messageHash);

@@ -2,7 +2,7 @@ import { Account, Call, RpcProvider, num, type TypedData } from 'starknet';
 import { SessionManager } from './session/SessionManager';
 import { PaymasterIntegration } from './paymaster/PaymasterIntegration';
 import { AnalyticsManager } from './analytics/AnalyticsManager';
-import { OAuthWalletManager, OAuthTransactionManager } from './oauth';
+import { OAuthWalletManager, OAuthTransactionManager, type SessionStatus } from './oauth';
 import { CavosConfig, UserInfo, OnrampProvider, LoginProvider, Signature, OAuthWalletConfig, FirebaseCredentials } from './types';
 import { DEFAULT_OAUTH_CONFIG_SEPOLIA, DEFAULT_OAUTH_CONFIG_MAINNET, DEFAULT_SLOT_RELAYER_ADDRESS, DEFAULT_SLOT_RELAYER_PRIVATE_KEY } from './config/defaults';
 import { Logger } from './utils/logger';
@@ -1520,10 +1520,14 @@ export class CavosSDK {
       return this.slotTransactionManager.executeViaOutsideExecution(
         callsArray,
         this.slotRelayerAccount,
-        { waitForTransaction: options?.waitForTransaction === true },
+        {
+          waitForTransaction: options?.waitForTransaction === true,
+          sessionStatus: status,
+        },
       );
     }
 
+    let executionStatus: SessionStatus = status;
     if (status.expired && status.canRenew) {
       const newSession = await this.oauthWalletManager.generateNewSession();
       await this.slotTransactionManager.renewSessionOnNoFeeChain(newSession, {
@@ -1531,10 +1535,20 @@ export class CavosSDK {
       });
       this.oauthWalletManager.commitRenewedSession(newSession);
       this.updateWalletStatus({ isSessionActive: true, isReady: true });
+      executionStatus = {
+        registered: true,
+        active: true,
+        expired: false,
+        canRenew: false,
+        validAfter: newSession.nonceParams?.validAfter,
+        validUntil: newSession.nonceParams?.validUntil,
+        renewalDeadline: newSession.nonceParams?.renewalDeadline,
+      };
     }
 
     return this.slotTransactionManager.executeOnNoFeeChain(callsArray, {
       waitForTransaction: options?.waitForTransaction === true,
+      sessionStatus: executionStatus,
     });
   }
 

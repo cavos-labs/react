@@ -70,9 +70,15 @@ describe('CavosSDK.executeOnSlot', () => {
     await expect(sdk.executeOnSlot(call)).resolves.toBe('0xexecute');
 
     expect(sdk.slotTransactionManager.renewSessionOnNoFeeChain).not.toHaveBeenCalled();
-    expect(sdk.slotTransactionManager.executeOnNoFeeChain).toHaveBeenCalledWith([call], {
+    expect(sdk.slotTransactionManager.getSessionStatus).toHaveBeenCalledTimes(1);
+    expect(sdk.slotTransactionManager.executeOnNoFeeChain).toHaveBeenCalledWith([call], expect.objectContaining({
       waitForTransaction: false,
-    });
+      sessionStatus: expect.objectContaining({
+        registered: true,
+        active: true,
+        expired: false,
+      }),
+    }));
   });
 
   it('renews an expired Slot session inside grace before executing the original call', async () => {
@@ -87,9 +93,15 @@ describe('CavosSDK.executeOnSlot', () => {
       waitForTransaction: true,
     });
     expect(sdk.oauthWalletManager.commitRenewedSession).toHaveBeenCalledWith(newSession);
-    expect(sdk.slotTransactionManager.executeOnNoFeeChain).toHaveBeenCalledWith([call], {
+    expect(sdk.slotTransactionManager.getSessionStatus).toHaveBeenCalledTimes(1);
+    expect(sdk.slotTransactionManager.executeOnNoFeeChain).toHaveBeenCalledWith([call], expect.objectContaining({
       waitForTransaction: true,
-    });
+      sessionStatus: expect.objectContaining({
+        registered: true,
+        active: true,
+        expired: false,
+      }),
+    }));
   });
 
   it('keeps the old session when Slot renewal fails', async () => {
@@ -125,8 +137,12 @@ describe('CavosSDK.executeOnSlot', () => {
     expect(sdk.slotTransactionManager.executeViaOutsideExecution).toHaveBeenCalledWith(
       [call],
       sdk.slotRelayerAccount,
-      { waitForTransaction: false },
+      expect.objectContaining({
+        waitForTransaction: false,
+        sessionStatus: expect.objectContaining({ registered: false }),
+      }),
     );
+    expect(sdk.slotTransactionManager.getSessionStatus).toHaveBeenCalledTimes(1);
     expect(sdk.slotTransactionManager.executeOnNoFeeChain).not.toHaveBeenCalled();
   });
 });

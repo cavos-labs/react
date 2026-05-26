@@ -13,7 +13,7 @@ export { SessionManager } from './session/SessionManager';
 export { PaymasterIntegration } from './paymaster/PaymasterIntegration';
 
 // OAuth Wallet (for oauth-wallet auth mode)
-export { OAuthWalletManager, OAuthTransactionManager, NonceManager, AddressSeedManager } from './oauth';
+export { OAuthWalletManager, OAuthTransactionManager, NonceManager, AddressSeedManager, type SessionStatus } from './oauth';
 
 // Email verification errors
 export { EmailVerificationRequiredError, EmailNotVerifiedError } from './oauth/errors';
