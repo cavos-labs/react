@@ -41,6 +41,11 @@ export interface CavosConfig {
   paymasterUrl?: string;
   /** Enable debug logging (default: false) */
   enableLogging?: boolean;
+  /**
+   * Deploy wallets on the primary network without automatically registering
+   * the session in the background. Slot auto-registration is not affected.
+   */
+  deployOnly?: boolean;
   /** OAuth Wallet configuration (optional, uses defaults for network if not provided) */
   oauthWallet?: Partial<OAuthWalletConfig>;
   /** Session configuration for session keys */

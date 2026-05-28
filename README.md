@@ -319,8 +319,14 @@ interface CavosConfig {
   paymasterApiKey?: string;         // AVNU Paymaster key (optional, uses default)
   starknetRpcUrl?: string;          // Custom RPC URL (optional)
   enableLogging?: boolean;          // Enable SDK logs (default: false)
+  deployOnly?: boolean;             // Deploy primary wallet without background session registration
 }
 ```
+
+Set `deployOnly: true` when you want mainnet/sepolia wallets to be deployed
+automatically without also registering the session in the background. You can
+still register later with `registerCurrentSession()`, and Slot keeps its normal
+automatic session registration flow.
 
 ## Architecture
 

@@ -404,7 +404,7 @@ export class CavosSDK {
             isDeployed: true,
             pendingDeployTxHash: undefined,
           });
-          await this.autoRegisterSession();
+          await this.autoRegisterPrimarySessionIfEnabled();
           return;
         } catch (err) {
           // Still not confirmed — leave the hash and let user check explorer
@@ -426,7 +426,7 @@ export class CavosSDK {
           if (deployHash === 'already-deployed') {
             // Race: deployed between the check and now
             this.updateWalletStatus({ isDeploying: false, isDeployed: true });
-            await this.autoRegisterSession();
+            await this.autoRegisterPrimarySessionIfEnabled();
             return;
           }
 
@@ -456,7 +456,7 @@ export class CavosSDK {
             this.analyticsManager.trackWalletDeployment(address);
           }
 
-          await this.autoRegisterSession();
+          await this.autoRegisterPrimarySessionIfEnabled();
           this._deploySlotInBackground();
         } catch (err: any) {
           const msg: string = err?.message || String(err);
@@ -481,7 +481,7 @@ export class CavosSDK {
           this.updateWalletStatus({ isDeployed: true, isSessionActive: true, isReady: true });
         } else {
           this.updateWalletStatus({ isDeployed: true, isSessionActive: false, isReady: false });
-          await this.autoRegisterSession();
+          await this.autoRegisterPrimarySessionIfEnabled();
         }
         this._deploySlotInBackground();
       }
@@ -529,6 +529,24 @@ export class CavosSDK {
    * Skips gracefully if JWT is expired — execute() will surface the error to the user
    * clearly via JwtExpiredError instead of failing silently here.
    */
+  private shouldAutoRegisterPrimarySession(): boolean {
+    return this.config.deployOnly !== true;
+  }
+
+  private async autoRegisterPrimarySessionIfEnabled(): Promise<void> {
+    if (this.shouldAutoRegisterPrimarySession()) {
+      await this.autoRegisterSession();
+      return;
+    }
+
+    this.logger.log('Primary network auto-registration skipped: deployOnly is enabled.');
+    this.updateWalletStatus({
+      isRegistering: false,
+      isSessionActive: false,
+      isReady: true,
+    });
+  }
+
   private async autoRegisterSessionOnSlot(): Promise<void> {
     if (!this.slotTransactionManager) return;
 
