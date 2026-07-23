@@ -399,6 +399,7 @@ export class OAuthWalletManager {
     const params = new URLSearchParams({
       nonce: this.session!.nonce,
       redirect_uri: redirectUri || window.location.href,
+      app_id: this.appId,
     });
 
     const response = await fetch(`${this.backendUrl}/api/oauth/google?${params}`, {
@@ -430,6 +431,7 @@ export class OAuthWalletManager {
     const params = new URLSearchParams({
       nonce: this.session!.nonce,
       redirect_uri: redirectUri || window.location.href,
+      app_id: this.appId,
     });
 
     const response = await fetch(`${this.backendUrl}/api/oauth/apple?${params}`, {
