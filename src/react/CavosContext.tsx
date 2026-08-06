@@ -92,6 +92,8 @@ const DEFAULT_WALLET_STATUS: WalletStatus = {
   isReady: false,
   isSlotDeploying: false,
   isSlotDeployed: false,
+  isSlotSessionActive: false,
+  isSlotReady: false,
 };
 
 export function CavosProvider({ config, modal, children }: CavosProviderProps) {

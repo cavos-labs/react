@@ -20,6 +20,12 @@ export interface WalletStatus {
   isSlotDeploying: boolean;
   /** True once the wallet is confirmed deployed on the Slot chain. */
   isSlotDeployed: boolean;
+  /** True when the current session is confirmed active on the Slot chain. */
+  isSlotSessionActive: boolean;
+  /** True only when Slot deployment and current-session activation are confirmed. */
+  isSlotReady: boolean;
+  /** Last Slot deployment or session-registration error, if any. */
+  slotError?: string;
   /** Tx hash of a pending Slot deploy whose confirmation timed out. */
   pendingSlotDeployTxHash?: string;
 }
@@ -69,6 +75,8 @@ export class CavosSDK {
     isReady: false,
     isSlotDeploying: false,
     isSlotDeployed: false,
+    isSlotSessionActive: false,
+    isSlotReady: false,
   };
   private walletStatusListeners: Set<WalletStatusListener> = new Set();
   private _authChangeListeners: Set<() => void> = new Set();
@@ -353,6 +361,7 @@ export class CavosSDK {
     }
 
     await this.oauthWalletManager.loginWithFirebase(email, password);
+    this.resetSessionReadiness();
     this.initializeTransactionManager();
     this.initializeSlotTransactionManager();
 
@@ -552,23 +561,49 @@ export class CavosSDK {
 
     if (this.isJwtExpired()) {
       this.logger.log('[Slot] Auto-registration skipped: JWT is expired.');
+      this.updateWalletStatus({
+        isSlotSessionActive: false,
+        isSlotReady: false,
+        slotError: 'JWT has expired. Please login again.',
+      });
       return;
     }
 
     try {
       if (!this.slotRelayerAccount) {
-        this.logger.log('[Slot] Auto-registration skipped: no relayer account available.');
-        return;
+        throw new Error('Slot relayer is not available.');
       }
 
+      this.updateWalletStatus({
+        isSlotSessionActive: false,
+        isSlotReady: false,
+        slotError: undefined,
+      });
       this.logger.log('[Slot] Auto-registering session on Slot via outside execution...');
       const txHash = await this.slotTransactionManager.registerCurrentSessionViaOutside(
         this.slotRelayerAccount,
+        { waitForTransaction: true },
       );
+      const status = await this.slotTransactionManager.getSessionStatus();
+      const ready = status.registered && status.active && !status.expired;
+      if (!ready) {
+        throw new Error('Slot session registration was submitted but is not active on-chain.');
+      }
+      this.updateWalletStatus({
+        isSlotSessionActive: true,
+        isSlotReady: true,
+        slotError: undefined,
+      });
       this.logger.log('[Slot] Session registered on Slot. TxHash:', txHash);
-    } catch (err) {
+    } catch (err: any) {
+      const message = err?.message || String(err);
+      this.updateWalletStatus({
+        isSlotSessionActive: false,
+        isSlotReady: false,
+        slotError: message,
+      });
       this.logger.alwaysError('[Slot] Auto session registration on Slot failed:', err);
-      // Non-blocking — executeOnSlot() will surface a clear error to the user.
+      throw err;
     }
   }
 
@@ -625,6 +660,7 @@ export class CavosSDK {
     }
 
     await this.oauthWalletManager.handleOAuthCallback(authDataString);
+    this.resetSessionReadiness();
     this.initializeTransactionManager();
     this.initializeSlotTransactionManager();
 
@@ -703,6 +739,12 @@ export class CavosSDK {
             : false;
           if (!slotSessionActiveAfterPoll) {
             await this.autoRegisterSessionOnSlot();
+          } else {
+            this.updateWalletStatus({
+              isSlotSessionActive: true,
+              isSlotReady: true,
+              slotError: undefined,
+            });
           }
           return;
         } catch {
@@ -730,13 +772,23 @@ export class CavosSDK {
         if (!slotSessionActive) {
           await this.autoRegisterSessionOnSlot();
         } else {
+          this.updateWalletStatus({
+            isSlotSessionActive: true,
+            isSlotReady: true,
+            slotError: undefined,
+          });
           this.logger.log('[Slot] Session already registered on Slot.');
         }
         return;
       }
 
       this.logger.log('[Slot] Wallet not deployed on Slot. Deploying via UDC...');
-      this.updateWalletStatus({ isSlotDeploying: true });
+      this.updateWalletStatus({
+        isSlotDeploying: true,
+        isSlotSessionActive: false,
+        isSlotReady: false,
+        slotError: undefined,
+      });
 
       if (!this.slotTransactionManager) {
         this.initializeSlotTransactionManager();
@@ -744,8 +796,14 @@ export class CavosSDK {
       if (!this.slotTransactionManager) return;
 
       if (!this.slotRelayerAccount) {
+        const message = 'Slot relayer is not available.';
         this.logger.alwaysError('[Slot] Cannot deploy: no relayer account available.');
-        this.updateWalletStatus({ isSlotDeploying: false });
+        this.updateWalletStatus({
+          isSlotDeploying: false,
+          isSlotSessionActive: false,
+          isSlotReady: false,
+          slotError: message,
+        });
         return;
       }
 
@@ -778,11 +836,21 @@ export class CavosSDK {
           typeof localStorage !== 'undefined' && localStorage.removeItem(CavosSDK.PENDING_SLOT_DEPLOY_TX_KEY);
           this.logger.alwaysError('[Slot] Background deployment failed:', err);
         }
-        this.updateWalletStatus({ isSlotDeploying: false });
+        this.updateWalletStatus({
+          isSlotDeploying: false,
+          isSlotSessionActive: false,
+          isSlotReady: false,
+          slotError: msg,
+        });
       }
     } catch (err) {
       this.logger.alwaysError('[Slot] Background deployment check failed:', err);
-      this.updateWalletStatus({ isSlotDeploying: false });
+      this.updateWalletStatus({
+        isSlotDeploying: false,
+        isSlotSessionActive: false,
+        isSlotReady: false,
+        slotError: err instanceof Error ? err.message : String(err),
+      });
     }
   }
 
@@ -1006,13 +1074,33 @@ export class CavosSDK {
 
     const status = await this.slotTransactionManager.getSessionStatus();
     if (status.registered && status.active && !status.expired) {
+      this.updateWalletStatus({
+        isSlotSessionActive: true,
+        isSlotReady: true,
+        slotError: undefined,
+      });
       return 'already-registered';
     }
 
     const txHash = await this.slotTransactionManager.registerCurrentSessionViaOutside(
       this.slotRelayerAccount,
+      { waitForTransaction: true },
     );
-    this.updateWalletStatus({ isSessionActive: true, isReady: true });
+    const confirmedStatus = await this.slotTransactionManager.getSessionStatus();
+    if (!confirmedStatus.registered || !confirmedStatus.active || confirmedStatus.expired) {
+      const message = 'Slot session registration was submitted but is not active on-chain.';
+      this.updateWalletStatus({
+        isSlotSessionActive: false,
+        isSlotReady: false,
+        slotError: message,
+      });
+      throw new Error(message);
+    }
+    this.updateWalletStatus({
+      isSlotSessionActive: true,
+      isSlotReady: true,
+      slotError: undefined,
+    });
     return txHash;
   }
 
@@ -1051,7 +1139,16 @@ export class CavosSDK {
     }
 
     const txHash = await this.slotTransactionManager.registerCurrentSessionDirect();
-    this.updateWalletStatus({ isSessionActive: true, isReady: true });
+    const confirmedStatus = await this.slotTransactionManager.getSessionStatus();
+    const ready = confirmedStatus.registered && confirmedStatus.active && !confirmedStatus.expired;
+    this.updateWalletStatus({
+      isSlotSessionActive: ready,
+      isSlotReady: ready,
+      slotError: ready ? undefined : 'Slot session registration was submitted but is not active on-chain.',
+    });
+    if (!ready) {
+      throw new Error('Slot session registration was submitted but is not active on-chain.');
+    }
     return txHash;
   }
 
@@ -1185,6 +1282,8 @@ export class CavosSDK {
       isReady: false,
       isSlotDeploying: false,
       isSlotDeployed: false,
+      isSlotSessionActive: false,
+      isSlotReady: false,
     };
     this.notifyWalletStatusListeners();
   }
@@ -1258,6 +1357,7 @@ export class CavosSDK {
     }
 
     await this.oauthWalletManager.verifyOtp(email, code);
+    this.resetSessionReadiness();
     this.initializeTransactionManager();
     this.initializeSlotTransactionManager();
 
@@ -1326,6 +1426,17 @@ export class CavosSDK {
   private updateWalletStatus(updates: Partial<WalletStatus>): void {
     this._walletStatus = { ...this._walletStatus, ...updates };
     this.notifyWalletStatusListeners();
+  }
+
+  /** A successful explicit login creates a new key that is not registered yet. */
+  private resetSessionReadiness(): void {
+    this.updateWalletStatus({
+      isSessionActive: false,
+      isReady: false,
+      isSlotSessionActive: false,
+      isSlotReady: false,
+      slotError: undefined,
+    });
   }
 
   /**
@@ -1531,20 +1642,6 @@ export class CavosSDK {
     const callsArray = Array.isArray(calls) ? calls : [calls];
     const status = await this.slotTransactionManager.getSessionStatus();
 
-    if (!status.registered) {
-      if (!this.slotRelayerAccount) {
-        throw new Error('Slot session is not registered yet and no relayer is available.');
-      }
-      return this.slotTransactionManager.executeViaOutsideExecution(
-        callsArray,
-        this.slotRelayerAccount,
-        {
-          waitForTransaction: options?.waitForTransaction === true,
-          sessionStatus: status,
-        },
-      );
-    }
-
     let executionStatus: SessionStatus = status;
     if (status.expired && status.canRenew) {
       const newSession = await this.oauthWalletManager.generateNewSession();
@@ -1563,6 +1660,41 @@ export class CavosSDK {
         renewalDeadline: newSession.nonceParams?.renewalDeadline,
       };
     }
+
+    const requiresJwt =
+      !executionStatus.registered || executionStatus.expired || !executionStatus.active;
+    if (requiresJwt) {
+      if (this.isJwtExpired()) {
+        throw new JwtExpiredError();
+      }
+      if (!this.slotRelayerAccount) {
+        throw new Error('Slot session requires JWT registration and no relayer is available.');
+      }
+      const txHash = await this.slotTransactionManager.executeViaOutsideExecution(
+        callsArray,
+        this.slotRelayerAccount,
+        {
+          waitForTransaction: options?.waitForTransaction === true,
+          sessionStatus: executionStatus,
+        },
+      );
+      if (options?.waitForTransaction === true) {
+        const confirmedStatus = await this.slotTransactionManager.getSessionStatus();
+        const ready = confirmedStatus.registered && confirmedStatus.active && !confirmedStatus.expired;
+        this.updateWalletStatus({
+          isSlotSessionActive: ready,
+          isSlotReady: ready,
+          slotError: ready ? undefined : 'Slot transaction confirmed but the session is not active on-chain.',
+        });
+      }
+      return txHash;
+    }
+
+    this.updateWalletStatus({
+      isSlotSessionActive: true,
+      isSlotReady: true,
+      slotError: undefined,
+    });
 
     return this.slotTransactionManager.executeOnNoFeeChain(callsArray, {
       waitForTransaction: options?.waitForTransaction === true,

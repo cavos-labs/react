@@ -161,6 +161,8 @@ export class OAuthWalletManager {
   private sessionDuration: number;
   private renewalGracePeriod: number;
   private defaultPolicy?: SessionKeyPolicy;
+  /** Non-sensitive wallet selection retained when a stale session is discarded. */
+  private preservedWalletName?: string;
 
   constructor(
     config: OAuthWalletConfig,
@@ -363,7 +365,7 @@ export class OAuthWalletManager {
     const nonce = NonceManager.computeNonce(nonceParams);
 
     // Set default wallet name if not already set
-    const walletName = this.session?.walletName || 'default';
+    const walletName = this.session?.walletName || this.preservedWalletName || 'default';
 
     // Create session object (use explicit policy, fall back to config default)
     this.session = {
@@ -391,9 +393,9 @@ export class OAuthWalletManager {
       throw new Error('OAuth not supported in SSR');
     }
 
-    if (!this.session) {
-      await this.initializeSession();
-    }
+    // Starting OAuth is an explicit login. Always rotate key material and nonce;
+    // an authenticated session left in memory may already be expired on-chain.
+    await this.initializeSession(this.session?.sessionPolicy);
 
     // Build URL with query parameters (backend expects GET)
     const params = new URLSearchParams({
@@ -423,9 +425,9 @@ export class OAuthWalletManager {
       throw new Error('OAuth not supported in SSR');
     }
 
-    if (!this.session) {
-      await this.initializeSession();
-    }
+    // Starting OAuth is an explicit login. Always rotate key material and nonce;
+    // an authenticated session left in memory may already be expired on-chain.
+    await this.initializeSession(this.session?.sessionPolicy);
 
     // Build URL with query parameters (backend expects GET)
     const params = new URLSearchParams({
@@ -744,6 +746,7 @@ export class OAuthWalletManager {
    */
   clearSession(): void {
     this.session = null;
+    this.preservedWalletName = undefined;
     if (typeof window !== 'undefined') {
       this.removeWalletStorage(SESSION_STORAGE_KEY);
       this.removeWalletStorage(PRE_AUTH_STORAGE_KEY);
@@ -789,7 +792,8 @@ export class OAuthWalletManager {
 
     // Check JWT expiration
     const now = Math.floor(Date.now() / 1000);
-    if (this.session.jwtClaims.exp < now) {
+    const expiresAt = Number(this.session.jwtClaims.exp);
+    if (!Number.isFinite(expiresAt) || expiresAt <= now) {
       return false;
     }
 
@@ -821,10 +825,20 @@ export class OAuthWalletManager {
             this.persistSession();
           }
         }
-        return this.hasValidSession();
+        const isValid = this.hasValidSession();
+        if (!isValid) {
+          // Never leave stale cryptographic material as the active session. A
+          // subsequent explicit login must create a new key, nonce and validity
+          // window. Only the non-sensitive wallet selection is retained.
+          this.preservedWalletName = this.session?.walletName || 'default';
+          this.session = null;
+          this.removeWalletStorage(SESSION_STORAGE_KEY);
+        }
+        return isValid;
       }
     } catch {
-      // Ignore parse errors
+      this.session = null;
+      this.removeWalletStorage(SESSION_STORAGE_KEY);
     }
     return false;
   }
@@ -1226,9 +1240,7 @@ export class OAuthWalletManager {
    * Register new user with email+password (Firebase)
    */
   async registerWithFirebase(email: string, password: string): Promise<OAuthSession> {
-    if (!this.session) {
-      await this.initializeSession();
-    }
+    await this.initializeSession(this.session?.sessionPolicy);
 
     const response = await fetch(`${this.backendUrl}/api/oauth/firebase/register`, {
       method: 'POST',
@@ -1277,9 +1289,7 @@ export class OAuthWalletManager {
    * Login existing user with email+password (Firebase)
    */
   async loginWithFirebase(email: string, password: string): Promise<OAuthSession> {
-    if (!this.session) {
-      await this.initializeSession();
-    }
+    await this.initializeSession(this.session?.sessionPolicy);
 
     const response = await fetch(`${this.backendUrl}/api/oauth/firebase/login`, {
       method: 'POST',
@@ -1356,9 +1366,7 @@ export class OAuthWalletManager {
    * localStorage, then asks the backend to send the branded email.
    */
   async sendMagicLink(email: string): Promise<void> {
-    if (!this.session) {
-      await this.initializeSession();
-    }
+    await this.initializeSession(this.session?.sessionPolicy);
 
     // Persist pre-auth to localStorage so it survives a mobile redirect (cross-tab)
     if (typeof window !== 'undefined' && this.session) {
@@ -1396,9 +1404,7 @@ export class OAuthWalletManager {
    * Uses the same pre-auth session and nonce persistence as magic link.
    */
   async sendOtp(email: string): Promise<void> {
-    if (!this.session) {
-      await this.initializeSession();
-    }
+    await this.initializeSession(this.session?.sessionPolicy);
 
     if (typeof window !== 'undefined' && this.session) {
       try {

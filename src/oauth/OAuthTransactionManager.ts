@@ -854,7 +854,10 @@ export class OAuthTransactionManager {
    *
    * @param relayerAccount Pre-funded Account on the Slot that submits the outer tx.
    */
-  async registerCurrentSessionViaOutside(relayerAccount: Account): Promise<string> {
+  async registerCurrentSessionViaOutside(
+    relayerAccount: Account,
+    options?: { waitForTransaction?: boolean },
+  ): Promise<string> {
     const session = this.oauthManager.getSession();
     if (!session?.jwt || !session.walletAddress) {
       throw new Error('Must be logged in to register session');
@@ -864,16 +867,17 @@ export class OAuthTransactionManager {
       entrypoint: 'get_version',
       calldata: [],
     };
-    return this.executeViaOutsideExecution([noOpCall], relayerAccount);
+    return this.executeViaOutsideExecution([noOpCall], relayerAccount, options);
   }
 
   /**
    * Execute calls on Slot via execute_from_outside_v2 (SNIP-9).
    *
    * Mirrors the normal wallet flow:
-   * - Session NOT registered: JWT signature (OAUTH_JWT_V1) — validates on-chain and registers
-   *   the session key in the same tx. One-time cost (RSA).
-   * - Session registered: lightweight session key signature (SESSION_V1) — only ECDSA, cheap.
+   * - Session not registered, inactive, or expired: JWT signature (OAUTH_JWT_V1) — validates
+   *   on-chain and registers/reactivates the session key in the same tx.
+   * - Session registered, active, and unexpired: lightweight session key signature
+   *   (SESSION_V1) — only ECDSA, cheap.
    *
    * Hashes the outside-execution payload manually using the account contract's
    * SNIP-12 type hashes. starknet.js does not currently support the u64 fields
@@ -917,10 +921,13 @@ export class OAuthTransactionManager {
       chainId,
     );
 
-    // Choose signature: JWT for unregistered sessions (registers + executes), session key otherwise.
+    // A registered key is not necessarily usable. Expired or not-yet-active
+    // sessions must go through JWT validation instead of SESSION_V1.
     const sessionStatus = options?.sessionStatus ?? await this.getSessionStatus();
+    const requiresJwt =
+      !sessionStatus.registered || sessionStatus.expired || !sessionStatus.active;
     let sigArray: string[];
-    if (!sessionStatus.registered) {
+    if (requiresJwt) {
       const signature = await this.oauthManager.buildJWTSignatureData(messageHash);
       sigArray = Array.isArray(signature) ? signature.map(String) : [String(signature)];
     } else {

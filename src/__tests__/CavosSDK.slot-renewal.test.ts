@@ -37,12 +37,17 @@ function createSlotSdk({
     isReady: true,
     isSlotDeploying: false,
     isSlotDeployed: true,
+    isSlotSessionActive: status.active && !status.expired,
+    isSlotReady: status.registered && status.active && !status.expired,
   };
   sdk.walletStatusListeners = new Set();
   sdk.slotRelayerAccount = { address: '0xrelayer' };
   sdk.oauthWalletManager = {
     generateNewSession: jest.fn().mockResolvedValue(newSession),
     commitRenewedSession: jest.fn(),
+    getSession: jest.fn().mockReturnValue({
+      jwtClaims: { exp: Math.floor(Date.now() / 1000) + 3600 },
+    }),
   };
   sdk.slotTransactionManager = {
     getSessionStatus: jest.fn().mockResolvedValue(status),
@@ -116,15 +121,34 @@ describe('CavosSDK.executeOnSlot', () => {
     expect(sdk.slotTransactionManager.executeOnNoFeeChain).not.toHaveBeenCalled();
   });
 
-  it('keeps outside-grace expiration as a login-required error', async () => {
+  it('uses JWT outside execution for an expired session outside grace', async () => {
     const { sdk } = createSlotSdk({
       status: { registered: true, active: false, expired: true, canRenew: false },
     });
 
-    await expect(sdk.executeOnSlot(call)).rejects.toThrow('SESSION_EXPIRED');
+    await expect(sdk.executeOnSlot(call)).resolves.toBe('0xoutside');
 
     expect(sdk.oauthWalletManager.generateNewSession).not.toHaveBeenCalled();
     expect(sdk.slotTransactionManager.renewSessionOnNoFeeChain).not.toHaveBeenCalled();
+    expect(sdk.slotTransactionManager.executeViaOutsideExecution).toHaveBeenCalledWith(
+      [call],
+      sdk.slotRelayerAccount,
+      expect.objectContaining({
+        sessionStatus: expect.objectContaining({ registered: true, expired: true, active: false }),
+      }),
+    );
+    expect(sdk.slotTransactionManager.executeOnNoFeeChain).not.toHaveBeenCalled();
+  });
+
+  it('uses JWT outside execution for a registered but inactive Slot session', async () => {
+    const { sdk } = createSlotSdk({
+      status: { registered: true, active: false, expired: false, canRenew: false },
+    });
+
+    await expect(sdk.executeOnSlot(call)).resolves.toBe('0xoutside');
+
+    expect(sdk.slotTransactionManager.executeViaOutsideExecution).toHaveBeenCalledTimes(1);
+    expect(sdk.slotTransactionManager.executeOnNoFeeChain).not.toHaveBeenCalled();
   });
 
   it('uses outside execution for an unregistered Slot session', async () => {

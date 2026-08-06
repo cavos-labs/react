@@ -106,6 +106,8 @@ function WalletStatus() {
       <p>Deployed: {walletStatus.isDeployed ? 'Yes' : 'No'}</p>
       <p>Session Active: {walletStatus.isSessionActive ? 'Yes' : 'No'}</p>
       <p>Ready: {walletStatus.isReady ? 'Yes' : 'No'}</p>
+      <p>Slot Deployed: {walletStatus.isSlotDeployed ? 'Yes' : 'No'}</p>
+      <p>Slot Ready: {walletStatus.isSlotReady ? 'Yes' : 'No'}</p>
 
       {walletStatus.isDeploying && <p>Deploying account...</p>}
       {walletStatus.isRegistering && <p>Registering session...</p>}
@@ -120,6 +122,10 @@ function WalletStatus() {
 - `isRegistering`: Session registration in progress
 - `isSessionActive`: Session registered and valid
 - `isReady`: Wallet is ready to execute transactions (all setup complete)
+- `isSlotDeployed`: Wallet contract exists on the configured Slot chain
+- `isSlotSessionActive`: Current session is registered, active, and unexpired on Slot
+- `isSlotReady`: Slot deployment and current-session activation are both confirmed
+- `slotError`: Last Slot deployment or session-registration error, when present
 
 ### 4. Sending Transactions
 
@@ -378,6 +384,10 @@ Returns:
   isRegistering: boolean    // Session registration in progress
   isSessionActive: boolean  // Session is registered
   isReady: boolean          // Ready to execute (all setup complete)
+  isSlotDeployed: boolean   // Account exists on Slot
+  isSlotSessionActive: boolean // Current session is active on Slot
+  isSlotReady: boolean      // Slot account and session are confirmed ready
+  slotError?: string        // Last Slot setup error
 }
 ```
 

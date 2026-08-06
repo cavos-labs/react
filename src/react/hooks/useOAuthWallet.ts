@@ -132,7 +132,6 @@ export function useOAuthWallet(hookConfig: UseOAuthWalletConfig): UseOAuthWallet
       setStage('initializing');
 
       try {
-        await manager.initializeSession();
         setStage('oauth');
 
         const url =
