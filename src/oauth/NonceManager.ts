@@ -50,7 +50,12 @@ export class NonceManager {
 
     const validAfter = currentTimestamp > 3600n ? currentTimestamp - 3600n : 0n;
     const validUntil = currentTimestamp + sessionDurationSeconds;
-    const renewalDeadline = currentTimestamp + renewalGraceSeconds;
+    // The grace period runs from expiry, not from now — matching cavos_account.cairo,
+    // which stores `renewal_deadline = valid_until + 172800` at registration. Measuring
+    // it from now instead put the local copy 'sessionDuration - grace' behind the chain
+    // for any session longer than the grace period, and made renew_session revert on
+    // "Renewal deadline must be >= valid_until".
+    const renewalDeadline = validUntil + renewalGraceSeconds;
 
     return {
       sessionPubKey,

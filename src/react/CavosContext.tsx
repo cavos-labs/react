@@ -142,7 +142,7 @@ export function CavosProvider({ config, modal, children }: CavosProviderProps) {
       if (typeof window === 'undefined') return;
 
       const urlParams = new URLSearchParams(window.location.search);
-      const authData = urlParams.get('auth_data') || urlParams.get('zk_auth_data');
+      const authData = urlParams.get('cavos_auth_code') || urlParams.get('auth_data') || urlParams.get('zk_auth_data');
 
       try {
         if (authData) {
@@ -152,7 +152,7 @@ export function CavosProvider({ config, modal, children }: CavosProviderProps) {
           CavosSDK.handlePopupCallback();
           // Process auth in this tab regardless — handles the redirect-fallback case,
           // and provides a usable state if window.close() is blocked by the browser.
-          await cavos.handleCallback(authData);
+          await cavos.handleCallback(urlParams.get('cavos_auth_code') ? window.location.href : authData);
           // Clean up URL
           window.history.replaceState({}, document.title, window.location.pathname);
         } else {

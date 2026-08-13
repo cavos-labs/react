@@ -10,9 +10,16 @@ tsup.config.ts
 *.test.tsx
 *.tgz
 
+# Local dev/ops utilities — never ship these. They are gitignored, but npm ignores
+# .gitignore entirely whenever an .npmignore exists, so they must be listed here too.
+# They have carried hardcoded credentials in the past.
+scripts/
+jest.config.js
+
 # Documentation (keep README.md)
 docs/
 
 # Config
 .vscode/
 .idea/
+.impeccable/

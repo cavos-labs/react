@@ -267,4 +267,45 @@ describe('CavosSDK deployOnly', () => {
       slotError: 'registration failed',
     }));
   });
+
+  it('deduplicates concurrent Slot auto-registration attempts', async () => {
+    const sdk = Object.create(CavosSDK.prototype) as CavosSDK & Record<string, any>;
+    sdk.logger = { log: jest.fn(), warn: jest.fn(), alwaysError: jest.fn() };
+    sdk._walletStatus = {
+      isDeploying: false,
+      isDeployed: true,
+      isRegistering: false,
+      isSessionActive: false,
+      isReady: true,
+      isSlotDeploying: false,
+      isSlotDeployed: true,
+      isSlotSessionActive: false,
+      isSlotReady: false,
+    };
+    sdk.walletStatusListeners = new Set();
+    sdk._slotRegistrationPromise = null;
+    sdk.slotRelayerAccount = { address: '0xrelayer' };
+    sdk.isJwtExpired = jest.fn().mockReturnValue(false);
+    let finishRegistration!: (value: string) => void;
+    sdk.slotTransactionManager = {
+      registerCurrentSessionViaOutside: jest.fn()
+        .mockImplementation(() => new Promise(resolve => { finishRegistration = resolve; })),
+      getSessionStatus: jest.fn().mockResolvedValue({
+        registered: true,
+        active: true,
+        expired: false,
+        canRenew: false,
+      }),
+    };
+
+    const first = sdk.autoRegisterSessionOnSlot();
+    const second = sdk.autoRegisterSessionOnSlot();
+
+    expect(sdk.slotTransactionManager.registerCurrentSessionViaOutside).toHaveBeenCalledTimes(1);
+
+    finishRegistration('0xregister');
+    await expect(Promise.all([first, second])).resolves.toEqual([undefined, undefined]);
+    expect(sdk.slotTransactionManager.getSessionStatus).toHaveBeenCalledTimes(1);
+    expect(sdk._slotRegistrationPromise).toBeNull();
+  });
 });
