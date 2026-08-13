@@ -6,6 +6,7 @@ import { OAuthWalletManager, OAuthTransactionManager, type SessionStatus } from 
 import { CavosConfig, UserInfo, OnrampProvider, LoginProvider, Signature, OAuthWalletConfig, FirebaseCredentials } from './types';
 import { DEFAULT_OAUTH_CONFIG_SEPOLIA, DEFAULT_OAUTH_CONFIG_MAINNET, DEFAULT_SLOT_RELAYER_ADDRESS, DEFAULT_SLOT_RELAYER_PRIVATE_KEY } from './config/defaults';
 import { Logger } from './utils/logger';
+import { CavosError, getErrorCode, markErrorLogged, wasErrorLogged } from './utils/errors';
 import axios from 'axios';
 
 export interface WalletStatus {
@@ -26,6 +27,12 @@ export interface WalletStatus {
   isSlotReady: boolean;
   /** Last Slot deployment or session-registration error, if any. */
   slotError?: string;
+  /**
+   * Stable code for `slotError` when the failure is one the SDK recognizes
+   * (e.g. 'JWKS_KID_NOT_REGISTERED', 'JWT_EXPIRED'). Branch on this rather than
+   * on the message text. Undefined for unclassified failures.
+   */
+  slotErrorCode?: string;
   /** Tx hash of a pending Slot deploy whose confirmation timed out. */
   pendingSlotDeployTxHash?: string;
 }
@@ -54,6 +61,8 @@ export class CavosSDK {
   private _deployingInBackground = false;
   /** Prevents concurrent _deploySlotInBackground() runs */
   private _deployingSlotInBackground = false;
+  /** Deduplicates Slot session registration and lets first execution await it. */
+  private _slotRegistrationPromise: Promise<void> | null = null;
   /** Shared RpcProvider instance to avoid creating one per call */
   private provider: RpcProvider;
   /** RpcProvider for the Slot chain (null if slot not configured) */
@@ -307,7 +316,7 @@ export class CavosSDK {
 
     // Check if we have auth_data in the URL
     const params = new URLSearchParams(window.location.search);
-    const authData = params.get('auth_data') || params.get('zk_auth_data');
+    const authData = params.get('cavos_auth_code') || params.get('auth_data') || params.get('zk_auth_data');
     if (!authData) return false;
 
     // Check if this was a redirect fallback we explicitly triggered
@@ -322,7 +331,7 @@ export class CavosSDK {
 
     // Auth callback detected — write to localStorage for the original tab and close
     try {
-      localStorage.setItem('cavos_auth_result', authData);
+      localStorage.setItem('cavos_auth_result', window.location.href);
       setTimeout(() => {
         try { window.close(); } catch { }
       }, 500);
@@ -395,6 +404,19 @@ export class CavosSDK {
 
   private async _runDeployBackground(): Promise<void> {
     try {
+      await this._runPrimaryDeployBackground();
+    } finally {
+      // Slot setup does not depend on the primary network. A primary failure —
+      // an unregistered JWKS kid, an RPC outage — must not leave a Slot-only app
+      // without a wallet, so this runs on every path out of the primary flow.
+      // _deploySlotInBackground() is a no-op when Slot is not configured and
+      // guards against concurrent runs itself.
+      this._deploySlotInBackground();
+    }
+  }
+
+  private async _runPrimaryDeployBackground(): Promise<void> {
+    try {
       // ── Step 0: Re-poll a previous deploy tx that timed out ─────────────────
       const pendingTxHash = typeof localStorage !== 'undefined'
         ? localStorage.getItem(CavosSDK.PENDING_DEPLOY_TX_KEY)
@@ -466,7 +488,6 @@ export class CavosSDK {
           }
 
           await this.autoRegisterPrimarySessionIfEnabled();
-          this._deploySlotInBackground();
         } catch (err: any) {
           const msg: string = err?.message || String(err);
           if (msg.includes('timeout')) {
@@ -492,7 +513,6 @@ export class CavosSDK {
           this.updateWalletStatus({ isDeployed: true, isSessionActive: false, isReady: false });
           await this.autoRegisterPrimarySessionIfEnabled();
         }
-        this._deploySlotInBackground();
       }
     } catch (err) {
       this.logger.alwaysError('Background deployment check failed:', err);
@@ -557,6 +577,22 @@ export class CavosSDK {
   }
 
   private async autoRegisterSessionOnSlot(): Promise<void> {
+    if (this._slotRegistrationPromise) {
+      return this._slotRegistrationPromise;
+    }
+
+    const registrationPromise = this.runAutoRegisterSessionOnSlot();
+    this._slotRegistrationPromise = registrationPromise;
+    try {
+      await registrationPromise;
+    } finally {
+      if (this._slotRegistrationPromise === registrationPromise) {
+        this._slotRegistrationPromise = null;
+      }
+    }
+  }
+
+  private async runAutoRegisterSessionOnSlot(): Promise<void> {
     if (!this.slotTransactionManager) return;
 
     if (this.isJwtExpired()) {
@@ -565,19 +601,21 @@ export class CavosSDK {
         isSlotSessionActive: false,
         isSlotReady: false,
         slotError: 'JWT has expired. Please login again.',
+        slotErrorCode: 'JWT_EXPIRED',
       });
       return;
     }
 
     try {
       if (!this.slotRelayerAccount) {
-        throw new Error('Slot relayer is not available.');
+        throw new CavosError('SLOT_RELAYER_UNAVAILABLE', 'Slot relayer is not available.');
       }
 
       this.updateWalletStatus({
         isSlotSessionActive: false,
         isSlotReady: false,
         slotError: undefined,
+        slotErrorCode: undefined,
       });
       this.logger.log('[Slot] Auto-registering session on Slot via outside execution...');
       const txHash = await this.slotTransactionManager.registerCurrentSessionViaOutside(
@@ -587,12 +625,16 @@ export class CavosSDK {
       const status = await this.slotTransactionManager.getSessionStatus();
       const ready = status.registered && status.active && !status.expired;
       if (!ready) {
-        throw new Error('Slot session registration was submitted but is not active on-chain.');
+        throw new CavosError(
+          'SLOT_SESSION_NOT_ACTIVE',
+          'Slot session registration was submitted but is not active on-chain.',
+        );
       }
       this.updateWalletStatus({
         isSlotSessionActive: true,
         isSlotReady: true,
         slotError: undefined,
+        slotErrorCode: undefined,
       });
       this.logger.log('[Slot] Session registered on Slot. TxHash:', txHash);
     } catch (err: any) {
@@ -601,8 +643,13 @@ export class CavosSDK {
         isSlotSessionActive: false,
         isSlotReady: false,
         slotError: message,
+        slotErrorCode: getErrorCode(err),
       });
-      this.logger.alwaysError('[Slot] Auto session registration on Slot failed:', err);
+      // Log the message as its own argument: some hosts (Capacitor's native console
+      // bridge) JSON-serialize console arguments, and an Error has no enumerable own
+      // properties, so passing only the object prints `{}`.
+      this.logger.alwaysError('[Slot] Auto session registration on Slot failed:', message, err);
+      markErrorLogged(err);
       throw err;
     }
   }
@@ -733,18 +780,23 @@ export class CavosSDK {
         try {
           await this._waitForDeployTx(pendingTxHash, 180_000, this.slotProvider!);
           localStorage.removeItem(CavosSDK.PENDING_SLOT_DEPLOY_TX_KEY);
-          this.updateWalletStatus({ isSlotDeploying: false, isSlotDeployed: true, pendingSlotDeployTxHash: undefined });
           const slotSessionActiveAfterPoll = this.slotTransactionManager
             ? await this.slotTransactionManager.isSessionRegistered()
             : false;
+          const registrationPromise = !slotSessionActiveAfterPoll
+            ? this.autoRegisterSessionOnSlot()
+            : null;
+          this.updateWalletStatus({
+            isSlotDeploying: false,
+            isSlotDeployed: true,
+            isSlotSessionActive: slotSessionActiveAfterPoll,
+            isSlotReady: slotSessionActiveAfterPoll,
+            pendingSlotDeployTxHash: undefined,
+          });
           if (!slotSessionActiveAfterPoll) {
-            await this.autoRegisterSessionOnSlot();
+            await registrationPromise;
           } else {
-            this.updateWalletStatus({
-              isSlotSessionActive: true,
-              isSlotReady: true,
-              slotError: undefined,
-            });
+            this.updateWalletStatus({ slotError: undefined });
           }
           return;
         } catch {
@@ -764,19 +816,24 @@ export class CavosSDK {
 
       if (isDeployedOnSlot) {
         this.logger.log('[Slot] Wallet already deployed on Slot.');
-        this.updateWalletStatus({ isSlotDeployed: true });
         // Mirror normal wallet: check session status before registering.
         const slotSessionActive = this.slotTransactionManager
           ? await this.slotTransactionManager.isSessionRegistered()
           : false;
+        const registrationPromise = !slotSessionActive
+          ? this.autoRegisterSessionOnSlot()
+          : null;
+        // If registration is needed, its shared promise is installed before
+        // isSlotDeployed is exposed to listeners that may execute immediately.
+        this.updateWalletStatus({
+          isSlotDeployed: true,
+          isSlotSessionActive: slotSessionActive,
+          isSlotReady: slotSessionActive,
+        });
         if (!slotSessionActive) {
-          await this.autoRegisterSessionOnSlot();
+          await registrationPromise;
         } else {
-          this.updateWalletStatus({
-            isSlotSessionActive: true,
-            isSlotReady: true,
-            slotError: undefined,
-          });
+          this.updateWalletStatus({ slotError: undefined });
           this.logger.log('[Slot] Session already registered on Slot.');
         }
         return;
@@ -813,8 +870,9 @@ export class CavosSDK {
         );
 
         if (deployHash === 'already-deployed') {
+          const registrationPromise = this.autoRegisterSessionOnSlot();
           this.updateWalletStatus({ isSlotDeploying: false, isSlotDeployed: true });
-          await this.autoRegisterSessionOnSlot();
+          await registrationPromise;
           return;
         }
 
@@ -825,31 +883,41 @@ export class CavosSDK {
         this.updateWalletStatus({ pendingSlotDeployTxHash: deployHash });
 
         localStorage.removeItem(CavosSDK.PENDING_SLOT_DEPLOY_TX_KEY);
+        const registrationPromise = this.autoRegisterSessionOnSlot();
         this.updateWalletStatus({ isSlotDeploying: false, isSlotDeployed: true, pendingSlotDeployTxHash: undefined });
         this.logger.log('[Slot] Wallet deployed on Slot.');
-        await this.autoRegisterSessionOnSlot();
+        await registrationPromise;
       } catch (err: any) {
         const msg: string = err?.message || String(err);
-        if (msg.includes('timeout')) {
-          this.logger.alwaysError('[Slot] Deploy confirmation timed out. Hash persisted for recovery.', err);
+        if (wasErrorLogged(err)) {
+          // Already reported by runAutoRegisterSessionOnSlot, which rethrows.
+        } else if (msg.includes('timeout')) {
+          this.logger.alwaysError('[Slot] Deploy confirmation timed out. Hash persisted for recovery.', msg, err);
         } else {
           typeof localStorage !== 'undefined' && localStorage.removeItem(CavosSDK.PENDING_SLOT_DEPLOY_TX_KEY);
-          this.logger.alwaysError('[Slot] Background deployment failed:', err);
+          this.logger.alwaysError('[Slot] Background deployment failed:', msg, err);
         }
         this.updateWalletStatus({
           isSlotDeploying: false,
           isSlotSessionActive: false,
           isSlotReady: false,
           slotError: msg,
+          slotErrorCode: getErrorCode(err),
         });
       }
     } catch (err) {
-      this.logger.alwaysError('[Slot] Background deployment check failed:', err);
+      const message = err instanceof Error ? err.message : String(err);
+      // Session-registration failures rethrow from runAutoRegisterSessionOnSlot and land
+      // here too; don't report the same fault twice under a second heading.
+      if (!wasErrorLogged(err)) {
+        this.logger.alwaysError('[Slot] Background deployment check failed:', message, err);
+      }
       this.updateWalletStatus({
         isSlotDeploying: false,
         isSlotSessionActive: false,
         isSlotReady: false,
-        slotError: err instanceof Error ? err.message : String(err),
+        slotError: message,
+        slotErrorCode: getErrorCode(err),
       });
     }
   }
@@ -1070,6 +1138,10 @@ export class CavosSDK {
 
     if (this.isJwtExpired()) {
       throw new JwtExpiredError();
+    }
+
+    if (this._slotRegistrationPromise) {
+      await this._slotRegistrationPromise;
     }
 
     const status = await this.slotTransactionManager.getSessionStatus();
@@ -1424,7 +1496,13 @@ export class CavosSDK {
    * Update wallet status and notify listeners
    */
   private updateWalletStatus(updates: Partial<WalletStatus>): void {
-    this._walletStatus = { ...this._walletStatus, ...updates };
+    const next = { ...this._walletStatus, ...updates };
+    // slotErrorCode describes slotError, so it must never outlive it. Any write that
+    // sets or clears slotError without naming a code drops the previous one.
+    if ('slotError' in updates && !('slotErrorCode' in updates)) {
+      next.slotErrorCode = undefined;
+    }
+    this._walletStatus = next;
     this.notifyWalletStatusListeners();
   }
 
@@ -1637,6 +1715,17 @@ export class CavosSDK {
     }
     if (!this._walletStatus.isSlotDeployed) {
       throw new Error('Wallet not deployed on Slot yet. Wait for walletStatus.isSlotDeployed.');
+    }
+
+    // Deployment starts auto-registration in the background. Waiting here avoids
+    // submitting a second JWT outside-execution with the same relayer nonce.
+    if (this._slotRegistrationPromise) {
+      try {
+        await this._slotRegistrationPromise;
+      } catch {
+        // The user's transaction can still register the session atomically via
+        // JWT, so re-check on-chain state and continue through the normal path.
+      }
     }
 
     const callsArray = Array.isArray(calls) ? calls : [calls];

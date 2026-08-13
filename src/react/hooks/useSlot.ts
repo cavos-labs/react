@@ -10,6 +10,11 @@ export interface UseSlotReturn {
   isSlotSessionActive: boolean;
   /** Last Slot setup error, if registration or deployment failed. */
   slotError?: string;
+  /**
+   * Stable code for `slotError` when the SDK recognizes the failure
+   * (e.g. 'JWKS_KID_NOT_REGISTERED', 'JWT_EXPIRED'). Branch on this, not on the message.
+   */
+  slotErrorCode?: string;
   /** True while the wallet is being deployed to the Slot chain. */
   isSlotDeploying: boolean;
   /** Execute calls on the Slot chain (no paymaster, session key reused). */
@@ -25,6 +30,7 @@ export function useSlot(): UseSlotReturn {
     isSlotReady: walletStatus.isSlotReady,
     isSlotSessionActive: walletStatus.isSlotSessionActive,
     slotError: walletStatus.slotError,
+    slotErrorCode: walletStatus.slotErrorCode,
     isSlotDeploying: walletStatus.isSlotDeploying,
     executeOnSlot,
     slotProvider: getSlotProvider(),

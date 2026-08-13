@@ -22,6 +22,7 @@ import {
   ec,
   Signer,
   EDAMode,
+  BlockTag,
   type Signature,
   type TypedData,
 } from 'starknet';
@@ -52,17 +53,47 @@ type ExecuteViaOutsideExecutionOptions = {
 };
 
 /**
+ * Serializes writes made by the same relayer within this JavaScript runtime.
+ * Multiple CavosSDK instances can otherwise read and submit the same nonce.
+ */
+const relayerExecutionQueues = new Map<string, Promise<void>>();
+
+function enqueueRelayerExecution<T>(relayerAddress: string, execute: () => Promise<T>): Promise<T> {
+  const key = relayerAddress.toLowerCase();
+  const previous = relayerExecutionQueues.get(key) ?? Promise.resolve();
+  const result = previous.catch(() => undefined).then(execute);
+  const tail = result.then(() => undefined, () => undefined);
+  relayerExecutionQueues.set(key, tail);
+
+  return result.finally(() => {
+    if (relayerExecutionQueues.get(key) === tail) {
+      relayerExecutionQueues.delete(key);
+    }
+  });
+}
+
+/**
  * Custom signer for OAuth accounts.
  * Produces JWT signatures for deploy and session signatures for execute.
  */
 class OAuthSigner extends Signer {
   private oauthManager: OAuthWalletManager;
   private forDeploy: boolean;
+  /**
+   * Provider of the chain this signer signs for. The JWKS modulus must be read from
+   * that chain's registry — see OAuthWalletManager.buildJWTSignatureData.
+   */
+  private jwksProvider?: RpcProvider;
 
-  constructor(oauthManager: OAuthWalletManager, forDeploy: boolean = false) {
+  constructor(
+    oauthManager: OAuthWalletManager,
+    forDeploy: boolean = false,
+    jwksProvider?: RpcProvider,
+  ) {
     super();
     this.oauthManager = oauthManager;
     this.forDeploy = forDeploy;
+    this.jwksProvider = jwksProvider;
   }
 
   async getPubKey(): Promise<string> {
@@ -74,7 +105,9 @@ class OAuthSigner extends Signer {
     const msgHash = typedData.getMessageHash(typedDataInput, accountAddress);
 
     if (this.forDeploy) {
-      return await this.oauthManager.buildJWTSignatureData(msgHash);
+      return await this.oauthManager.buildJWTSignatureData(msgHash, undefined, {
+        provider: this.jwksProvider,
+      });
     } else {
       return this.oauthManager.buildSessionSignature(msgHash);
     }
@@ -109,7 +142,9 @@ class OAuthSigner extends Signer {
     }
 
     if (this.forDeploy) {
-      return await this.oauthManager.buildJWTSignatureData(txHash);
+      return await this.oauthManager.buildJWTSignatureData(txHash, undefined, {
+        provider: this.jwksProvider,
+      });
     } else {
       return this.oauthManager.buildSessionSignature(txHash, transactions);
     }
@@ -117,11 +152,14 @@ class OAuthSigner extends Signer {
 
   async signDeployAccountTransaction(details: any): Promise<Signature> {
     const txHash = details.transactionHash || '0x0';
-    return await this.oauthManager.buildJWTSignatureData(txHash);
+    return await this.oauthManager.buildJWTSignatureData(txHash, undefined, {
+      provider: this.jwksProvider,
+    });
   }
 }
 
 export class OAuthTransactionManager {
+  private static readonly RELAYER_NONCE_RETRIES = 3;
   private config: OAuthWalletConfig;
   private provider: RpcProvider;
   private oauthManager: OAuthWalletManager;
@@ -309,7 +347,10 @@ export class OAuthTransactionManager {
       return { registered, active, expired, canRenew, validAfter, validUntil, renewalDeadline };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      this.logger.warn('getSessionStatus RPC error:', message);
+      // An RPC failure here silently degrades to "session not registered", which sends the
+      // caller down a full JWT re-registration. This logger is gated on timing debug, so use
+      // alwaysError to keep the real cause visible in production reports.
+      this.logger.alwaysError('getSessionStatus RPC error:', message, err);
       return { registered: false, active: false, expired: false, canRenew: false, rpcError: message };
     }
   }
@@ -354,7 +395,7 @@ export class OAuthTransactionManager {
     ].map(c => num.toHex(c));
 
     // Create custom signer for deploy (uses full JWT signature)
-    const deploySigner = new OAuthSigner(this.oauthManager, true);
+    const deploySigner = new OAuthSigner(this.oauthManager, true, this.provider);
 
     // Create counterfactual Account with PaymasterRpc
     const counterfactualAccount = new Account({
@@ -425,7 +466,7 @@ export class OAuthTransactionManager {
       this.config.jwksRegistryAddress,
     ].map(c => num.toHex(c));
 
-    const deploySigner = new OAuthSigner(this.oauthManager, true);
+    const deploySigner = new OAuthSigner(this.oauthManager, true, this.provider);
     const account = new Account({
       provider: this.provider,
       address: session.walletAddress,
@@ -478,7 +519,8 @@ export class OAuthTransactionManager {
     // UDC.deployContract(class_hash, salt, unique, calldata)
     // unique = 0 (false) → deployer_address = 0 → same address as DEPLOY_ACCOUNT.
     // Cairo 0 array serialization: calldata_len followed by elements.
-    const { transaction_hash } = await relayerAccount.execute(
+    const transactionHash = await this.executeRelayerTransaction(
+      relayerAccount,
       {
         contractAddress: UDC_ADDRESS,
         entrypoint: 'deployContract',
@@ -490,17 +532,10 @@ export class OAuthTransactionManager {
           ...constructorCalldata,
         ],
       },
-      {
-        resourceBounds: {
-          l1_gas:      { max_amount: 0n, max_price_per_unit: 0n },
-          l2_gas:      { max_amount: 0n, max_price_per_unit: 0n },
-          l1_data_gas: { max_amount: 0n, max_price_per_unit: 0n },
-        },
-      },
     );
 
-    await this.waitForTransaction(transaction_hash);
-    return transaction_hash;
+    await this.waitForTransaction(transactionHash);
+    return transactionHash;
   }
 
   private getNoFeeResourceBounds() {
@@ -509,6 +544,73 @@ export class OAuthTransactionManager {
       l2_gas: { max_amount: 0n, max_price_per_unit: 0n },
       l1_data_gas: { max_amount: 0n, max_price_per_unit: 0n },
     };
+  }
+
+  /**
+   * Submit a relayer invoke with in-runtime serialization and bounded recovery
+   * from stale nonces returned by Slot/Katana RPC nodes.
+   */
+  private executeRelayerTransaction(relayerAccount: Account, calls: Call | Call[]): Promise<string> {
+    return enqueueRelayerExecution(relayerAccount.address, async () => {
+      let explicitNonce: bigint | undefined;
+
+      for (let attempt = 0; ; attempt++) {
+        try {
+          const { transaction_hash } = await relayerAccount.execute(
+            calls,
+            {
+              resourceBounds: this.getNoFeeResourceBounds(),
+              ...(explicitNonce === undefined ? {} : { nonce: explicitNonce }),
+            },
+          );
+          return transaction_hash;
+        } catch (error) {
+          const errorText = this.getErrorText(error);
+          const candidate = error as any;
+          const errorCode = candidate?.code ?? candidate?.baseError?.code;
+          const isNonceError = Number(errorCode) === 52 || /invalid transaction nonce/i.test(errorText);
+          if (!isNonceError || attempt >= OAuthTransactionManager.RELAYER_NONCE_RETRIES) {
+            throw error;
+          }
+
+          explicitNonce = this.extractExpectedNonce(errorText)
+            ?? await this.getPreConfirmedRelayerNonce(relayerAccount.address);
+          this.logger.warn(
+            `[Slot] Relayer nonce changed while submitting; retrying with nonce ${num.toHex(explicitNonce)} ` +
+            `(${attempt + 1}/${OAuthTransactionManager.RELAYER_NONCE_RETRIES}).`,
+          );
+          await new Promise(resolve => setTimeout(resolve, 20 * (attempt + 1)));
+        }
+      }
+    });
+  }
+
+  private getErrorText(error: unknown): string {
+    const candidate = error as any;
+    return [
+      candidate?.message,
+      candidate?.cause?.message,
+      candidate?.data?.message,
+      String(error),
+    ].filter(Boolean).join('\n');
+  }
+
+  private extractExpectedNonce(errorText: string): bigint | undefined {
+    const match = errorText.match(/Account nonce:\s*["']?((?:0x)?[0-9a-f]+)["']?/i);
+    if (!match) return undefined;
+    try {
+      return BigInt(match[1]);
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async getPreConfirmedRelayerNonce(relayerAddress: string): Promise<bigint> {
+    try {
+      return BigInt(await this.provider.getNonceForAddress(relayerAddress, BlockTag.PRE_CONFIRMED));
+    } catch {
+      return BigInt(await this.provider.getNonceForAddress(relayerAddress));
+    }
   }
 
   private createDirectAccount(useJWTSignature: boolean): Account {
@@ -520,7 +622,7 @@ export class OAuthTransactionManager {
     return new Account({
       provider: this.provider,
       address: session.walletAddress,
-      signer: new OAuthSigner(this.oauthManager, useJWTSignature),
+      signer: new OAuthSigner(this.oauthManager, useJWTSignature, this.provider),
     });
   }
 
@@ -928,7 +1030,9 @@ export class OAuthTransactionManager {
       !sessionStatus.registered || sessionStatus.expired || !sessionStatus.active;
     let sigArray: string[];
     if (requiresJwt) {
-      const signature = await this.oauthManager.buildJWTSignatureData(messageHash);
+      const signature = await this.oauthManager.buildJWTSignatureData(messageHash, undefined, {
+        provider: this.provider,
+      });
       sigArray = Array.isArray(signature) ? signature.map(String) : [String(signature)];
     } else {
       sigArray = this.oauthManager.buildSessionSignature(messageHash, calls);
@@ -945,25 +1049,20 @@ export class OAuthTransactionManager {
       sigArray,
     );
 
-    // Relayer submits the outer transaction
-    const { transaction_hash } = await relayerAccount.execute(
+    // Relayer submits the outer transaction. All relayer writes share a nonce
+    // queue and retry stale nonce errors before surfacing a failure.
+    const transactionHash = await this.executeRelayerTransaction(
+      relayerAccount,
       {
         contractAddress: walletAddress,
         entrypoint: 'execute_from_outside_v2',
         calldata,
       },
-      {
-        resourceBounds: {
-          l1_gas:      { max_amount: 0n, max_price_per_unit: 0n },
-          l2_gas:      { max_amount: 0n, max_price_per_unit: 0n },
-          l1_data_gas: { max_amount: 0n, max_price_per_unit: 0n },
-        },
-      },
     );
     if (options?.waitForTransaction === true) {
-      await this.waitForTransaction(transaction_hash);
+      await this.waitForTransaction(transactionHash);
     }
-    return transaction_hash;
+    return transactionHash;
   }
 
   private generateOutsideExecutionNonce(): string {
@@ -1174,7 +1273,9 @@ export class OAuthTransactionManager {
     // Build signature (JWT for first tx, session for subsequent)
     // Pass calls for Merkle proof inclusion in session signatures
     const signature = forceJWT
-      ? await this.oauthManager.buildJWTSignatureData(messageHash, session)
+      ? await this.oauthManager.buildJWTSignatureData(messageHash, session, {
+          provider: this.provider,
+        })
       : this.oauthManager.buildSessionSignature(messageHash, calls);
     this.stepTiming(timing, forceJWT ? 'buildJWTSignatureData' : 'buildSessionSignature');
 

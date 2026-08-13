@@ -18,5 +18,8 @@ export { OAuthWalletManager, OAuthTransactionManager, NonceManager, AddressSeedM
 // Email verification errors
 export { EmailVerificationRequiredError, EmailNotVerifiedError } from './oauth/errors';
 
+// Normalized SDK errors
+export { CavosError, getErrorCode, type CavosErrorCode } from './utils/errors';
+
 // Utilities
 export { CryptoUtils } from './crypto/encryption';

@@ -41,6 +41,7 @@ function createSlotSdk({
     isSlotReady: status.registered && status.active && !status.expired,
   };
   sdk.walletStatusListeners = new Set();
+  sdk._slotRegistrationPromise = null;
   sdk.slotRelayerAccount = { address: '0xrelayer' };
   sdk.oauthWalletManager = {
     generateNewSession: jest.fn().mockResolvedValue(newSession),
@@ -168,5 +169,24 @@ describe('CavosSDK.executeOnSlot', () => {
     );
     expect(sdk.slotTransactionManager.getSessionStatus).toHaveBeenCalledTimes(1);
     expect(sdk.slotTransactionManager.executeOnNoFeeChain).not.toHaveBeenCalled();
+  });
+
+  it('waits for in-flight auto-registration before executing the first Slot call', async () => {
+    const { sdk } = createSlotSdk({
+      status: { registered: true, active: true, expired: false, canRenew: false },
+    });
+    let finishRegistration!: () => void;
+    sdk._slotRegistrationPromise = new Promise<void>(resolve => { finishRegistration = resolve; });
+
+    const execution = sdk.executeOnSlot(call);
+    await new Promise(resolve => setImmediate(resolve));
+
+    expect(sdk.slotTransactionManager.getSessionStatus).not.toHaveBeenCalled();
+    expect(sdk.slotTransactionManager.executeOnNoFeeChain).not.toHaveBeenCalled();
+
+    finishRegistration();
+    await expect(execution).resolves.toBe('0xexecute');
+    expect(sdk.slotTransactionManager.getSessionStatus).toHaveBeenCalledTimes(1);
+    expect(sdk.slotTransactionManager.executeViaOutsideExecution).not.toHaveBeenCalled();
   });
 });

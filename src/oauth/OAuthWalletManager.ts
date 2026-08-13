@@ -13,6 +13,7 @@ import { NonceManager, NonceParams } from './NonceManager';
 import { AddressSeedManager } from './AddressSeedManager';
 import { OAuthWalletConfig } from '../types/config';
 import { SessionKeyPolicy } from '../types/session';
+import { CavosError } from '../utils/errors';
 
 export interface OAuthSession {
   /** Session private key (hex) */
@@ -404,7 +405,7 @@ export class OAuthWalletManager {
       app_id: this.appId,
     });
 
-    const response = await fetch(`${this.backendUrl}/api/oauth/google?${params}`, {
+    const response = await fetch(`${this.backendUrl}/api/oauth/v2/google?${params}`, {
       method: 'GET',
       headers: { 'Content-Type': 'application/json' },
     });
@@ -436,7 +437,7 @@ export class OAuthWalletManager {
       app_id: this.appId,
     });
 
-    const response = await fetch(`${this.backendUrl}/api/oauth/apple?${params}`, {
+    const response = await fetch(`${this.backendUrl}/api/oauth/v2/apple?${params}`, {
       method: 'GET',
       headers: { 'Content-Type': 'application/json' },
     });
@@ -459,6 +460,18 @@ export class OAuthWalletManager {
 
     if (!this.session) {
       throw new Error('No pre-auth session found. OAuth flow was not initialized properly.');
+    }
+
+    const callbackCode = this.extractCallbackCode(authData);
+    if (callbackCode) {
+      const redirectUri = this.cleanCallbackUrl(authData);
+      const response = await fetch(`${this.backendUrl}/api/oauth/callback/exchange`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code: callbackCode, app_id: this.appId, redirect_uri: redirectUri }),
+      });
+      if (!response.ok) throw new Error(`OAuth callback exchange failed: ${await response.text()}`);
+      authData = JSON.stringify(await response.json());
     }
 
     // Parse auth data (could be JSON or direct JWT depending on backend)
@@ -512,6 +525,25 @@ export class OAuthWalletManager {
     }
 
     return this.session;
+  }
+
+  private extractCallbackCode(input: string): string | null {
+    if (/^[A-Za-z0-9_-]{43}$/.test(input)) return input;
+    try {
+      const params = input.includes('://')
+        ? new URL(input).searchParams
+        : new URLSearchParams(input.startsWith('?') ? input : `?${input}`);
+      return params.get('cavos_auth_code');
+    } catch { return null; }
+  }
+
+  private cleanCallbackUrl(input: string): string {
+    const base = typeof window !== 'undefined' ? window.location.href : undefined;
+    const url = input.includes('://') ? new URL(input) : new URL(base!);
+    url.searchParams.delete('cavos_auth_code');
+    url.searchParams.delete('auth_data');
+    url.searchParams.delete('zk_auth_data');
+    return url.toString();
   }
 
   /**
@@ -591,7 +623,18 @@ export class OAuthWalletManager {
    * [after JWT] = valid_after, allowed_contracts_root, max_calls_per_tx,
    *               spending_policies_count, spending_policies...
    */
-  async buildJWTSignatureData(transactionHash: string, externalSession?: OAuthSession): Promise<string[]> {
+  /**
+   * @param options.provider RPC provider used for the JWKS `get_key` lookup. Must be the
+   *   provider of the chain the transaction will execute on: the account contract verifies
+   *   the RSA signature against *its own* chain's registry, so building the Garaga witness
+   *   against a different chain's modulus produces a signature that reverts on-chain.
+   *   Defaults to the primary-network provider.
+   */
+  async buildJWTSignatureData(
+    transactionHash: string,
+    externalSession?: OAuthSession,
+    options?: { provider?: RpcProvider },
+  ): Promise<string[]> {
     const session = externalSession || this.session;
     if (!session?.jwt || !session.jwtClaims) {
       throw new Error('No JWT in session');
@@ -617,16 +660,21 @@ export class OAuthWalletManager {
     // Fetch the RSA modulus n from the on-chain registry in 17 x 123-bit proof limbs
     // and reconstruct the integer modulus.
     const kid = this.extractKidFromJwt(jwt);
-    const nLimbHexes = await this.fetchNFromRegistry(kid);
+    const jwksProvider = options?.provider ?? this.provider;
+    const nLimbHexes = await this.fetchNFromRegistry(kid, jwksProvider);
     const nBigInt = nLimbHexes.reduce(
       (acc: bigint, limb: string, i: number) => acc + BigInt(limb) * (1n << (BigInt(i) * 96n)),
       0n,
     );
 
     if (nBigInt === 0n) {
-      throw new Error(
-        `JWKS key not found or invalid: kid="${kid}" is not registered in the on-chain JWKS registry. ` +
-        `Make sure the JWKS registry has been populated for this network.`
+      const nodeUrl = (jwksProvider as any)?.channel?.nodeUrl ?? '(unknown RPC)';
+      throw new CavosError(
+        'JWKS_KID_NOT_REGISTERED',
+        `JWKS key not found or invalid: kid="${kid}" is not registered in the JWKS registry ` +
+        `${this.config.jwksRegistryAddress} on ${nodeUrl}. ` +
+        `The provider likely rotated its signing keys before the registry was synced for this chain.`,
+        { kid, registry: this.config.jwksRegistryAddress, nodeUrl },
       );
     }
 
@@ -790,14 +838,39 @@ export class OAuthWalletManager {
       return false;
     }
 
-    // Check JWT expiration
     const now = Math.floor(Date.now() / 1000);
-    const expiresAt = Number(this.session.jwtClaims.exp);
-    if (!Number.isFinite(expiresAt) || expiresAt <= now) {
+
+    const jwtExpiresAt = Number(this.session.jwtClaims.exp);
+    if (Number.isFinite(jwtExpiresAt) && jwtExpiresAt > now) {
+      return true;
+    }
+
+    // The JWT is expired, but it is not what signs transactions — the session key
+    // is, and the account honours it on-chain until renewalDeadline (validUntil
+    // plus the renewal grace period, both derived from the configured
+    // sessionDuration). Renewal itself needs no JWT: executeOnSlot() rotates the
+    // key by signing with the outgoing one. Ending the session here instead would
+    // cap every session at the provider's JWT lifetime — one hour — no matter what
+    // sessionDuration the app configured.
+    // The paths that genuinely need a live JWT (first registration, renewal past
+    // the deadline) gate on isJwtExpired() and surface JwtExpiredError.
+    const { validUntil, renewalDeadline } = this.session.nonceParams ?? {};
+    if (validUntil === undefined && renewalDeadline === undefined) {
       return false;
     }
 
-    return true;
+    // Take the later of the two. Sessions minted before renewalDeadline was fixed
+    // to run from validUntil carry a deadline of 'issued + grace', which for a
+    // 30-day session sits 28 days before the session actually expires on-chain.
+    // BigInt() because persisted sessions round-trip these through JSON strings.
+    const deadline = [validUntil, renewalDeadline]
+      .filter((value) => value !== undefined)
+      .reduce<bigint>((latest, value) => {
+        const parsed = BigInt(value!);
+        return parsed > latest ? parsed : latest;
+      }, 0n);
+
+    return deadline > BigInt(now);
   }
 
   /**
@@ -1024,9 +1097,9 @@ export class OAuthWalletManager {
    * Fetch the RSA modulus n of a JWKS key from the on-chain registry.
    * Returns the 24 limbs as an array of hex strings (little-endian, limb 0 = LSB).
    */
-  private async fetchNFromRegistry(kid: string): Promise<string[]> {
+  private async fetchNFromRegistry(kid: string, provider?: RpcProvider): Promise<string[]> {
     const kidFelt = this.kidToFelt(kid);
-    const result = await this.provider.callContract({
+    const result = await (provider ?? this.provider).callContract({
       contractAddress: this.config.jwksRegistryAddress,
       entrypoint: 'get_key',
       calldata: [kidFelt],
@@ -1387,7 +1460,7 @@ export class OAuthWalletManager {
     }
 
     const redirect_uri = typeof window !== 'undefined' ? window.location.href : undefined;
-    const response = await fetch(`${this.backendUrl}/api/oauth/firebase/magic-link`, {
+    const response = await fetch(`${this.backendUrl}/api/oauth/v2/firebase/magic-link`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ email, nonce: this.session!.nonce, app_id: this.appId, redirect_uri }),
